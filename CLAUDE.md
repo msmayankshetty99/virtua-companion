@@ -8,7 +8,7 @@ Riko is a local desktop AI companion with a VRM avatar.
 - **Python backend** (`Code/`, FastAPI/uvicorn on `127.0.0.1:8765`) owns conversation, in-process llama.cpp inference, microphone capture/ASR, TTS playback, memory, tools and persistence. Core package: `Code/process/app_core/` (written `app_core/` below). Entry points: `Code/run_server.py` (backend), `Code/desktop_server.py` (FastAPI app), `Code/discord_bot.py`, `Code/task_mcp_server.py`.
 - **Electron + React + three.js** (`electron/`) owns every window, the avatar and the UI, and talks to the backend only over HTTP/WebSocket.
 
-This layout exists on the `rewrite-2` branch. `origin/llama.cpp` is an older pre-rewrite tree whose tip fails to parse (`Code/process/llm_scripts/module.py:238`). `old llm_scripts/` here is dead code (the space in its name makes it unimportable).
+This layout is on `main` (formerly the `rewrite-2` branch). `origin/llama.cpp` is an older pre-rewrite tree, kept for reference, whose tip fails to parse (`Code/process/llm_scripts/module.py:238`). `old llm_scripts/` here is dead code (the space in its name makes it unimportable).
 
 ## Commands
 
