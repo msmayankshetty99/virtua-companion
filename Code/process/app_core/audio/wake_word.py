@@ -8,6 +8,7 @@ import threading
 import time
 
 from ..events.bus import event_bus
+from ..events.outbox import Outbox
 from .wake_capture import WakeCapture, prepare_audio
 
 
@@ -33,6 +34,7 @@ class WakeWord:
             raise ValueError("Invalid wake threshold or follow-up duration")
         self.directory = config.root / "persistent_memories" / "wake_words"
         self.lock = threading.RLock()
+        self.outbox = Outbox(event_bus)
         self.worker = DaemonExecutor(max_workers=1, thread_name_prefix="wake-detector", max_pending=2)
         self.model = None
         self.embeddings = []
@@ -211,6 +213,11 @@ class WakeWord:
         self.publish()
 
     def feed(self, frame, speaking=False):
+        try:
+            self._feed(frame, speaking)
+        finally: self.outbox.flush()
+
+    def _feed(self, frame, speaking):
         with self.lock:
             if self.closed: return
             if self.recording is not None:
@@ -218,8 +225,8 @@ class WakeWord:
                 if outcome == 'timeout':
                     self.recording = None
                     self.error = 'Five-second limit reached; sample discarded. Click Record and try again.'
-                    event_bus.publish('voice.calibration_discarded', error=self.error)
-                    self.publish()
+                    self.outbox.put('voice.calibration_discarded', error=self.error)
+                    self.outbox.defer(self.publish)
                 elif outcome == 'complete':
                     self.recording = None
                     self.job = self.worker.submit(self._enroll, pcm)

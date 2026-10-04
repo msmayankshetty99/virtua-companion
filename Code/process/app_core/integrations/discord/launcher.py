@@ -9,12 +9,14 @@ import time
 
 from .access import DiscordAccess
 from ...events.bus import event_bus
+from ...events.outbox import Outbox
 
 
 class DiscordLauncher:
     def __init__(self, root, state=None):
         self.root = Path(root)
         self.lock = threading.RLock()
+        self.outbox = Outbox(event_bus)  # status/notifications reach the session; never emit under self.lock
         self.process = None
         self.error = ''
         self.access = DiscordAccess(root)
@@ -65,6 +67,10 @@ class DiscordLauncher:
         with self.lock: return {'messages': [dict(item) for item in self.inbox], 'received': self.received, 'limit': 256}
 
     def report(self, client_id, value):
+        try: self._report(client_id, value)
+        finally: self.outbox.flush()
+
+    def _report(self, client_id, value):
         if not isinstance(value, dict): raise ValueError('Invalid Discord report')
         with self.lock:
             if self.client_id != client_id: raise ValueError('Discord connection changed')
@@ -72,13 +78,13 @@ class DiscordLauncher:
                 first = not self.ready
                 self.ready, self.error = True, ''
                 self.bot_name = str(value.get('bot_name', 'Discord bot'))[:100]
-                if first: self.notify('Discord connected as ' + self.bot_name + '.')
-                self.publish()
+                if first: self.outbox.defer(self.notify, 'Discord connected as ' + self.bot_name + '.')
+                self.outbox.defer(self.publish)
                 return
             if value.get('kind') == 'disconnected':
                 self.ready = False
-                self.notify('Discord gateway disconnected; reconnecting.', 'warning')
-                self.publish()
+                self.outbox.defer(self.notify, 'Discord gateway disconnected; reconnecting.', 'warning')
+                self.outbox.defer(self.publish)
                 return
             if value.get('kind') != 'message': raise ValueError('Unknown Discord report')
             def snowflake(key, optional=False):
@@ -112,9 +118,13 @@ class DiscordLauncher:
         return result
 
     def start(self):
+        try: return self._start()
+        finally: self.outbox.flush()
+
+    def _start(self):
         with self.lock:
             if self.status()['running']:
-                self.notify('Discord is already started' + (' and connected.' if self.ready else '; it is connecting.'))
+                self.outbox.defer(self.notify, 'Discord is already started' + (' and connected.' if self.ready else '; it is connecting.'))
                 return {**self.status(), 'already_started': True}
             try:
                 try: settings = self.access.settings()
@@ -129,13 +139,13 @@ class DiscordLauncher:
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 self.error = ''
             except ValueError as exc:
-                self.error = str(exc); self.publish(); raise
+                self.error = str(exc); self.outbox.defer(self.publish); raise
             except OSError as exc:
-                self.error = 'Discord client could not be started'; self.publish(); raise RuntimeError(self.error) from exc
+                self.error = 'Discord client could not be started'; self.outbox.defer(self.publish); raise RuntimeError(self.error) from exc
             process = self.process
             threading.Thread(target=self._watch, args=(process,), name='discord-process', daemon=True).start()
-            self.publish()
-            self.notify('Discord client is starting; waiting for its gateway connection.')
+            self.outbox.defer(self.publish)
+            self.outbox.defer(self.notify, 'Discord client is starting; waiting for its gateway connection.')
             return self.status()
 
     def _watch(self, process):

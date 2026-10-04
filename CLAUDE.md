@@ -42,7 +42,6 @@ python -u Code/task_mcp_server.py --store persistent_memories/tasks.sqlite3   # 
 Test caveats:
 - Use `HF_HUB_OFFLINE=1`: otherwise `tests/test_emotion.py` downloads Julia-1 (unpinned) and imports code from it.
 - `tests/test_server_logging.py` is stale (2 failures). `tests/test_settings_store.py::test_current_character_configuration_has_valid_settings` needs the private, gitignored `character_config.yaml` and only skips under `RIKO_RELEASE_BUILD=1`.
-- `tests/test_runtime_awareness.py::test_priority_still_allows_sustained_interruption_and_explicit_stop` can hang intermittently (see the lock rule under Threading); `-o faulthandler_timeout=60` dumps stacks.
 - Some tests use cwd-relative paths (`Path('Code')`, `Path('.')`), and `electron/src/formatted_text.test.mjs` / `polished_ui.test.mjs` start Vite SSR servers, so keep the working directories above.
 - Every GPU and audio-device path is mocked; a green suite says nothing about CUDA, Metal or ROCm behaviour.
 
@@ -76,7 +75,7 @@ Release (CI only, `.github/workflows/release.yml`): `python tools/release/build.
 
 ### Threading and events
 - `event_bus` (`app_core/events/bus.py`) is synchronous: listeners run on the publisher's thread, their exceptions are swallowed, and every event carries a monotonic `sequence`.
-- `SessionManager` (`app_core/runtime/session.py`) serialises foreground turns with `_turn_lock`. A second turn raises `RuntimeError('Riko is already handling another turn')`, which `app_core/integrations/discord/api.py` string-matches into a 409. The `_voice_lock` RLock guards voice/playback state, and the session's bus listener takes it for every event. **Never publish on the bus while holding another lock**: `WakeWord` does so today and has a reproducible lock-order inversion with `_voice_lock`.
+- `SessionManager` (`app_core/runtime/session.py`) serialises foreground turns with `_turn_lock`. A second turn raises `RuntimeError('Riko is already handling another turn')`, which `app_core/integrations/discord/api.py` string-matches into a 409. The `_voice_lock` RLock guards voice/playback state, and bus listeners can take it. Lock order is `_capture_lock` (request handlers only) → `_voice_lock` → component locks. **Never publish or run callbacks while holding a component lock**: queue them on an `Outbox` (`app_core/events/outbox.py`) and call `flush()` after releasing it. `tests/test_lock_discipline.py` enforces this with a static scan and deadlock regressions.
 - Hidden coupling: voice input, animation, initiative, Discord and the server read private `SessionManager` fields (`_voice_lock`, `_active_turn`, `_generation_active`). Attributes are monkey-patched onto `ChatService` and providers and read back through `getattr` defaults. Renames break silently.
 - Background work uses `DaemonExecutor` (`app_core/runtime/workers.py`; bounded queue, daemon threads). Each turn is cancelled through its own `threading.Event` and `TurnCancelled`.
 

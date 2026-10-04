@@ -27,6 +27,9 @@ class SessionManager:
         if provider is not None:
             provider.expression_idle=lambda:not (self._generation_active or self._playing or self._speech_pending or self._user_speaking)
         self.actions = actions or ActionController()
+        # Lock order: _capture_lock (request handlers only) -> _voice_lock -> any component lock.
+        # Bus listeners take _voice_lock, so components must not publish while holding their own
+        # locks (use events.outbox.Outbox); tests/test_lock_discipline.py enforces this.
         self._turn_lock = threading.Lock()
         self._voice_lock = threading.RLock()
         self._capture_lock = threading.Lock()
@@ -258,6 +261,8 @@ class SessionManager:
         self.wake_feedback.trigger(emotion.get('primary', 'neutral'), model_state, audio_enabled=audio_enabled)
 
     def _playback_event(self, event):
+        # Only voice/speech events change playback state; skip the rest before locking.
+        if not event.type.startswith(('voice.', 'speech.')): return
         with self._voice_lock:
             if event.type == 'voice.starting': self._voice_phase = 'starting'
             elif event.type == 'voice.activated': self._voice_phase = 'awake'

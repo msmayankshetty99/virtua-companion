@@ -275,14 +275,15 @@ class EmotionProbe:
             if event.stream == 'assistant':
                 if self.active_group is not None and event.state.turn_id != self.active_group: return
                 if self.prediction_turn_id == event.state.turn_id: return
-            publish(event.state)
+        # Callbacks reach DesktopState and the session; never run them under the condition.
+        publish(event.state)
 
     def _publish(self, state, group, cancelled, *, fallback=False):
         with self.condition:
             if self.closed or cancelled() or self.active_group != group: return
             self.prediction_turn_id = None if fallback or state is None else group
             callback = self.on_fallback if fallback else self.on_prediction
-            if state is not None and callback: callback(replace(state, turn_id=group))
+        if state is not None and callback: callback(replace(state, turn_id=group))
 
     def _restore(self):
         source = self.data_path if self.data_path.exists() else self.path if self.path.exists() else self.legacy_path

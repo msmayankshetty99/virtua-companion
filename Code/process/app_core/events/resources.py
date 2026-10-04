@@ -2,12 +2,16 @@
 import json
 import threading
 
+from .outbox import Outbox
+
 
 class ResourceEvents:
     def __init__(self, bus, getters):
         self.bus, self.getters = bus, getters
         self.lock = threading.RLock()
         self.previous = {}
+        self.generation = {}
+        self.outbox = Outbox(bus)
         self.unsubscribe = bus.subscribe(self.observe)
 
     def snapshot(self):
@@ -18,13 +22,18 @@ class ResourceEvents:
         return result
 
     def emit(self, topic):
+        # Getters may take session locks, so they run unlocked. A newer emit of the same
+        # topic supersedes an older one still computing, and the outbox publishes in queue
+        # order after the lock is released, so subscribers never see a stale value last.
+        with self.lock: generation = self.generation[topic] = self.generation.get(topic, 0) + 1
         try: value = self.getters[topic]()
         except Exception: return
         key = json.dumps(value, sort_keys=True, default=str)
         with self.lock:
-            if self.previous.get(topic) == key: return
-            self.previous[topic] = key
-            self.bus.publish('resource.' + topic, **value)
+            if generation == self.generation[topic] and self.previous.get(topic) != key:
+                self.previous[topic] = key
+                self.outbox.put('resource.' + topic, **value)
+        self.outbox.flush()
 
     def observe(self, event):
         kind = event.type

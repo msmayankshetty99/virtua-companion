@@ -381,7 +381,7 @@ def save_settings(request: SettingsPatch):
             with LOCK:
                 config.avatar = deepcopy(load_config(settings_store().path).avatar)
                 config.raw['avatar'] = deepcopy(config.avatar)
-                event_bus.publish('state.snapshot', **snapshot())
+            event_bus.publish('state.snapshot', **snapshot())
         initiative = getattr(session, 'initiative', None)
         if result.get('saved') and initiative:
             budgets = {key.split('.')[-1]: result['values'][key] for key in ('initiative.context_window_tokens', 'initiative.max_output_tokens')}
