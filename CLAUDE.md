@@ -106,7 +106,7 @@ Release (CI only, `.github/workflows/release.yml`): `python tools/release/build.
 ### Persistence
 The data root is the directory holding `character_config.yaml`.
 - `persistent_memories/` is user data: never delete it during cleanup. Runtime files:
-  - `chat_history.json`: the model's context. Both `ChatService` and `SessionManager` rewrite the whole file, and an invalid file is treated as empty.
+  - `chat_history.json`: the model's context. Both `ChatService` and `SessionManager` rewrite the whole file (fsynced). An unreadable file is kept as `chat_history.json.unreadable-<timestamp>` before anything replaces it. Only a turn still generating or playing is cut by Stop/Sleep/shutdown; failed and cancelled turns keep the user's message.
   - `memory_store.json` (`app_core/persistence/memory.py`): written via temp file, fsync and replace; fails closed. Its FAISS index is written but rebuilt from embeddings on load.
   - `conversations.sqlite3`: the UI archive, built from bus events. It is a second history and can diverge from `chat_history.json`.
   - `tasks.sqlite3` (`app_core/persistence/tasks.py`): revision-checked, and shared with `Code/task_mcp_server.py`.
@@ -146,7 +146,7 @@ The data root is the directory holding `character_config.yaml`.
   - `runtime.native_library: bundled:<cuda|vulkan>` resolves to `$RIKO_BUNDLE_ROOT/native/<backend>/`.
 
 ## Conventions and gotchas
-- Writes go to a temp file and then `os.replace`; the memory store and settings also fsync. Stores fail closed rather than resetting user data.
+- Writes go to a temp file and then `os.replace`; the memory store, settings and chat history also fsync. Stores fail closed rather than resetting user data: keep an unreadable file with `persistence/preserve.py` (`<name>.unreadable-<timestamp>`), or refuse to save over it.
 - Optimistic concurrency uses revisions throughout: the settings `revision`, task `expected_revision` (`TaskConflict` → 409), the Discord access revision, memory-record revisions, and whiteboard `board_revision`.
 - File paths supplied by the renderer or the model must go through `resolve_media` (`app_core/desktop/media.py`: approved roots plus an extension allowlist).
 - Heavy dependencies (torch, faster_whisper, sounddevice, silero_vad, sentence_transformers, openai, huggingface_hub) are imported lazily, and tests swap them through `sys.modules`. Services accept `start=False` / `start_worker=False`. Tests must close services and unsubscribe from the global `event_bus` in `finally`.

@@ -1,8 +1,11 @@
 """Snapshots originate at mutation events, never periodic status requests."""
 import json
+import logging
 import threading
 
 from .outbox import Outbox
+
+logger = logging.getLogger(__name__)
 
 
 class ResourceEvents:
@@ -18,7 +21,9 @@ class ResourceEvents:
         result = {}
         for topic, getter in self.getters.items():
             try: result[topic] = getter()
-            except Exception: result[topic] = None # Runtime may be starting/stopping.
+            except Exception: # Runtime may be starting/stopping.
+                logger.debug('Resource %s unavailable for snapshot', topic, exc_info=True)
+                result[topic] = None
         return result
 
     def emit(self, topic):
@@ -27,7 +32,11 @@ class ResourceEvents:
         # order after the lock is released, so subscribers never see a stale value last.
         with self.lock: generation = self.generation[topic] = self.generation.get(topic, 0) + 1
         try: value = self.getters[topic]()
-        except Exception: return
+        except Exception as exc:
+            # Getters are HTTP handlers: an HTTP error (status_code) means the feature is off.
+            level = logging.DEBUG if hasattr(exc, 'status_code') else logging.WARNING
+            logger.log(level, 'Resource %s could not be read; panels keep the previous value', topic, exc_info=True)
+            return
         key = json.dumps(value, sort_keys=True, default=str)
         with self.lock:
             if generation == self.generation[topic] and self.previous.get(topic) != key:

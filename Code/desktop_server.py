@@ -1,6 +1,7 @@
 """Local HTTP/WebSocket bridge for the Electron desktop client."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -246,14 +247,17 @@ def neural_replay(key:str):
 
 @app.websocket('/ws/discord/client')
 async def discord_client(websocket: WebSocket, instance: str):
-    try: discord_launcher.attach(instance)
+    # attach/detach publish state that reaches session locks: run them off the event loop.
+    try: await run_in_threadpool(discord_launcher.attach, instance)
     except (ValueError, TypeError):
         await websocket.accept(); await websocket.close(code=1008, reason='A Discord client is already connected or the instance ID is invalid'); return
     async def report(value): await run_in_threadpool(discord_launcher.report, instance, value)
     try:
         await stream_events(websocket, event_bus, snapshot,
             initial=lambda: resource_events.snapshot() if resource_events else {'discord': discord_launcher.status()}, on_message=report)
-    finally: discord_launcher.detach(instance)
+    finally:
+        # Shielded: detach must still free the client slot if this handler is being cancelled.
+        await asyncio.shield(run_in_threadpool(discord_launcher.detach, instance))
 
 @app.get('/api/resources/gpu')
 def gpu_status():
@@ -274,6 +278,7 @@ def approval_policy(request: dict):
     registry = approval_registry()
     try: return registry.approvals.configure(request.get('policy'), registry.tools)
     except ValueError as exc: raise HTTPException(400, str(exc))
+    except OSError as exc: raise HTTPException(409, f'Could not save tool permissions: {exc}')
 
 @app.post('/api/tools/approvals/{request_id}')
 def resolve_approval(request_id: str, request: dict):
@@ -450,7 +455,8 @@ async def whiteboard_capture(request: Request, revision: str):
     async for chunk in request.stream():
         if len(png) + len(chunk) > 8 * 1024 * 1024: raise HTTPException(413, 'Board image exceeds 8 MiB')
         png.extend(chunk)
-    try: accepted = board_images.capture(revision, bytes(png), state.snapshot(), event_bus)
+    # PIL verification, hashing and the publish run off the event loop.
+    try: accepted = await run_in_threadpool(lambda: board_images.capture(revision, bytes(png), state.snapshot(), event_bus))
     except (ValueError, OSError) as exc: raise HTTPException(400, 'Invalid board image') from exc
     return {'accepted': accepted}
 
@@ -722,9 +728,11 @@ def delete_memory(record_id: str):
     return {"deleted": record_id}
 
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
+def chat_endpoint(request: ChatRequest):
+    # Plain def: FastAPI runs it in the thread pool, so the state/snapshot calls below
+    # (which take session locks) never block the event loop.
     try:
-        response = await run_in_threadpool(session.respond, request.text, request.user_name)
+        response = session.respond(request.text, request.user_name)
     except TurnCancelled:
         return {"cancelled": True}
     state.set_speech(response.message.content)

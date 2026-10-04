@@ -69,7 +69,7 @@ class DesktopState:
             self._save_board()
         for listener in tuple(self._listeners):
             try: listener(event, value)
-            except Exception: pass
+            except Exception: logging.getLogger(__name__).exception('Desktop state listener %r failed on %s', listener, event)
 
     def snapshot(self):
         with self._lock:

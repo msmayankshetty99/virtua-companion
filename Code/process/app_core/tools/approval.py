@@ -2,12 +2,16 @@
 from copy import deepcopy
 from contextvars import ContextVar
 import json
+import logging
+import os
 import threading
 import time
 import uuid
 from ..events.bus import event_bus
+from ..persistence.preserve import preserve_unreadable
 
 approval_turn = ContextVar('approval_turn', default=None)
+logger = logging.getLogger(__name__)
 
 
 class ToolApprovals:
@@ -17,26 +21,43 @@ class ToolApprovals:
         self.condition = threading.Condition(self.lock)
         self.pending, self.policy = {}, {}
         self.closed = False
+        self.error = ''
         try:
             value = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(value, dict): raise ValueError('Approval policy is not a JSON object')
             self.policy = {k: v for k, v in value.items() if isinstance(k, str) and type(v) is bool}
-        except (OSError, ValueError, AttributeError): pass
+        except FileNotFoundError: pass
+        except (OSError, ValueError) as exc:
+            # Fail closed: an unreadable policy must not silently switch every approval off.
+            self.error = f'{path.name} could not be read ({exc}); every tool needs approval until the policy is saved again'
+            logger.error('Tool approval policy unreadable: %s', self.error)
 
     def snapshot(self):
         with self.lock:
-            return {'default_required': self.default, 'policy': dict(self.policy),
+            # Report the enforced default: while the policy is unreadable every tool needs approval.
+            return {'default_required': self.default or bool(self.error), 'policy': dict(self.policy), 'error': self.error,
                 'pending': [deepcopy(v['request']) for v in self.pending.values() if v['decision'] is None]}
 
     def configure(self, policy, names):
         if not isinstance(policy, dict) or any(k not in names or type(v) is not bool for k, v in policy.items()):
             raise ValueError('Approval policy must map registered tool names to booleans')
         with self.lock:
-            updated = {**self.policy, **policy}
+            if self.error:
+                # Keep the unreadable original (raises OSError if impossible, so it is never
+                # overwritten), and persist "require approval" for every tool the user did not
+                # just change, rather than dropping back to the permissive default.
+                preserve_unreadable(self.path)
+                base = {name: True for name in names}
+            else: base = self.policy
+            updated = {**base, **policy}
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix('.tmp')
-            temporary.write_text(json.dumps(updated, indent=2), encoding='utf-8')
+            with temporary.open('w', encoding='utf-8') as stream:
+                stream.write(json.dumps(updated, indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
             temporary.replace(self.path)
-            self.policy = updated
+            self.policy, self.error = updated, ''
         event_bus.publish('tool.approval_policy')
         return self.snapshot()
 
@@ -53,7 +74,7 @@ class ToolApprovals:
     def authorize(self, name, arguments, call_id, cancelled=lambda: False, timeout=120):
         with self.lock:
             if self.closed or cancelled(): return False
-            if not self.policy.get(name, self.default): return True
+            if not self.error and not self.policy.get(name, self.default): return True
             request_id = str(uuid.uuid4())
             request = {'id': request_id, 'name': name, 'arguments': deepcopy(arguments),
                 'call_id': call_id, 'expires_at': time.time() + timeout}

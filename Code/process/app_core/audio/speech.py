@@ -58,7 +58,7 @@ class SpeechQueue:
                 self.queue.put_nowait((text, turn_id, chunks, future, interrupt, start_offset, end_offset))
         # Publish and register callbacks outside the submit lock: both can run listeners inline.
         if full:
-            event_bus.publish("speech.error", turn_id=turn_id, error="Speech queue full")
+            event_bus.publish("speech.error", turn_id=turn_id, error="Speech queue full", queued=False)
             return False
         future.add_done_callback(finished)
         return True
