@@ -250,10 +250,13 @@ class ToolRegistry:
             self._processes.add(process)
         try:
             try:
-                output, _ = process.communicate(json.dumps({**tool.isolated, 'arguments': arguments}), timeout=self.timeout_seconds)
+                output, errors = process.communicate(json.dumps({**tool.isolated, 'arguments': arguments}), timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired:
                 process.kill(); process.communicate()
                 raise TimeoutError('Isolated tool terminated at deadline')
+            if not output.strip():  # the worker itself failed to start (a frozen build missing a module, say)
+                logger.warning('Tool worker exited with code %s and no result:\n%s', process.returncode, errors[-4000:])
+                raise RuntimeError(f'Tool worker exited with code {process.returncode} and no result')
             payload = json.loads(output.splitlines()[-1])
             if 'error' in payload: raise RuntimeError(payload['error'])
             return payload['result']

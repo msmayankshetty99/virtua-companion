@@ -12,8 +12,21 @@ STAGE = ROOT / 'release-stage'
 PIN = 'b92761a515ea31e852e7fbc1fad5f874b46f3718'
 
 
-def run(*args, cwd=ROOT):
-    subprocess.run([str(a) for a in args], cwd=cwd, check=True)
+def run(*args, cwd=ROOT, env=None):
+    subprocess.run([str(a) for a in args], cwd=cwd, check=True, env=env)
+
+
+def release_check_environment(environ):
+    """Users have no CUDA toolkit or Vulkan SDK, so the release check runs without the build's library paths, toolkit
+    variables and PATH entries: a bundled library that is missing must fail to load, not resolve from the toolchain."""
+    removed = {'LD_LIBRARY_PATH', 'LD_PRELOAD', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
+        'PYTHONPATH', 'PYTHONHOME', 'VULKAN_SDK', 'VK_SDK_PATH'}
+    environment = {key: value for key, value in environ.items()
+        if key.upper() not in removed and not key.upper().startswith(('CUDA', 'RIKO_'))}
+    for key in [key for key in environment if key.upper() == 'PATH']:
+        environment[key] = os.pathsep.join(entry for entry in environment[key].split(os.pathsep)
+            if entry and not any(name in entry.lower() for name in ('cuda', 'vulkan', 'nvidia')))
+    return {**environment, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1'}
 
 
 def cmake_file_definition(name, path):
@@ -47,7 +60,10 @@ def main():
         if backend == 'cuda':
             # Upstream uses -INFINITY as a max-reduction sentinel. MSVC's
             # expansion triggers NVCC #221 repeatedly; retain the upstream code.
-            flags += ['-DCMAKE_CUDA_FLAGS=--diag-suppress=221']
+            # Without NO_VMM, ggml-cuda links the driver library (nvcuda.dll, libcuda.so.1) directly, so the bundle
+            # could not load at all without an NVIDIA driver, as on CI runners; cudart still loads the driver when CUDA
+            # starts. The cost: the CUDA memory pool grows with cudaMalloc instead of virtual-memory mappings.
+            flags += ['-DCMAKE_CUDA_FLAGS=--diag-suppress=221', '-DGGML_CUDA_NO_VMM=ON']
         if sys.platform != 'win32': flags += ['-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON', '-DCMAKE_INSTALL_RPATH=$ORIGIN']
         run('cmake', '-S', checkout, '-B', build, *flags)
         run('cmake', '--build', build, '--config', 'Release', '--target', 'riko-native', '-j', '2')
@@ -76,15 +92,18 @@ def main():
         '--name', 'riko-backend', '--paths', ROOT / 'Code', '--distpath', STAGE,
         '--workpath', ROOT / 'release-build', '--specpath', ROOT / 'release-build',
         '--collect-submodules', 'process', '--hidden-import', 'desktop_server', '--hidden-import', 'discord_bot',
+        # numpy >= 2.3 imports this only from C; PyInstaller's own numpy hook lists it from 6.14.1 on.
+        '--hidden-import', 'numpy._core._exceptions',
         *[item for package in ('torch', 'transformers', 'sentence_transformers', 'faster_whisper',
             'ctranslate2', 'silero_vad', 'onnxruntime', 'sounddevice', 'soundfile',
-            'scipy', 'cv2', 'ruamel.yaml', 'eff_word_net', 'discord', 'uvicorn')
+            'scipy', 'ruamel.yaml', 'eff_word_net', 'discord', 'uvicorn')
             for item in ('--collect-all', package)], ROOT / 'Code/run_server.py')
     shutil.copytree(STAGE / 'riko-backend', STAGE / 'backend', dirs_exist_ok=True)
     executable = STAGE / 'backend' / ('riko-backend.exe' if sys.platform == 'win32' else 'riko-backend')
-    for backend in ('cuda', 'vulkan'):
+    environment = release_check_environment(os.environ)
+    for backend in ('cuda', 'vulkan'):  # one process each: both bundles name their libraries alike
         library = STAGE / 'native' / backend / ('riko-native.dll' if sys.platform == 'win32' else 'libriko-native.so')
-        run(executable, '--release-check', library)
+        run(executable, '--release-check', library, env=environment)
     manifest = {str(file.relative_to(STAGE)): hashlib.sha256(file.read_bytes()).hexdigest()
         for file in STAGE.rglob('*') if file.is_file()}
     (notices / 'SHA256SUMS.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')

@@ -24,6 +24,10 @@ def main():
     os.environ.setdefault('RIKO_DATA_DIR', str(root))  # Where the backend client finds the API token.
     load_dotenv(root / '.env') # Never search parent/private directories for credentials.
     settings = DiscordAccess(root).settings()
+    if '--dry-run' in sys.argv:  # run_server.release_check: the worker starts and builds its client, but never logs in
+        CompanionBot(settings)
+        print('RIKO_DISCORD_DRY_RUN_OK', flush=True)
+        return
     if not settings.token: raise ValueError('Discord_bot_token is required')
     if not settings.admins: raise ValueError('Configure Discord_admins before starting the bot')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
@@ -40,4 +44,5 @@ if __name__ == '__main__':
         name = type(exc).__name__
         code = 'login' if name == 'LoginFailure' else 'intents' if name == 'PrivilegedIntentsRequired' else 'dependency' if isinstance(exc, ImportError) else 'backend' if isinstance(exc, TimeoutError) else 'startup'
         print('RIKO_DISCORD_ERROR:' + code, flush=True)
+        if '--dry-run' in sys.argv: raise  # the release check shows the traceback; the launcher never passes --dry-run
         raise SystemExit(1) from None

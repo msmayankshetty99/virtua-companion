@@ -3,10 +3,25 @@ from pathlib import Path
 import asyncio
 import os
 import logging
+import sys
 
 import uvicorn
 
 from process.app_core.configuration.config import load_config
+
+# Imported lazily or dynamically, so a module or data file the frozen build misses would otherwise fail only on a
+# user's machine (tools/release/build.py collects them).
+RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'faster_whisper', 'ctranslate2', 'silero_vad',
+    'onnxruntime', 'sounddevice', 'soundfile', 'scipy.signal', 'ruamel.yaml', 'pypdf', 'openai', 'huggingface_hub', 'discord',
+    'discord_bot')
+# Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
+DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
+
+
+def is_driver(name):
+    """The NVIDIA driver library under any name it loads by; Linux maps list libcuda.so.<driver version>."""
+    import re
+    return name.lower() == 'nvcuda.dll' or bool(re.fullmatch(r'libcuda\.(dylib|so(\.\d+)*)', name))
 
 
 class Server(uvicorn.Server):
@@ -21,18 +36,90 @@ class Server(uvicorn.Server):
         await super().shutdown(sockets=sockets)
 
 
-def main():
-    import sys
-    if '--release-check' in sys.argv:
-        import ctypes
-        library = Path(sys.argv[sys.argv.index('--release-check') + 1]).resolve()
+def loaded_libraries(names):
+    """{name: path} for the shared libraries among `names` that this process has loaded."""
+    import ctypes
+    if os.name == 'nt':
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.GetModuleHandleW.argtypes, kernel32.GetModuleHandleW.restype = [wintypes.LPCWSTR], wintypes.HMODULE
+        kernel32.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        kernel32.GetModuleFileNameW.restype = wintypes.DWORD
+        found = {}
+        for name in names:
+            buffer = ctypes.create_unicode_buffer(32768)
+            module = kernel32.GetModuleHandleW(name)
+            if module and kernel32.GetModuleFileNameW(module, buffer, len(buffer)): found[name] = Path(buffer.value)
+        return found
+    if sys.platform == 'darwin':
+        dyld = ctypes.CDLL(None)
+        dyld._dyld_get_image_name.argtypes, dyld._dyld_get_image_name.restype = [ctypes.c_uint32], ctypes.c_char_p
+        paths = [os.fsdecode(name) for name in map(dyld._dyld_get_image_name, range(dyld._dyld_image_count())) if name]
+    else:
+        with open('/proc/self/maps', encoding='utf-8', errors='surrogateescape') as maps:
+            paths = [fields[5].rstrip('\n') for fields in (line.split(None, 5) for line in maps) if len(fields) == 6 and fields[5].startswith('/')]
+    return {Path(path).name: Path(path) for path in paths if Path(path).name in names or is_driver(Path(path).name)}
+
+
+def native_bundle_problems(library, loaded):
+    """Why a loaded native bundle cannot ship: one of its libraries resolved from elsewhere (a toolkit, SDK or
+    LD_LIBRARY_PATH that users lack was shadowing it), or the NVIDIA driver library loaded with it."""
+    bundle = library.resolve().parent
+    return [f'{name} was loaded from {path}' for name, path in sorted(loaded.items())
+            if is_driver(name) or path.resolve().parent != bundle]
+
+
+def release_check(library=None):
+    """`--release-check [library]`: can this build do what an installed app needs? tools/release/build.py runs it on the
+    frozen backend once per native backend, without the build's toolkit paths; tests/test_release_build.py runs it on this
+    tree without a library. It needs no GPU, audio device, credentials, network or model, and touches no user data."""
+    import ctypes
+    import importlib
+    import subprocess
+    import tempfile
+    if library:
+        library = Path(library).resolve()
         directory = os.add_dll_directory(str(library.parent)) if os.name == 'nt' else None
         try:
             dll = ctypes.CDLL(str(library))
             for symbol in ('riko_create', 'riko_request', 'riko_set_interval', 'riko_stop', 'riko_destroy'): getattr(dll, symbol)
-            import torch, faster_whisper, sounddevice, silero_vad, onnxruntime
         finally:
             if directory: directory.close()
+        problems = native_bundle_problems(library, loaded_libraries({file.name for file in library.parent.iterdir()} | DRIVER_LIBRARIES))
+        if problems: raise SystemExit('The native bundle is not self-contained:\n  ' + '\n  '.join(problems))
+    for module in RELEASE_MODULES: importlib.import_module(module)
+    from eff_word_net.audio_processing import Resnet50_Arc_loss
+    from silero_vad import load_silero_vad
+    Resnet50_Arc_loss(); load_silero_vad()  # wake words and voice activity: both models are package data files
+    previous = os.getcwd()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as data:
+        # desktop_server loads the config on import: the defaults, in an empty data root, never a developer's files.
+        os.environ.update(RIKO_DATA_DIR=data, RIKO_CONFIG=str(Path(data) / 'character_config.yaml'))
+        os.chdir(data)
+        try:
+            import desktop_server  # the FastAPI app and the whole app_core import graph
+            from process.app_core.tools.builtin.scientific_calculator import Tool
+            from process.app_core.tools.registry import ToolRegistry
+            registry = ToolRegistry(timeout_seconds=300)  # through the real worker: --tool-worker when frozen
+            try:
+                registry.register_local(Tool({}, {}))
+                result = registry.execute(Tool.TOOL_NAME, {'expression': '2**10'})
+            finally: registry.close()
+            if result.is_error or result.content != '1024': raise SystemExit(f'A built-in tool failed in its worker: {result.content}')
+            # As DiscordLauncher starts it, but --dry-run stops before the credentials check and the login.
+            script = Path(__file__).with_name('discord_bot.py')
+            command = [sys.executable, '--discord-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(script)]
+            worker = subprocess.run([*command, '--dry-run'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
+            if worker.returncode or 'RIKO_DISCORD_DRY_RUN_OK' not in worker.stdout:
+                raise SystemExit(f'The Discord worker failed its dry run (exit {worker.returncode}):\n{worker.stdout}{worker.stderr}')
+        finally: os.chdir(previous)
+    print('RIKO_RELEASE_CHECK_OK', flush=True)
+
+
+def main():
+    if '--release-check' in sys.argv:
+        arguments = sys.argv[sys.argv.index('--release-check') + 1:]
+        release_check(arguments[0] if arguments else None)
         return
     if '--tool-worker' in sys.argv:
         import runpy

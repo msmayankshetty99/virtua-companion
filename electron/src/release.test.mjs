@@ -41,3 +41,12 @@ test('a Finder-launched macOS backend still finds Homebrew tools for MCP servers
   assert.match(fs.readFileSync(new URL('../release.cjs',import.meta.url),'utf8'),/process\.platform==='darwin'\?\{PATH:finderPath\(process\.env\.PATH\)\}/);
 });
 test('Linux launches keep the AppImage sandbox flag and run under XWayland',()=>{const builder=YAML.parse(fs.readFileSync(new URL('../electron-builder.yml',import.meta.url),'utf8'));assert.deepEqual(builder.appImage.executableArgs,['--no-sandbox','--ozone-platform=x11']);assert.ok(builder.linux.executableArgs.includes('--ozone-platform=x11'));const main=fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8');const relaunch=main.indexOf("app.commandLine.hasSwitch('ozone-platform')");assert.ok(relaunch>0&&relaunch<main.indexOf('requestSingleInstanceLock'));assert.match(main,/execPath:process\.env\.APPIMAGE/);});
+test('installers ship only what main-process files require, and every npm version is exact',()=>{
+  // electron-builder packs each production dependency into app.asar and refuses electron or itself there; the renderer is bundled into dist/.
+  const pkg=JSON.parse(fs.readFileSync(new URL('../package.json',import.meta.url),'utf8')),dir=new URL('..',import.meta.url),{builtinModules}=require('node:module');
+  const required=new Set(fs.readdirSync(dir).filter(f=>f.endsWith('.cjs')).flatMap(f=>[...fs.readFileSync(new URL(f,dir),'utf8').matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map(m=>m[1])).filter(n=>!n.startsWith('.')&&n!=='electron'&&!n.startsWith('node:')&&!builtinModules.includes(n)));
+  assert.deepEqual(Object.keys(pkg.dependencies).sort(),[...required].sort());
+  for(const name of ['electron','electron-builder','vite'])assert.ok(pkg.devDependencies[name],name);
+  for(const [name,version] of Object.entries({...pkg.dependencies,...pkg.devDependencies}))assert.match(version,/^\d+\.\d+\.\d+$/,name);
+  assert.equal(pkg.devDependencies['electron-builder'],'26.0.12');
+});

@@ -6,7 +6,6 @@ ruamel.yaml>=0.18
 pypdf>=4
 huggingface_hub
 sentence-transformers
-opencv-python
 httpx
 numpy
 requests

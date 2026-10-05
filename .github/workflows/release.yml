@@ -12,6 +12,10 @@ jobs:
       matrix:
         os: [windows-2022, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # bash -eo pipefail stops a step at its first failing command; Windows' default pwsh checks only the last one.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,17 +52,17 @@ jobs:
           "VULKAN_SDK=C:\VulkanSDK\1.3.296.0" >> $env:GITHUB_ENV
           "C:\VulkanSDK\1.3.296.0\Bin" >> $env:GITHUB_PATH
       - name: Python runtime dependencies
+        # Exactly the versions in the hash-locked files from tools/release/lock.py; torch is the CPU build.
         run: |
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -r requirements-runtime.txt pyinstaller==6.12.0 pytest
-          python -m pip install EfficientWord-Net --no-deps
+          python -m pip install --require-hashes -r tools/release/requirements-lock.txt --extra-index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --require-hashes --no-deps -r tools/release/requirements-lock-no-deps.txt
       - name: Frontend dependencies
         working-directory: electron
         run: npm ci
       - name: Backend release regression checks
         env:
           RIKO_RELEASE_BUILD: '1'
-        run: python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py -q
+        run: python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q
       - name: Build both native backends and freeze Python
         run: python tools/release/build.py
       - name: Frontend dependencies and tests
@@ -66,12 +70,12 @@ jobs:
         run: |
           npm test
           npm run build
-          npm install --no-save --package-lock=false electron-builder@26.0.12
       - name: Package installers
         working-directory: electron
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npx --no-install electron-builder --config electron-builder.yml --publish never
+        # The deb target needs a homepage, and electron-builder looks for .git only in electron/. Quoted for pwsh.
+        run: npx --no-install electron-builder --config electron-builder.yml --publish never "-c.extraMetadata.homepage=${{ github.server_url }}/${{ github.repository }}"
       - uses: actions/upload-artifact@v4
         with:
           name: Riko-${{ runner.os }}-x64

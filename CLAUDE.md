@@ -27,7 +27,9 @@ python -u Code/run_server.py   # backend; run from the repo root; Ctrl+C stops i
 HF_HUB_OFFLINE=1 python -m pytest -q
 python -m pytest tests/test_tasks.py -q
 python -m pytest tests/test_tasks.py::test_real_stdio_mcp_handshake_and_task_round_trip -q
-RIKO_RELEASE_BUILD=1 python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py -q   # everything CI runs
+RIKO_RELEASE_BUILD=1 python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q   # everything CI runs
+python Code/run_server.py --release-check   # the frozen build's Python-side self-check, against the dev tree (no native library)
+python tools/release/lock.py               # after editing requirements-runtime.txt or tools/release/requirements-build.in (needs uv)
 
 # Electron, from electron/ (CI uses Node 22)
 npm ci && npm run build && npm run start   # loads dist/; start the backend first
@@ -56,7 +58,7 @@ cmake --build .native/llama.cpp/build --config Release --target riko-native -j 2
 
 `-DGGML_CUDA=OFF` gives a CPU-only build on Windows/Linux. On macOS the same configure builds Metal by default (embedded shader library, no full Xcode needed) and produces `libriko-native.dylib`. Point `runtime.native_library` at the built library and keep its llama/ggml libraries beside it.
 
-Release (CI only, `.github/workflows/release.yml`): `python tools/release/build.py` clones llama.cpp into `.native/llama.cpp-release` (it refuses if that exists), builds the `cuda` and `vulkan` backends, freezes `riko-backend` with PyInstaller into `release-stage/` and runs `--release-check`; electron-builder 26.0.12 then packages from `electron/`.
+Release (CI only, `.github/workflows/release.yml`): Python dependencies come from the hash-locked `tools/release/requirements-lock*.txt` (CPU torch; PyInstaller pinned there), and Electron's from `electron/package-lock.json` via `npm ci` (only `yaml` is a runtime dependency; electron and electron-builder 26.0.12 are exact devDependencies). `python tools/release/build.py` clones llama.cpp into `.native/llama.cpp-release` (it refuses if that exists), builds the `cuda` (with `GGML_CUDA_NO_VMM`, so no hard link to the NVIDIA driver) and `vulkan` backends, freezes `riko-backend` with PyInstaller into `release-stage/` and runs `riko-backend --release-check <library>` in a cleaned environment: it checks the five exports, that bundled libraries load from the bundle and no driver library loads, imports every lazily imported module and `desktop_server`, runs a calculator call through the real `--tool-worker`, and dry-runs the Discord worker. electron-builder then packages from `electron/`.
 
 ## Architecture
 
