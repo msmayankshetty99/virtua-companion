@@ -43,6 +43,7 @@ function Controls() {
   useEffect(()=>{let alive=true;window.windowBridge?.state().then(value=>{if(alive){setMode(value.mode||'full');if(value.dockWidth)setDockSize(value.dockWidth);}}).catch(()=>{});const off=window.windowBridge?.subscribe(value=>{if(value.mode)setMode(value.mode);if(value.dockWidth)setDockSize(value.dockWidth);});return()=>{alive=false;off?.();};},[]);
   const [preferences, updatePreferences] = usePreferences();
   const runtime=useRuntime();
+  useEffect(()=>{window.riko?.settingsDirty?.(settingsDirty);},[settingsDirty]);
   function navigate(name){if(view==='settings'&&settingsDirty&&name!==view&&!confirm('Discard unsaved settings changes?'))return;setView(name);}
   useEffect(()=>window.riko?.onNavigate?.(name=>{if(['chat','workspace','tasks','settings','appearance'].includes(name))navigate(name);}),[view,settingsDirty]);
   useEffect(()=>{document.title=runtime.character_name||'Conversation';},[runtime.character_name]);

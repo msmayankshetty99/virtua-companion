@@ -7,7 +7,9 @@ function useApprovals(){
 export function ApprovalBubble({overlay=false}){
   const [data,,error,setError]=useApprovals(),[busy,setBusy]=useState(false);
   const item=data?.pending?.[0];
-  useEffect(()=>{if(!overlay)return;window.approvalBridge?.interactive(!!item);return()=>window.approvalBridge?.interactive(false);},[overlay,!!item]);
+  // The overlay spans the display; holding it interactive while a request waits would swallow every click there.
+  // Like popups, take the pointer only while it is over the card.
+  useEffect(()=>{if(!overlay||!item)return;let on=false;const hit=e=>{const next=!!e.target.closest?.('.overlay-approval');if(next!==on){on=next;window.approvalBridge?.interactive(next);}};document.addEventListener('pointermove',hit,true);document.addEventListener('mousemove',hit,true);return()=>{document.removeEventListener('pointermove',hit,true);document.removeEventListener('mousemove',hit,true);window.approvalBridge?.interactive(false);};},[overlay,!!item]);
   async function decide(approved){setBusy(true);try{await request('/api/tools/approvals/'+item.id,{method:'POST',body:{approved}});setError('');}catch(e){setError(e.message);}finally{setBusy(false);}}
   if(!item)return null;
   return <aside className={'approval-bubble '+(overlay?'overlay-approval':'')} role="dialog" aria-label="Approve tool use"><span className="eyebrow">PERMISSION REQUEST{data.pending.length>1?` · ${data.pending.length} waiting`:''}</span><h3>Allow {item.name}?</h3><p>This call will only run after you approve it.</p><details><summary>Review arguments</summary><pre>{JSON.stringify(item.arguments,null,2)}</pre></details>{error&&<p role="alert">{error}</p>}<div className="approval-actions"><button disabled={busy} onClick={()=>decide(false)}>Deny</button><button className="primary" disabled={busy} onClick={()=>decide(true)}>Approve once</button></div></aside>;

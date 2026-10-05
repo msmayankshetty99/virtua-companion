@@ -1,5 +1,9 @@
 from pathlib import Path
+import json
 import os
+import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -239,3 +243,45 @@ def test_speech_recognition_error_names_the_value_that_cannot_run(store, monkeyp
     errors = store.validate({'voice.asr_device': 'cpu'})['errors']  # CPU is fine; the stored precision is what cannot run there
     assert 'voice.asr_device' not in errors and 'cpu cannot run int8_float16' in errors['voice.asr_compute_type']
     assert store.validate({'voice.asr_device': 'cpu', 'voice.asr_compute_type': 'default'})['valid']
+
+
+def test_live_budget_is_checked_only_when_edited_so_older_setups_can_save(tmp_path, monkeypatch):
+    # The setup wizard used to write memory.context_window_tokens equal to n_ctx, which never leaves room for the reply.
+    monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(tmp_path / 'application'))
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: llama_cpp\n  native_library: bundled:cuda\n  hf_repo_id: owner/model\n  hf_filename: model.gguf\n'
+        '  n_ctx: 8192\n  max_output_tokens: 1024\nmemory:\n  context_window_tokens: 8192\n')
+    store = SettingsStore(path)
+    assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
+    assert 'Context must fit' in store.validate({'runtime.max_output_tokens': 512})['errors']['runtime.n_ctx']
+    assert store.validate({'memory.context_window_tokens': 7168})['valid']
+    path.write_text(path.read_text().replace('memory:\n  context_window_tokens: 8192\n', ''))
+    assert store.snapshot()['values']['memory.context_window_tokens'] == 7168  # the prompt gets what the reply leaves
+    assert store.validate({'runtime.n_ctx': 4096})['valid']
+    assert 'runtime.n_ctx' in store.validate({'runtime.max_output_tokens': 8192})['errors']
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.skipif(not shutil.which('node') or not (ROOT / 'electron' / 'node_modules' / 'yaml').is_dir(), reason='needs node and the Electron dependencies')
+def test_packaged_setup_writes_a_config_settings_can_save(tmp_path, monkeypatch):
+    resources = tmp_path / 'application'
+    library = resources / 'native' / 'cuda' / ('riko-native.dll' if sys.platform == 'win32' else 'libriko-native.so')
+    library.parent.mkdir(parents=True); library.write_text('test')
+    form = {'backend': 'cuda', 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 4}
+    script = "require('./release.cjs').saveSetup(process.argv[1], JSON.parse(process.argv[2]), process.argv[3])"
+    subprocess.run(['node', '-e', script, str(tmp_path / 'data'), json.dumps(form), str(resources)], cwd=ROOT / 'electron', check=True, timeout=60)
+    monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(resources))
+    store = SettingsStore(tmp_path / 'data' / 'character_config.yaml')
+    assert store.validate({'runtime.n_ctx': 8192}) == {'valid': True, 'errors': {}}  # the wizard's budget fits
+    assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
+
+
+def test_legacy_preset_context_leaves_room_for_the_reply(tmp_path):
+    from process.app_core.configuration.config import load_config
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: llama_cpp\n  model_path: model.gguf\n  max_output_tokens: 1024\npresets:\n  default:\n    model_params:\n      context_window_token_limit: 8192\n')
+    config = load_config(path)
+    assert config.runtime.n_ctx == 8192 and config.memory.context_window_tokens == 7168
+    assert SettingsStore(path).validate({'runtime.max_output_tokens': 512})['valid']

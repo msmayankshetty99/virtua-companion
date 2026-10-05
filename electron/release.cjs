@@ -23,14 +23,17 @@ function configuration(input,resources){
  if(input.modelPath&&(!path.isAbsolute(input.modelPath)||!input.modelPath.toLowerCase().endsWith('.gguf')||!fs.existsSync(input.modelPath)))throw new Error('Local GGUF does not exist');
  return {runtime:{provider:'llama_cpp',native_library:'bundled:'+input.backend,model_path:input.modelPath||null,hf_repo_id:input.repo||null,hf_filename:input.filename||null,hf_revision:input.revision||'main',n_ctx:context,max_output_tokens:output,n_threads:threads,n_gpu_layers:input.cpuOnly?0:-1,parallel_slots:2,flash_attn:'auto',type_k:'f16',type_v:'f16',warmup:false},
   presets:{default:{name:input.name||'Riko',system_prompt:input.prompt||'You are a helpful local companion.'}},
-  memory:{context_window_tokens:context,default_memories:String(input.memories||'').split('\n').filter(t=>t.trim()).map(text=>({text,memory_type:'factual',importance:.8})),embeddings_enabled:!!input.embeddings,system1_enabled:!!input.julia,reflection_enabled:!!input.reflection},
+  memory:{context_window_tokens:context-output,default_memories:String(input.memories||'').split('\n').filter(t=>t.trim()).map(text=>({text,memory_type:'factual',importance:.8})),embeddings_enabled:!!input.embeddings,system1_enabled:!!input.julia,reflection_enabled:!!input.reflection},
   emotion:{enabled:!!input.julia,device:'cpu',probe:{enabled:false}},voice:{asr_device:'cpu',asr_compute_type:'int8'},tools:{require_approval:true},initiative:{enabled:false},desktop:{setup_on_startup_error:true},
   sovits_ping_config:{auto_start:!!input.sovitsAuto,executable:input.sovitsExecutable||null,arguments:[],url:input.sovitsUrl||'http://127.0.0.1:9880/tts',ref_audio_path:input.referenceAudio||'',prompt_text:input.referenceText||'',text_lang:'en',prompt_lang:'en',sample_rate:32000}};
 }
-function saveSetup(directory,input,resources){
+// The folder an update replaces and an uninstall deletes (NSIS ends with RMDir /r $INSTDIR): the .app bundle on
+// macOS, the executable's folder elsewhere.
+function installRoot(executable,platform=process.platform){return platform==='darwin'?path.resolve(executable,'..','..','..'):path.dirname(executable);}
+function inside(parent,child){const relative=path.relative(path.resolve(parent),path.resolve(child));return relative===''||relative!=='..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);}
+function saveSetup(directory,input,resources,install=resources){
  if(!path.isAbsolute(directory))throw new Error('Choose an absolute data directory');
- const relative=path.relative(path.resolve(resources),path.resolve(directory));
- if(relative===''||relative!=='..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative))throw new Error('Choose a data folder outside installed application resources');
+ if([install,resources].some(root=>inside(root,directory)))throw new Error('Choose a data folder outside the application folder ('+path.resolve(install)+'); updates and uninstall delete everything inside it');
  const config=configuration(input,resources);
  fs.mkdirSync(directory,{recursive:true});
  for(const folder of ['models','persistent_memories','logs'])fs.mkdirSync(path.join(directory,folder),{recursive:true});
@@ -77,4 +80,4 @@ function startSovits(settings){
 }
 // Ask first; the backend gives itself 14 s. uvicorn ignores SIGTERM while already shutting down, so escalate to SIGKILL.
 function stopBackend(child,grace=15000,force=3000){return new Promise(resolve=>{if(!child||child.exitCode!==null||child.signalCode!==null){resolve();return;}let timer=setTimeout(()=>{child.kill();timer=setTimeout(()=>{child.kill('SIGKILL');resolve();},force);},grace);child.once('exit',()=>{clearTimeout(timer);resolve();});child.stdin.end('shutdown\n');});}
-module.exports={hardware,configuration,saveSetup,startBackend,nativeLibrary,startSovits,stopBackend,watchListening,finderPath,LISTENING};
+module.exports={hardware,configuration,saveSetup,installRoot,startBackend,nativeLibrary,startSovits,stopBackend,watchListening,finderPath,LISTENING};

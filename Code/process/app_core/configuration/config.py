@@ -217,6 +217,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         runtime.initiative_max_output_tokens = persisted_output
     except (OSError, ValueError, TypeError, AttributeError): pass
     runtime.reflection_n_ctx = memory_raw.get('reflection_context_window_tokens', 4096)
+    # The in-process context holds the prompt and the reply, so by default the prompt gets what the reply leaves.
+    native = str(runtime.provider).lower().replace('-', '_') == 'llama_cpp'
+    live_prompt = max(1, runtime.n_ctx - runtime.max_output_tokens) if native else 8192
+    # The legacy preset key sets n_ctx; as a prompt budget it would leave no room for the reply.
+    legacy_prompt = params.get('context_window_token_limit', live_prompt)
     from ..inference.kv_budget import pool_capacity
     if runtime.kv_pool_auto: runtime.kv_pool_tokens = pool_capacity(runtime)
     return AppConfig(
@@ -233,7 +238,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         memory=MemoryConfig(
             history_file=_path(root, raw.get("history_file", memory_raw.get("history_file", "persistent_memories/chat_history.json"))) or root / "persistent_memories/chat_history.json",
-            context_window_tokens=int(memory_raw.get("context_window_tokens", params.get("context_window_token_limit", 8192))),
+            context_window_tokens=int(memory_raw.get("context_window_tokens", min(legacy_prompt, live_prompt) if native else legacy_prompt)),
             store_file=_path(root, memory_raw.get("store_file", "persistent_memories/memory_store.json")) or root / "persistent_memories/memory_store.json",
             index_file=_path(root, memory_raw.get("index_file", "persistent_memories/faiss_index.index")) or root / "persistent_memories/faiss_index.index",
             embedding_model=str(memory_raw.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")),

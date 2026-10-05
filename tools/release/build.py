@@ -70,7 +70,9 @@ def main():
     shutil.copy2(checkout / 'LICENSE', notices / 'llama.cpp-LICENSE')
     shutil.copy2(ROOT / 'tools/release/README.md', notices / 'distribution-notes.md')
     # Freeze the backend and dynamic imports; no source config or private assets.
-    run(sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir',
+    # UTF-8 mode for the backend, --tool-worker and --discord-worker: frozen apps ignore PYTHONUTF8, and on Windows
+    # stdio and open() would otherwise use the ANSI code page (logs/backend-launch.log, tool results).
+    run(sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--python-option', 'X utf8',
         '--name', 'riko-backend', '--paths', ROOT / 'Code', '--distpath', STAGE,
         '--workpath', ROOT / 'release-build', '--specpath', ROOT / 'release-build',
         '--collect-submodules', 'process', '--hidden-import', 'desktop_server', '--hidden-import', 'discord_bot',

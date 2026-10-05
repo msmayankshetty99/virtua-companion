@@ -33,3 +33,8 @@ linux:
       arch: [x64]
   category: Utility
   maintainer: Riko contributors
+  # The overlay needs window positioning, always-on-top and pointer forwarding, which native Wayland ignores; run under XWayland.
+  executableArgs: ['--ozone-platform=x11']  # deb launcher
+appImage:
+  # Replaces electron-builder's default '--no-sandbox', which Ubuntu 24.04+ needs for AppImages, so keep it.
+  executableArgs: ['--no-sandbox', '--ozone-platform=x11']

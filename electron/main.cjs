@@ -1,12 +1,17 @@
 const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen, session, shell, Tray, Menu, nativeImage } = require('electron');
 // Hardware acceleration is Electron's default; keep WebGL and GPU rasterization enabled.
 app.commandLine.appendSwitch('enable-gpu-rasterization');
+// Linux Wayland: the overlay needs X11 (placement, always-on-top, click-through) and Ozone is chosen before this file
+// runs, so a launch without a platform (a double-clicked AppImage, a terminal) relaunches once under XWayland.
+if(process.platform==='linux'&&process.env.WAYLAND_DISPLAY&&!app.commandLine.hasSwitch('ozone-platform')){app.relaunch({...(process.env.APPIMAGE?{execPath:process.env.APPIMAGE}:{}),args:[...process.argv.slice(1),'--ozone-platform=x11']});app.exit(0);return;}
 const path = require('path');
 const fs = require('fs');
 const YAML = require('yaml');
 let root = app.isPackaged?process.resourcesPath:path.resolve(__dirname, '..');
-let backendProcess,sovitsProcess,setupWindow,shutdownRequested=false;
-if(app.isPackaged&&!app.requestSingleInstanceLock())app.quit();
+let backendProcess,sovitsProcess,setupWindow,shutdownRequested=false,settingsDirty=false;
+// A second launch only wakes the running instance. app.quit() before ready still runs whenReady callbacks, which
+// would spawn a second backend (loading the model again) and GPT-SoVITS, so stop evaluating this file here.
+if(app.isPackaged&&!app.requestSingleInstanceLock()){app.quit();return;}
 app.on('second-instance',()=>{if(setupWindow&&!setupWindow.isDestroyed())setupWindow.focus();else if(control&&!control.isDestroyed())showControls();});
 const release=require('./release.cjs');
 const {shortcutBindings}=require('./shortcuts.cjs');
@@ -15,7 +20,7 @@ ipcMain.handle('setup-hardware',async event=>{setupSender(event);const hw=await 
 ipcMain.handle('setup-directory',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openDirectory','createDirectory']});return result.canceled?null:result.filePaths[0];});
 ipcMain.handle('setup-model',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openFile'],filters:[{name:'GGUF models',extensions:['gguf']}]});return result.canceled?null:result.filePaths[0];});
 ipcMain.handle('setup-sovits',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openFile']});return result.canceled?null:result.filePaths[0];});
-ipcMain.handle('setup-finish',(event,values)=>{setupSender(event);const directory=release.saveSetup(values.directory,values.settings,process.resourcesPath);fs.writeFileSync(path.join(app.getPath('userData'),'data-location.json'),JSON.stringify({directory}));app.relaunch();app.quit();return true;});
+ipcMain.handle('setup-finish',(event,values)=>{setupSender(event);const directory=release.saveSetup(values.directory,values.settings,process.resourcesPath,release.installRoot(app.getPath('exe')));fs.writeFileSync(path.join(app.getPath('userData'),'data-location.json'),JSON.stringify({directory}));app.relaunch();app.quit();return true;});
 const brandIcon=path.join(root,'assets','tray.png');
 let debug = false;
 let overlay, control, whiteboard, effects;
@@ -23,10 +28,19 @@ let neuralDataWindow;
 ipcMain.handle('neural-data-open',event=>{
  if(!control||control.isDestroyed()||event.sender.id!==control.webContents.id)throw new Error('Settings renderer required');
  if(neuralDataWindow&&!neuralDataWindow.isDestroyed()){neuralDataWindow.show();neuralDataWindow.focus();return true;}
- neuralDataWindow=new BrowserWindow({width:1000,height:800,title:'Expression training data',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
+ neuralDataWindow=new BrowserWindow({width:1000,height:800,title:'Expression training data',backgroundColor:'#101116',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
  protectNavigation(neuralDataWindow);neuralDataWindow.loadURL(page('neural-data'));return true;
 });
-const overlayPointer=require('./overlay_input.cjs').overlayInput(enabled=>{if(overlay&&!overlay.isDestroyed())overlay.setIgnoreMouseEvents(!enabled,{forward:true});});
+const {overlayInput,pointerForwarder}=require('./overlay_input.cjs');
+const overlayPointer=overlayInput(enabled=>{if(overlay&&!overlay.isDestroyed())overlay.setIgnoreMouseEvents(!enabled,{forward:true});});
+// Linux only: emulate click-through forwarding for the overlay and the dock/compact chat, and, as Electron does, only
+// while a window ignores the mouse; a window taking it gets real events (a stale buttons=0 move would end its drags).
+let controlIgnoring=false;
+// Electron forwards only to the topmost window; the overlay sits under the chat, whiteboard and setup windows.
+const coveredByWindow=point=>[!controlIgnoring&&control,whiteboard,setupWindow,neuralDataWindow].some(w=>{if(!w||w.isDestroyed()||!w.isVisible())return false;const b=w.getBounds();return point.x>=b.x&&point.y>=b.y&&point.x<b.x+b.width&&point.y<b.y+b.height;});
+const linuxPointer=process.platform==='linux'?pointerForwarder({cursor:()=>screen.getCursorScreenPoint(),bounds:w=>w.getContentBounds(),
+ targets:()=>[!overlayPointer.interactive&&!coveredByWindow(screen.getCursorScreenPoint())&&overlay,controlIgnoring&&!windowGesture&&control].filter(w=>w&&!w.isDestroyed()&&w.isVisible()),
+ send:(w,point)=>w.webContents.send('forwarded-pointer',point)}):null;
 let tray;
 let controlMode='full',fullControlBounds,compactControlBounds;
 let boardMode='full',boardBounds,controlTween,boardTween,collapsedControlBounds;
@@ -123,6 +137,9 @@ function createWindows(characterName='') {
   if(process.platform==='win32')control.hookWindowMessage(0x0202,()=>{if(windowGesture?.window===control)endWindowGesture();});
   control.webContents.once('did-finish-load',()=>{if(!debug){const a=screen.getPrimaryDisplay().workArea;setControlMode('collapsed',{x:a.x+a.width-80,y:a.y+a.height-70},true);}});
   control.on('close', event => {if (!app.isQuitting) {event.preventDefault();setControlMode(controlMode==='full'?'compact':'collapsed');}});
+  // Electron cancels a vetoed unload silently. before-quit already asked about unsaved Settings; a reload asks here.
+  control.webContents.on('will-prevent-unload',event=>{if(app.isQuitting||dialog.showMessageBoxSync(control,{type:'question',buttons:['Discard changes','Keep editing'],defaultId:1,cancelId:1,message:'Discard unsaved settings changes?'})===0){settingsDirty=false;event.preventDefault();}});
+  control.webContents.on('render-process-gone',()=>{settingsDirty=false;});
   control.on('hide',()=>{if(controlMode==='compact')compactControlBounds=control.getBounds();});
   control.on('minimize',()=>{if(app.isQuitting)return;control.setFocusable(false);control.restore();setControlMode('collapsed');});
   whiteboard = new BrowserWindow({width: 900, height: 700, minWidth: 320, minHeight: 240, show: false, frame:false, transparent:true, backgroundColor:'#00000000', skipTaskbar:true, alwaysOnTop:true, title: characterName?characterName+' — Whiteboard':'Whiteboard', webPreferences: {preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false}});
@@ -161,7 +178,7 @@ function setControlMode(mode,anchor,instant=false){
   if(control.isMaximized())control.unmaximize();
   const safeAnchor=anchor&&Number.isFinite(anchor.x)&&Number.isFinite(anchor.y)?anchor:undefined;
   const target=chatBounds(mode,current,area,safeAnchor,mode==='full'?fullControlBounds:mode==='collapsed'?collapsedControlBounds:compactControlBounds);
-  controlMode=mode;control.setMinimumSize(88,88);control.setResizable(mode==='full');control.setAspectRatio(0);control.setFocusable(mode!=='collapsed');control.setAlwaysOnTop(true);control.setIgnoreMouseEvents(mode!=='full',{forward:true});
+  controlMode=mode;control.setMinimumSize(88,88);control.setResizable(mode==='full');control.setAspectRatio(0);control.setFocusable(mode!=='collapsed');control.setAlwaysOnTop(true);control.setIgnoreMouseEvents(controlIgnoring=mode!=='full',{forward:true});
    applyWindowMaterial(control,mode,fullControlBlur);
   control.webContents.send('window-state',{maximized:false,mode,dockWidth:mode==='collapsed'?target.width:collapsedControlBounds?.width||88});tweenBounds(control,target,'chat',instant);
  }
@@ -191,7 +208,8 @@ app.whenReady().then(async () => {
     if(app.isPackaged){
       const locator=path.join(app.getPath('userData'),'data-location.json');
       if(!fs.existsSync(locator)){
-        setupWindow=new BrowserWindow({width:1000,height:850,webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
+        // Standalone pages paint no canvas (morph.css keeps html/body transparent), so the window supplies style.css's --bg.
+        setupWindow=new BrowserWindow({width:1000,height:850,backgroundColor:'#101116',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
         protectNavigation(setupWindow);await setupWindow.loadURL(page('setup'));return;
       }
       root=JSON.parse(fs.readFileSync(locator,'utf8')).directory;
@@ -215,7 +233,7 @@ app.whenReady().then(async () => {
       catch(error){dialog.showErrorBox('GPT-SoVITS could not start',error.message);}
     }
     debug = config.desktop?.debug === true;
-    prepareAvatarAssets(); createWindows(config.presets?.default?.name || '');
+    prepareAvatarAssets(); createWindows(config.presets?.default?.name || ''); linuxPointer?.start();
     createTray(config.presets?.default?.name || '');
     for (const name of ['display-added', 'display-removed', 'display-metrics-changed']) {
       screen.on(name, () => {displaySignature = ''; publishDisplays();});
@@ -245,13 +263,15 @@ app.on('gpu-info-update',()=>publishProcesses());
 app.on('child-process-gone',()=>publishProcesses());
 ipcMain.on('sync-processes',event=>{if([control,overlay,whiteboard,effects].some(window=>window&&!window.isDestroyed()&&window.webContents.id===event.sender.id))publishProcesses(true);});
 app.on('will-quit', () => {globalShortcut.unregisterAll();publishProcesses(true,true);});
-app.on('before-quit', event => {app.isQuitting = true;if(backendProcess&&!shutdownRequested){event.preventDefault();shutdownRequested=true;release.stopBackend(backendProcess).finally(()=>app.quit());}if(sovitsProcess)sovitsProcess.kill();endWindowGesture(); clearTimeout(geometryTimer);clearTimeout(controlTween);clearTimeout(boardTween);});
+// Ask before anything stops: once quitting, the backend is stopped first and unsaved Settings are discarded.
+app.on('before-quit', event => {if(!app.isQuitting&&settingsDirty&&control&&!control.isDestroyed()){setControlMode('full',undefined,true);if(dialog.showMessageBoxSync(control,{type:'question',buttons:['Quit and discard','Keep editing'],defaultId:1,cancelId:1,message:'Quit and discard unsaved settings changes?'})!==0){event.preventDefault();return;}}app.isQuitting = true;if(backendProcess&&!shutdownRequested){event.preventDefault();shutdownRequested=true;release.stopBackend(backendProcess).finally(()=>app.quit());}if(sovitsProcess)sovitsProcess.kill();linuxPointer?.stop();endWindowGesture(); clearTimeout(geometryTimer);clearTimeout(controlTween);clearTimeout(boardTween);});
+ipcMain.on('settings-dirty',(event,dirty)=>{if(control&&!control.isDestroyed()&&event.sender.id===control.webContents.id)settingsDirty=dirty===true;});
 ipcMain.on('show-control', event => {if([overlay,control,whiteboard].some(w=>w&&!w.isDestroyed()&&w.webContents.id===event.sender.id))showControls();});
 function chromeWindow(event){const window=[control,whiteboard].find(w=>w&&!w.isDestroyed()&&w.webContents.id===event.sender.id);if(!window)throw new Error('Control or whiteboard renderer required');return window;}
 ipcMain.handle('window-state',event=>{const w=chromeWindow(event);return {maximized:w.isMaximized(),mode:w===control?controlMode:boardMode,dockWidth:collapsedControlBounds?.width||88};});
 ipcMain.handle('window-action',(event,action,anchor,instant)=>{const w=chromeWindow(event);if(['close','minimize'].includes(action)){if(w===control)setControlMode(controlMode==='full'?'compact':'collapsed',anchor,instant===true);else setBoardMode('collapsed',instant===true);return {mode:w===control?controlMode:boardMode};}if(w===control&&action==='maximize'&&controlMode!=='full')setControlMode('full',anchor,instant===true);return windowAction(w,action);});
 ipcMain.handle('chat-mode',(event,mode,anchor,instant)=>{const w=chromeWindow(event);if(w===control)setControlMode(mode,anchor,instant===true);else setBoardMode(mode,instant===true);return {mode:w===control?controlMode:boardMode};});
-ipcMain.on('compact-interactive',(event,enabled)=>{if(controlMode!=='full'&&event.sender.id===control.webContents.id&&!windowGesture)control.setIgnoreMouseEvents(!enabled,{forward:true});});
+ipcMain.on('compact-interactive',(event,enabled)=>{if(controlMode!=='full'&&event.sender.id===control.webContents.id&&!windowGesture)control.setIgnoreMouseEvents(controlIgnoring=!enabled,{forward:true});});
 ipcMain.on('window-gesture',(event,value)=>{
  const w=[control,whiteboard].find(w=>w&&!w.isDestroyed()&&w.webContents.id===event.sender.id);
  if(!w||!value||typeof value.id!=='string'||value.id.length>64)return;
@@ -259,7 +279,7 @@ ipcMain.on('window-gesture',(event,value)=>{
  if(value.phase!=='begin'||!['move','resize'].includes(value.kind)||(value.kind==='resize'&&(w!==control||controlMode==='full')))return;
  endWindowGesture();clearTimeout(w===control?controlTween:boardTween);w.webContents.send('window-state',{transitioning:false});
  const g={id:value.id,window:w,kind:value.kind,mode:controlMode,bounds:w.getBounds(),cursor:screen.getCursorScreenPoint(),began:Date.now()};
- windowGesture=g;w.setIgnoreMouseEvents(false);
+ windowGesture=g;w.setIgnoreMouseEvents(false);if(w===control)controlIgnoring=false;
  function frame(){
   if(windowGesture!==g)return;
   if(w.isDestroyed()||Date.now()-g.began>60000){endWindowGesture();return;}

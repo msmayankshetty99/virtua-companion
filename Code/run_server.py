@@ -48,6 +48,8 @@ def main():
     configure_logging(config)
     # Debug our application, not WebSocket frames. Uvicorn DEBUG dumps every
     # voice.level/chat.delta packet and can dominate the capture/UI event loop.
+    # Redirected stdout uses the ANSI code page on Windows (cp932 has no em dash); never let output stop startup.
+    if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='backslashreplace')
     print("Riko AI server: http://127.0.0.1:8765 — Ctrl+C to stop", flush=True)
     import desktop_server
     # Hold the port before the model loads, so no other process (or account) can listen on it and

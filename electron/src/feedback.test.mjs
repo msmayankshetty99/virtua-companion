@@ -57,3 +57,14 @@ test('reply speech clouds stream the current turn and ignore stale snapshots/del
   state=reduceOverlayReply(state,{type:'state.snapshot',payload:{speech:'old reply',runtime:{generating:false}}});
   assert.equal(state.text,'New reply');assert.equal(state.generating,false);
 });
+
+test('a waiting tool approval takes the overlay pointer only while it is over the card',()=>{
+  const source=fs.readFileSync(new URL('./tool_approvals.jsx',import.meta.url),'utf8');
+  assert.doesNotMatch(source,/approvalBridge\?\.interactive\(!!item\)/);
+  assert.match(source,/closest\?\.\('\.overlay-approval'\)/);
+  // Click-through forwarding delivers mousemove (macOS/Windows); the Linux replay delivers pointermove.
+  assert.match(source,/addEventListener\('mousemove',hit,true\)/);assert.match(source,/addEventListener\('pointermove',hit,true\)/);
+  const preload=fs.readFileSync(new URL('../preload.cjs',import.meta.url),'utf8');
+  assert.match(preload,/if\(process\.platform==='linux'\)ipcRenderer\.on\('forwarded-pointer'/);
+  assert.match(preload,/elementFromPoint\(point\.x,point\.y\)/);
+});

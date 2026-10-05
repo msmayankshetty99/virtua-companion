@@ -151,6 +151,27 @@ def test_timed_out_shared_tool_blocks_duplicate_retry():
     finally: release.set();registry.close()
 
 
+def test_isolated_tool_round_trips_non_ascii_through_ansi_code_page_pipes(tmp_path,monkeypatch):
+    # Windows pipes use the ANSI code page unless Python runs in UTF-8 mode; cp1252 cannot encode todo_list's emoji
+    # and writes bytes such as 0xE9 that are not UTF-8.
+    (tmp_path/'unicode_tool.py').write_text('''import sys
+class Tool:
+ def __init__(self,config,context): pass
+ def execute(self,**args):
+  sys.stderr.buffer.write(b'caf\\xe9 warning\\n'); sys.stderr.flush()
+  return '\\u2705 Added task: ' + args['task']
+''')
+    monkeypatch.setenv('PYTHONPATH',str(tmp_path))
+    monkeypatch.setenv('PYTHONIOENCODING','cp1252')
+    registry=ToolRegistry(timeout_seconds=30)
+    registry.tools['unicode']=RegisteredTool('unicode','',{},None,isolated={'module':'unicode_tool','class':'Tool','config':{}})
+    try:
+        result=registry.execute('unicode',{'task':'Caf\u00e9 \u2014 \U0001F95B'})
+        assert not result.is_error, result.content
+        assert result.content=='\u2705 Added task: Caf\u00e9 \u2014 \U0001F95B'
+    finally: registry.close()
+
+
 def test_isolated_tool_is_killed_at_deadline(tmp_path,monkeypatch):
     (tmp_path/'slow_tool.py').write_text('''from pathlib import Path
 import time

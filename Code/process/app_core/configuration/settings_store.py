@@ -61,6 +61,9 @@ RANGES = {
     'presets.default.model_params.context_window_token_limit': (1, 1048576),
     'presets.default.model_params.max_output_tokens': (1, 1048576),
 }
+# Settings that change the live conversation budget (memory.context_window_tokens + runtime.max_output_tokens <= n_ctx).
+BUDGET_KEYS = {'runtime.provider', 'runtime.n_ctx', 'runtime.max_output_tokens', 'memory.context_window_tokens',
+    'presets.default.model_params.context_window_token_limit', 'presets.default.model_params.max_output_tokens'}
 INTEGER_NULLS = {'runtime.n_threads', 'runtime.n_threads_batch', 'runtime.kv_pool_tokens', 'voice.input_device'}
 JSON_NULLS = {'runtime.tensor_split'}
 OPTIONAL_TEXT = {'runtime.model_path', 'runtime.hf_repo_id', 'runtime.hf_filename', 'runtime.chat_format'}
@@ -384,8 +387,10 @@ class SettingsStore:
                 pool_capacity(rt)
                 if rt.n_ctx <= 0: errors['runtime.n_ctx'] = 'Managed server requires a positive context'
                 if rt.split_mode == 'row': errors['runtime.split_mode'] = 'Row split is not available in this llama.cpp build; choose layer or none'
+                # Check the live budget only when one of its inputs is edited: the runtime clamps it (factory.py), so a
+                # config that does not fit, such as one an older setup wizard wrote, never blocks saving other settings.
                 budget = candidate.memory.context_window_tokens + rt.max_output_tokens
-                if budget > rt.n_ctx: errors['runtime.n_ctx'] = f'Context must fit conversation budget + response ({budget} tokens)'
+                if budget > rt.n_ctx and BUDGET_KEYS & changes.keys(): errors['runtime.n_ctx'] = f'Context must fit conversation budget + response ({budget} tokens)'
         except (ValueError, TypeError, KeyError) as exc: errors['__all__'] = str(exc)
         finally: Path(temporary).unlink(missing_ok=True)
         return text, output, errors

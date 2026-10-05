@@ -41,3 +41,16 @@ test('authored branding images come from the root assets folder',()=>{
  assert.match(branding,/\.\.\/\.\.\/assets\/logo.svg/);assert.match(host,/path.join\(root,'assets','tray.png'\)/);
  assert.ok(fs.statSync(new URL('../../assets/tray.png',import.meta.url)).size>0);
 });
+test('quitting never stops at a silent Settings unload veto, and asks before the backend stops',()=>{
+ const host=fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8'),preload=fs.readFileSync(new URL('../preload.cjs',import.meta.url),'utf8');
+ assert.match(host,/control\.webContents\.on\('will-prevent-unload',event=>\{if\(app\.isQuitting\|\|dialog\.showMessageBoxSync\(control,/);
+ assert.match(host,/ipcMain\.on\('settings-dirty',\(event,dirty\)=>\{if\(control&&!control\.isDestroyed\(\)&&event\.sender\.id===control\.webContents\.id\)/);
+ const quit=host.slice(host.indexOf("app.on('before-quit'"));
+ assert.ok(quit.indexOf('settingsDirty')<quit.indexOf('app.isQuitting = true')&&quit.indexOf('app.isQuitting = true')<quit.indexOf('stopBackend'));
+ assert.match(preload,/settingsDirty: dirty => ipcRenderer\.send\('settings-dirty', dirty === true\)/);
+});
+test('standalone setup and training-data windows paint the dark page background',()=>{
+ const host=fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8'),css=fs.readFileSync(new URL('./style.css',import.meta.url),'utf8');
+ const bg=css.match(/--bg:(#[0-9a-f]{6})/)[1];
+ for(const name of ['setupWindow','neuralDataWindow'])assert.match(host,new RegExp(name+"=new BrowserWindow\\(\\{[^}]*backgroundColor:'"+bg+"'"),name);
+});

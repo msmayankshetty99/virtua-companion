@@ -114,6 +114,29 @@ def test_mcp_server_named_by_bare_command_on_a_configured_path(tmp_path):
     finally: client.close()
 
 
+def test_python_mcp_server_gets_utf8_mode_and_undecodable_stderr_never_blocks_it(tmp_path, monkeypatch):
+    # A Windows server logs in the ANSI code page (0xE9 is cp1252 e-acute). The drain must survive it, or the server
+    # blocks once the stderr pipe fills.
+    server = tmp_path / 'server.py'
+    server.write_text('''import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request: continue
+    sys.stderr.buffer.write(b'caf\\xe9\\n' + b'x' * 262144 + b'\\n'); sys.stderr.flush()
+    result = {'tools': []} if request['method'] == 'tools/list' else {'encoding': os.environ.get('PYTHONIOENCODING'), 'stdout': sys.stdout.encoding}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+''', encoding='utf-8')
+    monkeypatch.delenv('PYTHONIOENCODING', raising=False)
+    client = StdioMCPClient(sys.executable, [str(server)])
+    try:
+        assert client.list_tools() == []
+        assert client.call('probe', {}) == {'encoding': 'utf-8', 'stdout': 'utf-8'}
+    finally: client.close()
+    explicit = StdioMCPClient(sys.executable, [str(server)], env={'PYTHONIOENCODING': 'latin-1'})
+    try: assert explicit.call('probe', {}) == {'encoding': 'latin-1', 'stdout': 'iso8859-1'}  # a server's own setting wins
+    finally: explicit.close()
+
+
 def test_unloadable_mcp_server_is_reported_to_the_desktop(tmp_path):
     from types import SimpleNamespace
     from process.app_core.desktop.state import get_desktop_state

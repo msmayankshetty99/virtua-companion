@@ -81,9 +81,11 @@ class StdioMCPClient:
     def __init__(self, command: str, args: list[str] | None = None, env: dict[str, str] | None = None):
         self.command, self.args, self.env = command, args, env
         self._restart_lock = threading.Lock()
-        environment = {**os.environ, **(env or {})}
+        # MCP stdio is UTF-8. Python servers on Windows write the ANSI code page unless told otherwise, and one byte that
+        # does not decode would stop the stderr drain; PYTHONIOENCODING changes only their stdio, not their file encodings.
+        environment = {'PYTHONIOENCODING': 'utf-8', **os.environ, **(env or {})}
         self.process = subprocess.Popen([resolve_command(command, environment), *(args or [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True, encoding='utf-8', bufsize=1, env=environment)
+                                        stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', bufsize=1, env=environment)
         self._counter = 0
         self._lock = threading.Lock()
         self._responses = queue.Queue(maxsize=256)
@@ -238,8 +240,9 @@ class ToolRegistry:
 
     def _isolated_call(self, tool, arguments):
         command = [sys.executable, '--tool-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(Path(__file__).with_name('worker.py'))]
+        # stderr carries whatever the tool's libraries print, in the ANSI code page on Windows: never fail decoding it.
         process = subprocess.Popen(command,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         with self._execution_lock:
             if self._closed:
                 process.kill(); process.wait()

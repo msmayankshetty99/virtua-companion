@@ -37,3 +37,10 @@ def test_upstream_patch_is_limited_to_probe_and_build_glue():
     assert files == {'tools/server/CMakeLists.txt', 'tools/server/server-context.cpp',
         'tools/server/server-context.h', 'tools/server/server-task.cpp', 'tools/server/server-task.h'}
     assert not (root / 'tools/llama_cpp/cuda-infinity.patch').exists()
+
+
+def test_frozen_backend_runs_in_utf8_mode():
+    # PyInstaller apps ignore PYTHONUTF8, so the backend and its frozen --tool-worker/--discord-worker children get
+    # UTF-8 stdio only from this build option (Windows otherwise uses the ANSI code page).
+    source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
+    assert "'--python-option', 'X utf8'" in source

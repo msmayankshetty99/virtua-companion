@@ -1,7 +1,7 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {Save, FolderOpen, Check, RefreshCw, AlertCircle, Plus, Trash2} from './ui/icons.jsx';
 import {request} from './api.mjs';
-import {inputValues, settingsPatch, runtimePresets, llamaServerCommand} from './settings_model.mjs';
+import {inputValues, settingsPatch, settingsEdited, runtimePresets, llamaServerCommand} from './settings_model.mjs';
 import InitiativeSettings from './initiative_settings.jsx';
 import DisplaySettings from './display_settings.jsx';
 import VoiceInput from './voice_input.jsx';
@@ -50,14 +50,16 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
   const parsed=useMemo(()=>snapshot?settingsPatch(snapshot.fields,snapshot.values,inputs):{changes:{},errors:{}},[snapshot,inputs]);
   const sourceDirty=!!snapshot&&inputs['runtime.provider']==='llama_cpp'&&modelSource!==(snapshot.values['runtime.model_path']?'local':'huggingface');
   const dirty=sourceDirty || Object.keys(parsed.changes).length>0 || Object.keys(parsed.errors).length>0;
-  useEffect(()=>{onDirty?.(dirty);},[dirty,onDirty]);
+  // Only user edits guard navigation, reload and quit: opening Settings on a config it flags must not block them.
+  const edited=sourceDirty || (!!snapshot&&settingsEdited(snapshot,inputs,parsed));
+  useEffect(()=>{onDirty?.(edited);},[edited,onDirty]);
   useEffect(()=>()=>onDirty?.(false),[onDirty]);
   useEffect(()=>{
-    if(!dirty)return;
+    if(!edited)return;
     const handler=event=>{event.preventDefault();event.returnValue='';};
     window.addEventListener('beforeunload',handler);
     return()=>window.removeEventListener('beforeunload',handler);
-  },[dirty]);
+  },[edited]);
   const errors={...serverErrors,...parsed.errors};
   if(inputs['runtime.provider']==='llama_cpp'&&modelSource==='local'&&!inputs['runtime.model_path'])errors['runtime.model_path']='Choose a local GGUF file';
   if(inputs['runtime.provider']==='llama_cpp'&&!inputs['runtime.native_library'])errors['runtime.native_library']='Choose a compatible riko-native library, or choose llama_server to use a llama-server you run';
@@ -161,7 +163,7 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
     </div>;
    }
    return <main ref={page} className="settings-page">
-     <header className="page-heading"><SettingsNavigation groups={groups} group={group} sections={jumpSections} onSelect={selectGroup} onJump={jump}/><h1>Settings</h1><button className="icon-button" title="Reload settings" aria-label="Reload settings" disabled={busy} onClick={()=>{if(!dirty||confirm('Discard unsaved changes and reload?'))load();}}><RefreshCw size={18}/></button></header>
+     <header className="page-heading"><SettingsNavigation groups={groups} group={group} sections={jumpSections} onSelect={selectGroup} onJump={jump}/><h1>Settings</h1><button className="icon-button" title="Reload settings" aria-label="Reload settings" disabled={busy} onClick={()=>{if(!edited||confirm('Discard unsaved changes and reload?'))load();}}><RefreshCw size={18}/></button></header>
       <div className="settings-search"><SettingsSearchMenu items={searchItems} groups={groups} onNavigate={navigateSetting} renderRuntime={renderField} preferences={preferences} catalog={catalog} updatePreferences={updatePreferences} onSave={save} canSave={!!snapshot&&dirty&&!validating&&!Object.values(errors).some(Boolean)} saving={busy} status={error||errors.__all__||notice||(validating?'Checking your changes…':dirty?'Unsaved runtime changes':'Runtime settings saved')} /><label><input type="checkbox" checked={advanced} onChange={e=>setAdvanced(e.target.checked)}/>Advanced controls</label></div>
       <SettingsTabs groups={groups} group={group} onSelect={selectGroup}/>
       {group==='discord'&&<DiscordSettings/>}

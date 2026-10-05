@@ -32,6 +32,13 @@ export function settingsPatch(fields, values, inputs) {
   return {changes, errors};
 }
 
+// Whether the user edited anything a reload or quit would lose: a change to save, or an entry that does not
+// parse yet. Errors the stored values already have (a config the client flags) are not edits.
+export function settingsEdited(snapshot, inputs, patch = settingsPatch(snapshot.fields, snapshot.values, inputs)) {
+  const initial = inputValues(snapshot);
+  return Object.keys(patch.changes).length > 0 || Object.keys(patch.errors).some(path => path in initial && String(inputs[path] ?? '') !== String(initial[path] ?? ''));
+}
+
 // The llama-server command for these settings: each slot needs room for the largest of the live,
 // initiative and reflection budgets (as the backend checks), on the port in the server address.
 export function llamaServerCommand(inputs) {

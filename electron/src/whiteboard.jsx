@@ -70,7 +70,7 @@ export default function Whiteboard({commands = [], pages = ['page-1'], modelPage
   useEffect(() => {
     if (loaded && !hydrated.current) {
       hydrated.current = true;
-      if (saved.current?.seen === commands.at(-1)?.id) seen.current = saved.current.seen;
+      if (saved.current?.seen && saved.current.seen === commands.at(-1)?.id) seen.current = saved.current.seen;  // no saved view on a fresh board
       if (saved.current?.page && pages.includes(saved.current.page)) setPage(saved.current.page);
       else if(!pages.includes(page))setPage(modelPage);
     }
