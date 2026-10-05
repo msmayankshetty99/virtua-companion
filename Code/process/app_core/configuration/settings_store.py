@@ -20,7 +20,7 @@ OBSOLETE = {'avatar.camera.distance', 'avatar.expression_engine', 'avatar.view',
             'model','base_url','api_key','tokenizer_model'}
 ENUMS = {
     'logging.level': ['DEBUG','INFO','WARNING','ERROR'],
-    'runtime.provider': ['llama_cpp', 'lm_studio', 'openai', 'openai_compatible', 'ollama', 'local_http'],
+    'runtime.provider': ['llama_cpp', 'llama_server', 'lm_studio', 'openai', 'openai_compatible', 'ollama', 'local_http'],
     'runtime.api_mode': ['auto', 'responses', 'chat_completions'],
     'runtime.type_k': ['f16', 'f32', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'],
     'runtime.type_v': ['f16', 'f32', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'],
@@ -70,7 +70,9 @@ HELP = {
     'sovits_ping_config.auto_start': 'Packaged app only: explicitly launch your GPT-SoVITS API executable on startup. The app stops only its owned direct process on quit. Save and restart the app, not just Python.',
     'sovits_ping_config.executable': 'Absolute path to a GPT-SoVITS API-server executable, not a GUI launcher. Its dependencies and model weights must already be installed. Save and restart the packaged app.',
     'sovits_ping_config.arguments': 'JSON list of command-line arguments passed directly without a shell. Configure its API port to match the endpoint URL. Restart the packaged app.',
-    'runtime.startup_timeout_seconds': 'Deadline for optional component warmup (ASR, TTS and auxiliary models), not a timeout for synchronous native model loading. Native request waits use Request timeout. Restart Python.',
+    'runtime.startup_timeout_seconds': 'Deadline for optional component warmup (ASR, TTS and auxiliary models), and for an external llama-server to finish loading its model; not a timeout for synchronous native model loading. Native request waits use Request timeout. Restart Python.',
+    'runtime.provider': 'llama_cpp runs llama.cpp inside Python with a riko-native library. llama_server connects to a llama-server you run, built for any backend (CUDA, ROCm, Metal, Vulkan or CPU), and keeps slots, exact token counts and streaming. The others use OpenAI-compatible APIs. Save and restart Python.',
+    'runtime.base_url': 'Server address. For llama_server, the llama-server address such as http://127.0.0.1:8080; its --parallel must equal Parallel inference slots and each slot needs at least the live, initiative and reflection context. Conversations are sent to this address. Save and restart Python.',
     'emotion.probe.enabled': 'Collect hidden-state features and Julia targets with a compatible in-process DLL. Julia stays live for user transcription. A validated probe can take over agent expressions; no extra main model is loaded. Restart Python.',
     'emotion.probe.use_for_expression': 'Automatically use the probe for agent expressions only after held-out validation passes. Julia remains for user input and low-confidence or unavailable-feature fallback. Disable to continue gathering comparisons. Restart Python.',
     'emotion.probe.auto_train': 'Train automatically only after continuous idle time and sufficient new samples. Inference, microphone activity and playback take priority. Manual Train now skips the idle delay, not foreground protection. Restart Python.',
@@ -258,7 +260,8 @@ class SettingsStore:
         values = self._values(raw)
         return {'revision': revision(text), 'values': values, 'fields': [field(k, v) for k, v in values.items()
             if k not in OBSOLETE and not k.startswith('presets.default.model_params.')
-            and not (values.get('runtime.provider') == 'llama_cpp' and k in {'runtime.model','runtime.base_url','runtime.api_key','runtime.api_mode','runtime.reuse_response_ids','runtime.tokenizer_model'})],
+            and not (values.get('runtime.provider') == 'llama_cpp' and k in {'runtime.model','runtime.api_mode','runtime.reuse_response_ids','runtime.tokenizer_model'})
+            and not (values.get('runtime.provider') == 'llama_server' and k in {'runtime.model','runtime.api_mode','runtime.reuse_response_ids','runtime.tokenizer_model'})],
             'path': str(self.path), 'restart_required': True}
 
     def _values(self, raw):

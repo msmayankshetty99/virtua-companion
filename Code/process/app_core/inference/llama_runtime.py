@@ -1,7 +1,8 @@
-"""Validated native settings and reproducible GGUF resolution (no model imports)."""
+"""Validated llama.cpp settings and reproducible GGUF resolution (no model imports)."""
 import math
 from pathlib import Path, PurePosixPath
 import re
+from urllib.parse import urlsplit
 
 KV_TYPES = {'f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'}
 EXTRA_SETTINGS = ('hf_repo_id', 'hf_filename', 'hf_revision', 'hf_local_files_only',
@@ -14,24 +15,52 @@ EXTRA_SETTINGS = ('hf_repo_id', 'hf_filename', 'hf_revision', 'hf_local_files_on
 def configure_runtime(config, raw):
     for key in EXTRA_SETTINGS:
         if key in raw: setattr(config, key, raw[key])
-    if config.provider.lower().replace('-', '_') == 'llama_cpp':
+    provider = config.provider.lower().replace('-', '_')
+    if provider == 'llama_cpp':
         for key in ('n_ctx', 'n_batch', 'n_gpu_layers'):
             if key in raw and type(raw[key]) is not int: raise ValueError(f'runtime.{key} must be an integer')
         if 'n_ubatch' not in raw: config.n_ubatch = min(512, config.n_batch)
         validate_runtime(config)
+    elif provider == 'llama_server':
+        if 'n_ctx' in raw and type(raw['n_ctx']) is not int: raise ValueError('runtime.n_ctx must be an integer')
+        if config.base_url is None: config.base_url = 'http://127.0.0.1:8080'
+        server_address(config.base_url)
+        if config.api_key is not None and not isinstance(config.api_key, str):
+            raise ValueError('runtime.api_key must be text; put it in quotes in character_config.yaml')
+        validate_slots(config)
 
 
-def validate_runtime(config):
+def server_address(url):
+    """The llama-server root for runtime.base_url; it serves /tokenize, /slots and /health beside /v1."""
+    problem = ValueError('runtime.base_url must be the llama-server address, such as http://127.0.0.1:8080')
+    if not isinstance(url, str): raise problem
+    root = url.strip().rstrip('/')
+    root = root[:-3] if root.endswith('/v1') else root
+    parts = urlsplit(root)
+    try: parts.port
+    except ValueError: raise problem from None
+    if parts.scheme not in {'http', 'https'} or not parts.hostname or parts.username or parts.password or parts.path or parts.query or parts.fragment:
+        raise problem
+    return root
+
+
+def validate_slots(config):
+    """Settings shared by every llama.cpp transport: Riko schedules the slots and packs each request."""
     if type(config.parallel_slots) is not int or not 2 <= config.parallel_slots <= 4:
         raise ValueError('runtime.parallel_slots must be an integer from 2 to 4')
     if type(config.warmup) is not bool: raise ValueError('runtime.warmup must be boolean')
     if type(config.pause_background_on_live) is not bool: raise ValueError('runtime.pause_background_on_live must be boolean')
+    if type(config.startup_timeout_seconds) not in (int, float) or not math.isfinite(config.startup_timeout_seconds) or config.startup_timeout_seconds <= 0:
+        raise ValueError('runtime.startup_timeout_seconds must be positive and finite')
+    if type(config.n_ctx) is not int or config.n_ctx < 0: raise ValueError('runtime.n_ctx must be an integer >= 0')
+
+
+def validate_runtime(config):
+    validate_slots(config)
     if type(config.kv_unified) is not bool: raise ValueError('runtime.kv_unified must be boolean')
     if type(config.kv_pool_auto) is not bool: raise ValueError('runtime.kv_pool_auto must be boolean')
     if config.kv_pool_tokens is not None and (type(config.kv_pool_tokens) is not int or not 1 <= config.kv_pool_tokens <= 4194304):
         raise ValueError('runtime.kv_pool_tokens must be null or an integer from 1 to 4194304')
-    if type(config.startup_timeout_seconds) not in (int, float) or not math.isfinite(config.startup_timeout_seconds) or config.startup_timeout_seconds <= 0:
-        raise ValueError('runtime.startup_timeout_seconds must be positive and finite')
     for key in ('n_ctx', 'n_batch', 'n_ubatch', 'main_gpu', 'cache_size_mb'):
         value = getattr(config, key)
         minimum = 1 if key in {'n_batch', 'n_ubatch'} else 0

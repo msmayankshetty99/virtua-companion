@@ -14,8 +14,8 @@ import queue
 import threading
 import time
 
-from .llama_context import LlamaContextProvider, native_arguments
-from .llama_runtime import resolve_model
+from .llama_context import LlamaContextProvider, context_capacity, native_arguments
+from .llama_runtime import resolve_model, validate_runtime
 
 logger = logging.getLogger(__name__)
 OUTPUT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
@@ -229,6 +229,8 @@ class NativeClient:
 
 class InProcessLlamaProvider(LlamaContextProvider):
     def __init__(self, config):
+        validate_runtime(config)
+        context_capacity(config)
         super().__init__(config)
         self.native = None
         self.probe_interval = 32
@@ -238,7 +240,7 @@ class InProcessLlamaProvider(LlamaContextProvider):
             if self.closed: raise RuntimeError('Native provider closed')
             if self.native: return
             if not self.config.native_library:
-                raise RuntimeError('Set runtime.native_library to a compatible riko-native library. The HTTP llama-server backend has been removed.')
+                raise RuntimeError('Set runtime.native_library to a compatible riko-native library, or set runtime.provider: llama_server to use a llama-server you run.')
             if not Path(self.config.native_library).is_file():
                 raise RuntimeError(f'runtime.native_library does not exist: {self.config.native_library}. Build or select a compatible riko-native library before loading the model.')
             model = resolve_model(self.config)

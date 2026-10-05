@@ -165,7 +165,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     runtime = RuntimeConfig(
         provider=runtime_raw.get("provider", "openai"),
         model=runtime_raw.get("model", raw.get("model", "")),
-        base_url=runtime_raw.get("base_url", raw.get("base_url", "http://localhost:1234/v1")),
+        base_url=runtime_raw.get("base_url", raw.get("base_url", "http://127.0.0.1:8080"
+            if str(runtime_raw.get("provider", "")).lower().replace("-", "_") == "llama_server" else "http://localhost:1234/v1")),
         api_key=runtime_raw.get("api_key", raw.get("api_key", os.getenv("RIKO_API_KEY", "local"))),
         model_path=_path(root, runtime_raw.get("model_path")),
         native_library=_path(root, library),

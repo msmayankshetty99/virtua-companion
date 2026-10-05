@@ -82,6 +82,7 @@ Release (CI only, `.github/workflows/release.yml`): `python tools/release/build.
 ### Inference
 - `create_provider` (`app_core/inference/providers.py`) picks the provider:
   - `llama_cpp` → `InProcessLlamaProvider` (`llama_native.py`). It calls the C ABI in `tools/llama_cpp/riko-native.cpp` via ctypes: five `riko_*` exports, serving only `/v1/responses`, `/apply-template`, `/tokenize`, `/props` and `/slots`, with argv from `native_arguments` in `llama_context.py`. There is no HTTP listener, llama-server or llama-cpp-python, and no fallback: `runtime.native_library` is required.
+  - `llama_server` → `LlamaServerProvider` (`llama_server.py`): the same `LlamaContextProvider` protocol (slot 0 for live, exact `/apply-template` + `/tokenize` counts, `/v1/responses` streaming and tools) against a llama-server the user runs at `runtime.base_url` (default `http://127.0.0.1:8080`; validated by `server_address` in `llama_runtime.py`). It uses `http.client`, one connection per request, and cancels by shutting the socket down (closing alone does not wake a read blocked during prefill). Startup waits on `/health` (503 while loading), then requires exactly `parallel_slots` slots each holding the largest of the live, initiative and reflection budgets, and prints the matching `llama-server` command otherwise; a connection failure resets it so the next request checks again. The server owns the model and GPU settings, and there is no emotion probe.
   - `openai`, `lm_studio`, `openai_compatible`, `ollama`, `local_http` → `OpenAIProvider`: Responses API with a Chat Completions fallback, byte-based token estimates, no slots, no provider-level cancel.
 - `SlotScheduler` (`llama_context.py`) reserves slot 0 for the `live` lane. `initiative` and `reflection` share slots 1..N-1 (`runtime.parallel_slots`, 2–4), and live turns preempt them when `runtime.pause_background_on_live` is set. The emotion probe captures only on slot 0.
 - `--ctx-size` comes from `kv_budget.pool_capacity`. Per-role budgets are enforced only by Python-side packing (`context_budget.pack_context`, with exact native token counts) and by `max_output_tokens`.
@@ -168,7 +169,7 @@ The data root is the directory holding `character_config.yaml`.
 
 ## Platform status
 
-Releases ship CUDA and Vulkan bundles for Windows and Linux x64 only; nothing builds, packages, detects or tests Metal or ROCm. The Python inference layer is backend-agnostic: the backend is whatever llama.cpp build `runtime.native_library` loads. The patched bridge, including the emotion probe, has been built and run on Apple Silicon Metal at the current pin.
+Releases ship CUDA and Vulkan bundles for Windows and Linux x64 only; nothing builds, packages, detects or tests Metal or ROCm. The Python inference layer is backend-agnostic: the backend is whatever llama.cpp build `runtime.native_library` loads, or whatever llama-server `runtime.provider: llama_server` talks to (any backend, without the emotion probe; checked against stock llama-server b11408 on Apple Silicon). The patched bridge, including the emotion probe, has been built and run on Apple Silicon Metal at the current pin.
 
 Backend and device assumptions live here:
 - **Native build and packaging:**

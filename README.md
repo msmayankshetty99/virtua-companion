@@ -26,6 +26,12 @@ Review `character_config.yaml` before starting:
   `riko-native` library. Set `runtime.native_library` to a compatible build and
   select a local GGUF or exact Hugging Face file/revision. No HTTP listener,
   llama-server process or llama-cpp-python binding is used. See [model runtime](docs/llama-runtime.md).
+- `runtime.provider: llama_server` connects to a llama-server you run yourself, built
+  for any llama.cpp backend (CUDA, ROCm/HIP, Metal, Vulkan or CPU), on this machine or
+  another. Set `runtime.base_url` (default `http://127.0.0.1:8080`) and start it with
+  `--parallel` equal to `runtime.parallel_slots` and enough `--ctx-size` for every slot;
+  Riko prints the exact command if they do not match. Riko keeps its reserved live slot,
+  exact token counts, streaming and cancellation. The emotion probe needs `llama_cpp`.
 - Remote OpenAI-compatible providers, including LM Studio, are optional alternatives.
 - Start GPT-SoVITS separately. `sovits_ping_config` configures its HTTP endpoint,
   reference audio/transcript and PCM sample rate. Python does not load its model.
@@ -225,4 +231,4 @@ Settings -> Performance & logs includes logging level (DEBUG, INFO, WARNING, ERR
 
 Chat displays live llama.cpp per-request token counts and tokens/second from `timings_per_token`. Other providers use explicitly labelled estimates until final usage arrives. Counts include reasoning tokens. Julia remains live for cumulative partial user transcriptions. Settings -> Custom neural network settings manages the agent-expression probe and training data.
 
-`runtime.native_library` is required for native llama.cpp inference. There is no external-server fallback; unset paths produce an actionable startup error. Choose a GPU-enabled build for GPU inference: requesting GPU layers alone does not prove backend support. Remote OpenAI-compatible providers remain available.
+`runtime.native_library` is required for native llama.cpp inference (`llama_cpp`); unset paths produce an actionable startup error. To use a llama.cpp build Riko does not bundle, run llama-server and choose `llama_server` instead. Choose a GPU-enabled build for GPU inference: requesting GPU layers alone does not prove backend support. Remote OpenAI-compatible providers remain available.

@@ -221,9 +221,12 @@ def create_provider(config):
     if provider == "llama_cpp":
         from .llama_native import InProcessLlamaProvider
         return InProcessLlamaProvider(config)
+    if provider == "llama_server":
+        from .llama_server import LlamaServerProvider
+        return LlamaServerProvider(config)
     if provider in {"openai", "lm_studio", "openai_compatible", "ollama", "local_http"}:
         return OpenAIProvider(config)
     raise ValueError(
-        f"Unsupported provider '{config.provider}'. Use llama_cpp, openai, lm_studio, "
+        f"Unsupported provider '{config.provider}'. Use llama_cpp, llama_server, openai, lm_studio, "
         "openai_compatible, ollama, or local_http."
     )

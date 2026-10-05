@@ -1,4 +1,5 @@
-"""Native model request protocol, context budgeting and priority-ordered slots."""
+"""llama.cpp request protocol, context budgeting and priority-ordered slots, shared by the
+in-process native library and an external llama-server."""
 from contextlib import contextmanager
 import logging
 import queue
@@ -8,7 +9,7 @@ import hashlib
 import uuid
 import math
 
-from .llama_runtime import validate_runtime
+from .llama_runtime import validate_slots
 logger = logging.getLogger(__name__)
 
 
@@ -119,10 +120,11 @@ class InferenceLane:
 
 class LlamaContextProvider(InferenceLane):
     supports_latent_probe = True
+    transport = 'Native llama.cpp'  # names the transport in errors
+    missing_route_hint = ' Rebuild the compatible riko-native library with Responses support.'
     def __init__(self, config):
-        validate_runtime(config)
-        context_capacity(config)
-        if not config.n_ctx: raise ValueError('Native llama.cpp requires explicit per-slot runtime.n_ctx > 0')
+        validate_slots(config)
+        if not config.n_ctx: raise ValueError('llama.cpp requires explicit per-slot runtime.n_ctx > 0')
         super().__init__(self, 'live')
         self.config = config
         self.scheduler = SlotScheduler(config.parallel_slots, pause_background=config.pause_background_on_live)
@@ -258,8 +260,8 @@ class LlamaContextProvider(InferenceLane):
     def _inference_client(self):
         raise NotImplementedError('Native transport must provide a request client')
 
-    @staticmethod
-    def _check_response(response):
+    @classmethod
+    def _check_response(cls, response):
         if response.is_success: return
         response.read()
         try:
@@ -267,8 +269,8 @@ class LlamaContextProvider(InferenceLane):
             error = body.get('error', body)
             detail = error.get('message', str(error)) if isinstance(error, dict) else str(error)
         except (ValueError, AttributeError): detail = response.text
-        hint = ' Rebuild the compatible riko-native library with Responses support.' if response.status_code in {404, 405, 501} else ''
-        raise RuntimeError(f'Native llama.cpp operation {response.status_code}: {str(detail).strip()[:2000]}{hint}')
+        hint = cls.missing_route_hint if response.status_code in {404, 405, 501} else ''
+        raise RuntimeError(f'{cls.transport} operation {response.status_code}: {str(detail).strip()[:2000]}{hint}')
 
     def stream(self, messages, *, tools=None, **options):
         output = queue.Queue(maxsize=128)

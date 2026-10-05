@@ -32,6 +32,16 @@ export function settingsPatch(fields, values, inputs) {
   return {changes, errors};
 }
 
+// The llama-server command for these settings: each slot needs room for the largest of the live,
+// initiative and reflection budgets (as the backend checks), on the port in the server address.
+export function llamaServerCommand(inputs) {
+  const slots = Number(inputs['runtime.parallel_slots']) || 2;
+  const perSlot = Math.max(Number(inputs['runtime.n_ctx']) || 0, Number(inputs['initiative.context_window_tokens']) || 4096, Number(inputs['memory.reflection_context_window_tokens']) || 4096);
+  let port = '8080';
+  try { port = new URL(String(inputs['runtime.base_url'] || 'http://127.0.0.1:8080')).port || '8080'; } catch {}
+  return `llama-server -m model.gguf --port ${port} --parallel ${slots} --ctx-size ${slots * perSlot} --jinja`;
+}
+
 export const runtimePresets = {
   balanced: {'runtime.n_gpu_layers': -1, 'runtime.n_batch': 512, 'runtime.n_ubatch': 512, 'runtime.flash_attn': false, 'runtime.type_k': 'f16', 'runtime.type_v': 'f16'},
   compact: {'runtime.n_gpu_layers': -1, 'runtime.n_batch': 256, 'runtime.n_ubatch': 128, 'runtime.flash_attn': true, 'runtime.type_k': 'q8_0', 'runtime.type_v': 'q8_0'},
