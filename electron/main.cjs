@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen, session, shell, Tray, Menu, nativeImage } = require('electron');
 // Hardware acceleration is Electron's default; keep WebGL and GPU rasterization enabled.
 app.commandLine.appendSwitch('enable-gpu-rasterization');
 const path = require('path');
@@ -40,7 +40,33 @@ const {windowAction} = require('./window_actions.cjs');
 let boardScreen = 0, geometryTimer;
 let displaySignature = '', displayPublishing = false;
 const API = 'http://127.0.0.1:8765';
-const patchBoard = body => fetch(API + '/api/surfaces/whiteboard', {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).catch(() => {});
+// The backend requires the install's API token (Code/process/app_core/desktop/api_guard.py). Main adds it
+// to every request to the backend at the network layer, so renderer JavaScript never sees it.
+// Both secrets are fresh on every backend start. Packaged builds generate them here, hand them to the
+// backend they spawn (no files) and send the token only once it reports that it holds the port; in
+// development the backend writes them beside its config after it holds the port, and main re-reads them
+// whenever the files change.
+let secretDirectory = '', ownSecrets = null;
+const secretCache = {};
+function backendSecret(name) {
+  if (ownSecrets) return ownSecrets.listening ? ownSecrets[name] : '';
+  if (!secretDirectory) return '';
+  const file = path.join(secretDirectory, name), cached = secretCache[name] || {mtime: 0, value: ''};
+  try { const stat = fs.statSync(file); if (stat.mtimeMs !== cached.mtime) secretCache[name] = {mtime: stat.mtimeMs, value: fs.readFileSync(file, 'ascii').trim()}; }
+  catch { secretCache[name] = {mtime: 0, value: ''}; }
+  return secretCache[name].value;
+}
+const apiToken = () => backendSecret('api_token');
+function injectApiToken() {
+  // Only 127.0.0.1: 'localhost' may resolve to ::1, where another account could listen.
+  session.defaultSession.webRequest.onBeforeSendHeaders({urls: ['http://127.0.0.1:8765/*', 'ws://127.0.0.1:8765/*']}, (details, callback) => {
+    const token = apiToken();
+    if (token && new URL(details.url).host === '127.0.0.1:8765') details.requestHeaders.Authorization = 'Bearer ' + token;
+    callback({requestHeaders: details.requestHeaders});
+  });
+}
+const backendFetch = (route, init = {}) => fetch(API + route, {...init, headers: {...init.headers, Authorization: 'Bearer ' + apiToken()}});
+const patchBoard = body => backendFetch('/api/surfaces/whiteboard', {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).catch(() => {});
 const dev = process.env.RIKO_DEV === '1';
 function page(name) { return dev ? `http://localhost:5173/#/${name}` : `file://${path.join(__dirname, 'dist', 'index.html')}#/${name}`; }
 function displayList() {
@@ -53,7 +79,7 @@ async function publishDisplays() {
   if (displayPublishing || signature === displaySignature) return;
   displayPublishing = true;
   try {
-    const response = await fetch(API + '/api/displays', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: signature});
+    const response = await backendFetch('/api/displays', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: signature});
     if (response.ok) displaySignature = signature;
   } catch { /* Retry on the next backend snapshot/reconnection. */ }
   finally {displayPublishing = false;}
@@ -156,7 +182,7 @@ function createTray(characterName){
   const icon=nativeImage.createFromPath(brandIcon);
   if(icon.isEmpty())throw new Error('Tray icon is missing or invalid: assets/tray.png');
   tray=new Tray(icon.resize({width:24,height:24}));tray.setToolTip(characterName||'Companion');
-  tray.setContextMenu(Menu.buildFromTemplate([{label:'Open chat',click:()=>showControls('chat')},{label:'Start Discord client',click:async()=>{try{const response=await fetch(API+'/api/discord/start',{method:'POST'});if(!response.ok){let message='Discord could not be started';try{const body=await response.json();if(typeof body.detail==='string')message=body.detail;}catch{}dialog.showErrorBox('Discord',message);}}catch{dialog.showErrorBox('Discord','The Python backend is not available. Start it before launching Discord.');}}},{label:'Settings',click:()=>showControls('settings')},{label:'Appearance',click:()=>showControls('appearance')},{label:'Whiteboard',click:()=>{patchBoard({visible:true});setBoardMode('full');}},{type:'separator'},{label:'Quit',click:()=>app.quit()}]));
+  tray.setContextMenu(Menu.buildFromTemplate([{label:'Open chat',click:()=>showControls('chat')},{label:'Start Discord client',click:async()=>{try{const response=await backendFetch('/api/discord/start',{method:'POST'});if(!response.ok){let message='Discord could not be started';try{const body=await response.json();if(typeof body.detail==='string')message=body.detail;}catch{}dialog.showErrorBox('Discord',message);}}catch{dialog.showErrorBox('Discord','The Python backend is not available. Start it before launching Discord.');}}},{label:'Settings',click:()=>showControls('settings')},{label:'Appearance',click:()=>showControls('appearance')},{label:'Whiteboard',click:()=>{patchBoard({visible:true});setBoardMode('full');}},{type:'separator'},{label:'Quit',click:()=>app.quit()}]));
   tray.on('double-click',()=>showControls('chat'));
 }
 app.whenReady().then(async () => {
@@ -169,11 +195,19 @@ app.whenReady().then(async () => {
       }
       root=JSON.parse(fs.readFileSync(locator,'utf8')).directory;
       process.env.RIKO_CONFIG=path.join(root,'character_config.yaml');
-      backendProcess=release.startBackend(root,process.resourcesPath);
+      const crypto=require('crypto');
+      ownSecrets={api_token:crypto.randomBytes(32).toString('base64url'),confirm_key:crypto.randomBytes(32).toString('base64url'),listening:false};
+      // Nothing carries the token until the backend says it holds the port, and nothing does after it exits.
+      backendProcess=release.startBackend(root,process.resourcesPath,ownSecrets,()=>{ownSecrets.listening=true;publishProcesses(true);});
       backendProcess.on('error',error=>dialog.showErrorBox('Backend failed to launch',error.message));
-      backendProcess.on('exit',code=>{if(!app.isQuitting&&code)dialog.showErrorBox('Backend stopped','Review logs/backend-launch.log in your data folder. Open Settings to correct the model or backend configuration.');});
+      backendProcess.on('exit',code=>{ownSecrets.listening=false;if(!app.isQuitting&&code)dialog.showErrorBox('Backend stopped','Review logs/backend-launch.log in your data folder. Open Settings to correct the model or backend configuration.');});
     }
-    const configPath = path.resolve(root, process.env.RIKO_CONFIG || 'character_config.yaml');
+    // Resolve the config as run_server does (relative to RIKO_DATA_DIR in development), so main reads the
+    // secrets the backend wrote beside it.
+    const configPath = path.resolve(!app.isPackaged && process.env.RIKO_DATA_DIR ? process.env.RIKO_DATA_DIR : root, process.env.RIKO_CONFIG || 'character_config.yaml');
+    // In development the backend writes its secrets beside the config it loads; inject before any window loads.
+    secretDirectory = path.join(path.dirname(configPath), 'persistent_memories');
+    injectApiToken();
     const config = YAML.parse(fs.readFileSync(configPath, 'utf8')) || {};
     if(app.isPackaged){
       try{sovitsProcess=release.startSovits(config.sovits_ping_config);sovitsProcess?.on('error',error=>dialog.showErrorBox('GPT-SoVITS could not start',error.message));}
@@ -189,7 +223,7 @@ app.whenReady().then(async () => {
     const shortcuts=config.desktop?.shortcuts||{};
     const actions={popup:()=>showControls(),quit:()=>app.quit(),whiteboard:()=>patchBoard({visible:!whiteboard.isVisible()}),
       settings:()=>showControls('settings'),
-      mic:()=>fetch(API+'/api/mic/toggle',{method:'POST'}).catch(()=>{}),audio:()=>fetch(API+'/api/audio/toggle',{method:'POST'}).catch(()=>{}),sleep:()=>fetch(API+'/api/sleep/toggle',{method:'POST'}).catch(()=>{})};
+      mic:()=>backendFetch('/api/mic/toggle',{method:'POST'}).catch(()=>{}),audio:()=>backendFetch('/api/audio/toggle',{method:'POST'}).catch(()=>{}),sleep:()=>backendFetch('/api/sleep/toggle',{method:'POST'}).catch(()=>{})};
     const defaults={popup:'CommandOrControl+Shift+Space',quit:'CommandOrControl+Shift+Q',whiteboard:'CommandOrControl+Shift+W',settings:'CommandOrControl+Shift+,'};
     for(const [name,action] of Object.entries(actions)){
       const accelerator=shortcuts[name]??defaults[name];
@@ -205,7 +239,7 @@ function publishProcesses(force=false,empty=false){
   if(!app.isReady())return;
   const body=JSON.stringify({processes:empty?[]:app.getAppMetrics().map(item=>({pid:item.pid,kind:['Browser','GPU','Renderer','Utility','Zygote','Sandbox helper'].includes(item.type)?item.type:'Utility'}))});
   if(!force&&body===processSignature)return;processSignature=body;
-  processUpdates=processUpdates.then(()=>fetch(API+'/api/resources/electron',{method:'POST',headers:{'Content-Type':'application/json'},body})).catch(()=>{processSignature='';});
+  processUpdates=processUpdates.then(()=>backendFetch('/api/resources/electron',{method:'POST',headers:{'Content-Type':'application/json'},body})).catch(()=>{processSignature='';});
 }
 app.whenReady().then(()=>publishProcesses());
 app.on('web-contents-created',(_event,contents)=>{contents.on('did-finish-load',()=>publishProcesses());contents.on('destroyed',()=>publishProcesses());contents.on('render-process-gone',()=>publishProcesses());});
@@ -257,6 +291,23 @@ ipcMain.handle('capture-whiteboard', async (event, rect) => {
   return image.toPNG();
 });
 ipcMain.handle('displays', () => displayList());
+// Security-sensitive changes (native library, programs Riko starts, unattended tools, Discord access) need
+// the user's approval here. The signature uses the confirmation key, which never leaves main and the backend,
+// over the exact change the backend asked to confirm, so a compromised page cannot approve it silently.
+ipcMain.handle('confirm-security-change', async (event, challenge) => {
+  if (!control || control.isDestroyed() || event.sender.id !== control.webContents.id) throw new Error('Settings window required');
+  let change;
+  try { change = JSON.parse(challenge); } catch { throw new Error('Invalid confirmation request'); }
+  const titles = {settings: 'Change security-sensitive settings?', tool_approvals: 'Let these tools run without asking first?', discord_access: 'Change who can use Riko from Discord?'};
+  // Show control, invisible and direction-changing characters as escapes, so the text shown is what gets signed.
+  const visible = text => String(text).replace(/[\p{C}\p{Zl}\p{Zp}]/gu, c => `\\u{${c.codePointAt(0).toString(16)}}`);
+  const lines = Object.entries(change.changes || {}).map(([key, value]) => `${visible(key)}: ${visible(JSON.stringify(value))}`);
+  const {response} = await dialog.showMessageBox(control, {type: 'warning', buttons: ['Cancel', 'Allow'], defaultId: 0, cancelId: 0, noLink: true,
+    message: titles[change.action] || 'Confirm this change?', detail: lines.join('\n') + '\n\nOnly allow this if you made this change yourself.'});
+  const key = backendSecret('confirm_key');
+  if (response !== 1 || !key) return null;
+  return require('crypto').createHmac('sha256', key).update(challenge).digest('hex');
+});
 ipcMain.handle('pick-path', async (event, options={}) => {
   if(!control||event.sender.id!==control.webContents.id)throw new Error('Path selection is limited to controls');
   const result=await dialog.showOpenDialog(control,{title:options.directory?'Choose a folder':'Choose a file',

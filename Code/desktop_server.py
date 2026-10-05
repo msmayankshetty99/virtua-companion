@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, StrictInt
 from starlette.concurrency import run_in_threadpool
@@ -121,7 +123,45 @@ async def lifespan(_app):
         if conversation_store: conversation_store.close()
         event_bus.publish("runtime.stopped")
 
-app = FastAPI(title="Riko Local Desktop Runtime", lifespan=lifespan)
+_dev = os.environ.get('RIKO_DEV') == '1'  # The API map is published only while developing.
+app = FastAPI(title="Riko Local Desktop Runtime", lifespan=lifespan,
+    docs_url='/docs' if _dev else None, redoc_url='/redoc' if _dev else None, openapi_url='/openapi.json' if _dev else None)
+
+_secrets = {}
+def api_secrets():
+    """(token, confirmation key) for this start, minted once (see app_core/desktop/api_guard.py).
+    run_server mints them right after binding the port; tests mint them on first use."""
+    from process.app_core.desktop.api_guard import issue_secrets
+    if config.root not in _secrets: _secrets[config.root] = issue_secrets(config.root)
+    return _secrets[config.root]
+
+def api_token(): return api_secrets()[0]
+discord_launcher.token = api_token  # The Discord worker it starts receives this start's token.
+
+from process.app_core.desktop.api_guard import Confirmations
+confirmations = Confirmations()
+
+def require_confirmation(action, changes, provided):
+    """Security-sensitive changes need a single-use signature that Electron main makes with the
+    confirmation key, which never leaves the machine's files, after the user approves a dialog."""
+    if not changes or confirmations.consume(api_secrets()[1], action, changes, provided): return
+    raise HTTPException(428, {'detail': 'Confirm this change in the Riko window', 'confirm': confirmations.challenge(action, changes)})
+
+# Settings that load code, start programs, choose models or network endpoints, move user data, widen
+# file access, or decide what runs unattended. Classified by name, so settings added later with these
+# names are covered; any other value that is a URL or an absolute path is treated the same way.
+SENSITIVE_SETTING_NAMES = {'native_library', 'mcp_config', 'executable', 'arguments', 'auto_start', 'api_key', 'url',
+    'provider', 'model_id', 'embedding_model', 'asr_model', 'require_approval', 'system1_enabled'}
+LOCATION = re.compile(r'\s*([a-z][a-z0-9+.-]*://|[/\\~]|[a-z]:[/\\])', re.IGNORECASE)
+def security_sensitive(key, value=None):
+    # An empty mapping in the YAML is one editable value, so a whole section can arrive at once: check each leaf.
+    if isinstance(value, dict): return security_sensitive(key) or any(security_sensitive(f'{key}.{name}', item) for name, item in value.items())
+    if isinstance(value, (list, tuple)): return security_sensitive(key) or any(security_sensitive(key, item) for item in value)
+    section, _, name = key.rpartition('.')
+    if (name in SENSITIVE_SETTING_NAMES or name.startswith('hf_') or key == 'emotion.enabled'
+            or name.endswith(('_path', '_dir', '_directory', '_folder', '_root', '_file', '_url', '_model_id', '_library', '_config', '_executable'))):
+        return True
+    return isinstance(value, str) and key != 'avatar.model' and bool(LOCATION.match(value))  # the avatar endpoint serves only .vrm files
 from process.app_core.integrations.discord.api import create_router as discord_router
 app.include_router(discord_router(lambda: session, lambda: discord_launcher))
 
@@ -149,7 +189,11 @@ class DiscordSettingsRequest(BaseModel):
     revision: str
 
 @app.put('/api/discord/settings')
-def save_discord_settings(request: DiscordSettingsRequest):
+def save_discord_settings(request: DiscordSettingsRequest, x_riko_confirmation: str | None = Header(default=None)):
+    # Allow-lists decide who can drive the companion from Discord: changes need confirmation.
+    try: current = discord_launcher.access.read()['values']
+    except ValueError: current = {}
+    require_confirmation('discord_access', {key: value for key, value in request.values.items() if current.get(key) != value}, x_riko_confirmation)
     try: return discord_launcher.configure(request.values, request.revision)
     except ValueError as exc: raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc: raise HTTPException(409, str(exc)) from exc
@@ -252,9 +296,21 @@ async def discord_client(websocket: WebSocket, instance: str):
     except (ValueError, TypeError):
         await websocket.accept(); await websocket.close(code=1008, reason='A Discord client is already connected or the instance ID is invalid'); return
     async def report(value): await run_in_threadpool(discord_launcher.report, instance, value)
+    # The Discord process sees only what it acts on: its own turns, approvals, Discord and
+    # initiative messages and whiteboard updates. Local transcripts, chats and desktop state stay local.
+    discord_turns = set()
+    def relevant(event):
+        if event.payload.get('source') == 'discord' and event.turn_id:
+            discord_turns.add(event.turn_id)
+            if len(discord_turns) > 256: discord_turns.clear(); discord_turns.add(event.turn_id)
+        if event.type in {'resource.discord', 'resource.approvals', 'tool.approval_finished', 'tool.approval_resolved',
+                          'initiative.presented', 'whiteboard.changed', 'whiteboard.image'}: return True
+        return event.turn_id in discord_turns and event.type in {'chat.delta', 'model.reasoning', 'tool.approval_requested'}
+    def resources():
+        values = resource_events.snapshot() if resource_events else {'discord': discord_launcher.status()}
+        return {key: values[key] for key in ('discord', 'approvals') if key in values}
     try:
-        await stream_events(websocket, event_bus, snapshot,
-            initial=lambda: resource_events.snapshot() if resource_events else {'discord': discord_launcher.status()}, on_message=report)
+        await stream_events(websocket, event_bus, lambda: {}, initial=resources, event_filter=relevant, on_message=report)
     finally:
         # Shielded: detach must still free the client slot if this handler is being cancelled.
         await asyncio.shield(run_in_threadpool(discord_launcher.detach, instance))
@@ -274,9 +330,14 @@ def tool_approvals():
     return {**registry.approvals.snapshot(), 'tools': [{'name': t.name, 'description': t.description} for t in registry.tools.values()]}
 
 @app.put('/api/tools/approvals')
-def approval_policy(request: dict):
+def approval_policy(request: dict, x_riko_confirmation: str | None = Header(default=None)):
     registry = approval_registry()
-    try: return registry.approvals.configure(request.get('policy'), registry.tools)
+    # Switching approval off lets the model run that tool unattended: confirm it.
+    policy, current = request.get('policy'), registry.approvals.snapshot()
+    if isinstance(policy, dict):
+        require_confirmation('tool_approvals', {name: False for name, value in policy.items()
+            if value is False and current['policy'].get(name, current['default_required'])}, x_riko_confirmation)
+    try: return registry.approvals.configure(policy, registry.tools)
     except ValueError as exc: raise HTTPException(400, str(exc))
     except OSError as exc: raise HTTPException(409, f'Could not save tool permissions: {exc}')
 
@@ -364,8 +425,12 @@ def validate_settings(request: SettingsPatch):
     except (ValueError, TypeError) as exc: raise HTTPException(400, str(exc))
 
 @app.put('/api/settings')
-def save_settings(request: SettingsPatch):
+def save_settings(request: SettingsPatch, x_riko_confirmation: str | None = Header(default=None)):
     from process.app_core.configuration.settings_store import SettingsConflict
+    try: current = settings_store().snapshot()['values']
+    except (OSError, ValueError, TypeError): current = {}
+    require_confirmation('settings', {key: value for key, value in request.changes.items()
+        if security_sensitive(key, value) and current.get(key) != value}, x_riko_confirmation)
     try:
         result = settings_store().save(request.changes, request.revision)
         if result.get('saved') and 'emotion.probe.interval_tokens' in request.changes:
@@ -874,5 +939,8 @@ async def chat_stream(websocket: WebSocket):
     except (WebSocketDisconnect, RuntimeError):
         return
 
+# Every route, HTTP and WebSocket, needs the install's API token and a loopback Host.
+from process.app_core.desktop.api_guard import LocalAPIGuard
+app.add_middleware(LocalAPIGuard, token=api_token)
 # Outermost: even setup-mode 503 responses need readable CORS headers.
 app.add_middleware(CORSMiddleware, allow_origins=["null", "http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])

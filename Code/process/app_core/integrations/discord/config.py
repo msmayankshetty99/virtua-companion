@@ -28,8 +28,10 @@ class BotSettings:
     def from_env(cls, root, env):
         backend = env.get('Discord_backend_url', 'http://127.0.0.1:8765').rstrip('/')
         parsed = urlsplit(backend)
-        if parsed.scheme != 'http' or parsed.hostname not in {'127.0.0.1', 'localhost', '::1'} or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
-            raise ValueError('Discord backend must be a loopback http:// URL without credentials or a path')
+        if parsed.scheme != 'http' or parsed.hostname not in {'127.0.0.1', 'localhost'} or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+            raise ValueError('Discord backend must be http://127.0.0.1:<port> without credentials or a path')
+        # Always 127.0.0.1: 'localhost' can resolve to ::1, where another account's listener would receive the API token.
+        backend = 'http://127.0.0.1' + (f':{parsed.port}' if parsed.port else '')
         camera = env.get('Discord_camera_url', '').strip()
         if camera:
             url = urlsplit(camera)

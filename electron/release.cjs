@@ -38,13 +38,30 @@ function saveSetup(directory,input,resources){
  fs.writeFileSync(path.join(directory,'character_config.yaml'),YAML.stringify(config),{flag:'wx',mode:0o600});
  return directory;
 }
-function startBackend(directory,resources){
+// The backend prints this line once it holds 127.0.0.1:8765. Main sends the API token only after it, so a
+// process that grabbed the port while the backend was still starting never sees this start's token.
+const LISTENING='RIKO_BACKEND_LISTENING';
+function watchListening(onListening){
+ let tail='';
+ return chunk=>{
+  if(tail===null)return;
+  tail=(tail+String(chunk)).slice(-4096);
+  if(tail.split(/\r?\n/).slice(0,-1).includes(LISTENING)){tail=null;onListening();}
+ };
+}
+function startBackend(directory,resources,secrets={},onListening=()=>{}){
  const executable=path.join(resources,'backend',process.platform==='win32'?'riko-backend.exe':'riko-backend');
- const log=fs.openSync(path.join(directory,'logs','backend-launch.log'),'a');
- const env={...process.env,RIKO_MANAGED:'1',RIKO_DATA_DIR:directory,RIKO_CONFIG:path.join(directory,'character_config.yaml'),HF_HOME:path.join(directory,'models','huggingface'),TORCH_HOME:path.join(directory,'models','torch'),XDG_CACHE_HOME:path.join(directory,'models','cache'),RIKO_BUNDLE_ROOT:resources};
+ const logPath=path.join(directory,'logs','backend-launch.log');
+ const log=fs.openSync(logPath,'a');
+ // This start's API token and confirmation key go to the backend only; it removes them from its own environment.
+ const own=secrets.api_token&&secrets.confirm_key?{RIKO_API_TOKEN:secrets.api_token,RIKO_CONFIRM_KEY:secrets.confirm_key}:{};
+ const env={...process.env,...own,RIKO_MANAGED:'1',RIKO_DATA_DIR:directory,RIKO_CONFIG:path.join(directory,'character_config.yaml'),HF_HOME:path.join(directory,'models','huggingface'),TORCH_HOME:path.join(directory,'models','torch'),XDG_CACHE_HOME:path.join(directory,'models','cache'),RIKO_BUNDLE_ROOT:resources};
  let child;
- try{child=spawn(executable,[],{cwd:directory,env,stdio:['pipe',log,log],windowsHide:true});}finally{fs.closeSync(log);}
+ try{child=spawn(executable,[],{cwd:directory,env,stdio:['pipe','pipe',log],windowsHide:true});}finally{fs.closeSync(log);}
  child.stdin.on('error',()=>{});
+ const output=fs.createWriteStream(logPath,{flags:'a'}),listening=watchListening(onListening);
+ child.stdout.on('data',chunk=>{output.write(chunk);listening(chunk);});
+ child.stdout.on('end',()=>output.end());
  return child;
 }
 function startSovits(settings){
@@ -55,4 +72,4 @@ function startSovits(settings){
  return spawn(executable,args,{cwd:path.dirname(executable),stdio:'ignore',windowsHide:true,shell:false});
 }
 function stopBackend(child){return new Promise(resolve=>{if(!child||child.exitCode!==null){resolve();return;}const timeout=setTimeout(()=>{child.kill();resolve();},15000);child.once('exit',()=>{clearTimeout(timeout);resolve();});child.stdin.end('shutdown\n');});}
-module.exports={hardware,configuration,saveSetup,startBackend,nativeLibrary,startSovits,stopBackend};
+module.exports={hardware,configuration,saveSetup,startBackend,nativeLibrary,startSovits,stopBackend,watchListening,LISTENING};

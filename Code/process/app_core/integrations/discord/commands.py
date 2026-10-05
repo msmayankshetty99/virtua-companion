@@ -112,6 +112,8 @@ class CompanionCommands(commands.Cog):
     @app_commands.command(name='tool_policy', description='Require or remove approval for one exact registered tool name.')
     async def tool_policy(self, interaction: discord.Interaction, name: str, required: bool):
         self.require(interaction, admin=True)
+        # Removing approval lets the model run that tool unattended; only the desktop owner can confirm it.
+        if not required: raise ValueError('Removing approval must be confirmed in the Riko desktop window (Settings).')
         await interaction.response.defer(ephemeral=True)
         await self.bot.backend.request('PUT', '/api/tools/approvals', body={'policy': {name: required}})
         await self.reply(interaction, f'Approval requirement for {name}: {required}.')

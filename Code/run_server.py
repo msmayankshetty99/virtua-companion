@@ -37,6 +37,24 @@ def main():
     # voice.level/chat.delta packet and can dominate the capture/UI event loop.
     print("Riko AI server: http://127.0.0.1:8765 — Ctrl+C to stop", flush=True)
     import desktop_server
+    # Hold the port before the model loads, so no other process (or account) can listen on it and
+    # collect the API token Electron sends. In development this start's token is minted only now, so a
+    # squatter could only have seen the previous one; packaged Electron sends its token only after the
+    # line below. Requests queue until startup finishes.
+    import socket
+    import time
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE if os.name == 'nt' else socket.SO_REUSEADDR, 1)
+    deadline = time.monotonic() + 20  # a previous backend may still be shutting down after a quick relaunch
+    while True:
+        try: listener.bind(('127.0.0.1', 8765)); break
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise SystemExit(f'Port 8765 is already in use ({exc}); stop the other process and try again.') from None
+            time.sleep(.5)
+    listener.listen(2048)
+    desktop_server.api_secrets()
+    if os.environ.get('RIKO_MANAGED') == '1': print('RIKO_BACKEND_LISTENING', flush=True)  # see electron/release.cjs
     server = uvicorn.Server(uvicorn.Config(desktop_server.app, host="127.0.0.1", port=8765,
                 log_level="info", timeout_graceful_shutdown=10))
     if os.environ.get('RIKO_MANAGED') == '1':
@@ -46,7 +64,7 @@ def main():
                 if line.strip() == 'shutdown': break
             server.should_exit = True
         threading.Thread(target=managed_shutdown, name='release-shutdown', daemon=True).start()
-    server.run()
+    server.run(sockets=[listener])
 
 
 if __name__ == "__main__":

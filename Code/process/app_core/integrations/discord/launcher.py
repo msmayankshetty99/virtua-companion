@@ -16,6 +16,7 @@ class DiscordLauncher:
     def __init__(self, root, state=None):
         self.root = Path(root)
         self.lock = threading.RLock()
+        self.token = lambda: ''  # The backend's API token accessor; desktop_server sets it.
         self.outbox = Outbox(event_bus)  # status/notifications reach the session; never emit under self.lock
         self.process = None
         self.error = ''
@@ -134,8 +135,11 @@ class DiscordLauncher:
                 script = self.root / 'Code' / 'discord_bot.py'
                 if not getattr(sys, 'frozen', False) and not script.is_file(): raise ValueError('Discord client entry point is missing')
                 command = [sys.executable, '--discord-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(script)]
-                self.process = subprocess.Popen(command, cwd=self.root,
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                # The worker exits when its stdin closes, i.e. when this backend exits however it exits,
+                # so a client holding a dead backend's token never outlives it.
+                env = {**os.environ, 'RIKO_API_TOKEN': self.token(), 'RIKO_DATA_DIR': str(self.root), 'RIKO_EXIT_WITH_BACKEND': '1'}
+                self.process = subprocess.Popen(command, cwd=self.root, env=env,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 self.error = ''
             except ValueError as exc:
@@ -163,6 +167,9 @@ class DiscordLauncher:
                         with self.lock:
                             if self.process is process: self.error = errors[code]
         code = process.wait()
+        if getattr(process, 'stdin', None):
+            try: process.stdin.close()
+            except OSError: pass
         with self.lock:
             if self.process is not process: return
             self.process = None
