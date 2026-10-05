@@ -75,7 +75,7 @@ def main():
         '--workpath', ROOT / 'release-build', '--specpath', ROOT / 'release-build',
         '--collect-submodules', 'process', '--hidden-import', 'desktop_server', '--hidden-import', 'discord_bot',
         *[item for package in ('torch', 'transformers', 'sentence_transformers', 'faster_whisper',
-            'ctranslate2', 'silero_vad', 'onnxruntime', 'faiss', 'sounddevice', 'soundfile',
+            'ctranslate2', 'silero_vad', 'onnxruntime', 'sounddevice', 'soundfile',
             'scipy', 'cv2', 'ruamel.yaml', 'eff_word_net', 'discord', 'uvicorn')
             for item in ('--collect-all', package)], ROOT / 'Code/run_server.py')
     shutil.copytree(STAGE / 'riko-backend', STAGE / 'backend', dirs_exist_ok=True)

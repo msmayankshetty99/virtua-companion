@@ -74,7 +74,8 @@ def test_interval_is_ui_slider_and_live_only_change(tmp_path):
 
 
 def test_julia_gpu_option_does_not_enable_gpu_probe():
-    assert field('emotion.device', 'cpu')['options'] == ['cpu', 'cuda', 'cuda:0']
+    assert field('emotion.device', 'cpu')['options'] == ['cpu', 'auto', 'cuda', 'cuda:0']
+    assert field('memory.device', 'cpu')['options'] == ['cpu', 'auto', 'cuda', 'cuda:0', 'mps']
     from process.app_core.emotion.probe import ProbeConfig
     with pytest.raises(ValueError): ProbeConfig.from_raw({'device': 'cuda'})
 
@@ -299,3 +300,144 @@ def test_native_probe_capture_checks_utf8_prefix_and_turn_alignment(monkeypatch)
         assert not options['cancelled']()
     finally:
         provider.close()
+
+
+def gguf(path, context_length):
+    import struct
+    def text(value):
+        data = value.encode()
+        return struct.pack('<Q', len(data)) + data
+    entries = [text('general.architecture') + struct.pack('<I', 8) + text('llama'),
+        text('llama.context_length') + struct.pack('<II', 4, context_length)]
+    path.write_bytes(b'GGUF' + struct.pack('<IQQ', 3, 0, len(entries)) + b''.join(entries))
+
+
+def test_budgets_above_the_training_context_fail_before_loading(tmp_path, monkeypatch):
+    gguf(tmp_path / 'model.gguf', 4096)
+    (tmp_path / 'riko-native.dll').write_bytes(b'test-library')
+    def unexpected(*args): raise AssertionError('The model must not load')
+    monkeypatch.setattr('process.app_core.inference.llama_native.NativeRuntime', unexpected)
+    config = RuntimeConfig(provider='llama_cpp', model_path=tmp_path / 'model.gguf', native_library=tmp_path / 'riko-native.dll', n_ctx=8192)
+    config.initiative_n_ctx = config.reflection_n_ctx = 4096
+    provider = InProcessLlamaProvider(config)
+    try:
+        with pytest.raises(RuntimeError, match=r'trained for 4096 tokens.*Lower runtime\.n_ctx \(8192\) to 4096'): provider.warmup()
+    finally:
+        provider.close()
+
+
+def test_short_slots_and_cpu_fallback_are_reported(tmp_path, monkeypatch, caplog):
+    gguf(tmp_path / 'model.gguf', 32768)
+    (tmp_path / 'riko-native.dll').write_bytes(b'test-library')
+    runtime = fake_runtime([])
+    runtime.notes = 'load_tensors: offloaded 0/37 layers to GPU'
+    def request(handle, path, body, output, cancel, user):
+        data = json.dumps([{'n_ctx': 4096}, {'n_ctx': 4096}]).encode()
+        buffer = ctypes.create_string_buffer(data)
+        output(200, ctypes.cast(buffer, ctypes.c_void_p), len(data), user)
+        return 0
+    runtime.dll = SimpleNamespace(riko_request=request, riko_stop=lambda _: None, riko_destroy=lambda _: None)
+    monkeypatch.setattr('process.app_core.inference.llama_native.NativeRuntime', lambda *args: runtime)
+    provider = InProcessLlamaProvider(RuntimeConfig(provider='llama_cpp', model_path=tmp_path / 'model.gguf',
+        native_library=tmp_path / 'riko-native.dll', n_ctx=8192))
+    try:
+        with caplog.at_level('WARNING'), pytest.raises(RuntimeError, match=r'allocated 2 slots of \[4096\] tokens, but Riko needs 2 slots of 8192'):
+            provider.warmup()
+        assert 'only 0 of 37 layers on the GPU' in caplog.text
+    finally:
+        provider.close()
+
+
+class FakeNativeLibrary:
+    """Stands in for ctypes.CDLL(riko-native): plain functions accept the argtypes/restype that _bind sets."""
+    def __init__(self, create):
+        self.destroyed = []
+        def riko_create(*args): return create(*args)
+        def riko_request(*args): return 0
+        def riko_set_interval(*args): return 0
+        def riko_stop(handle): pass
+        def riko_destroy(handle): self.destroyed.append(handle)
+        self.riko_create, self.riko_request, self.riko_set_interval = riko_create, riko_request, riko_set_interval
+        self.riko_stop, self.riko_destroy = riko_stop, riko_destroy
+
+
+def test_native_runtime_is_live_from_create_until_destroy(monkeypatch, tmp_path):
+    import process.app_core.inference.llama_native as native
+    library = FakeNativeLibrary(lambda *args: 77)
+    monkeypatch.setattr(native.ctypes, 'CDLL', lambda path: library)
+    runtime = native.NativeRuntime(tmp_path / 'riko-native.dll', ['riko-native'])
+    try:
+        assert runtime in native._LIVE and runtime.handle == 77
+        runtime.close()
+        assert library.destroyed == [77] and runtime not in native._LIVE and runtime.handle is None
+    finally: native._LIVE.discard(runtime)
+    def failed(arguments, interval, error, capacity):
+        error.value = b'native model initialization failed'
+    monkeypatch.setattr(native.ctypes, 'CDLL', lambda path: FakeNativeLibrary(failed))
+    before = set(native._LIVE)
+    with pytest.raises(RuntimeError, match='initialization failed'): native.NativeRuntime(tmp_path / 'riko-native.dll', ['riko-native'])
+    assert native._LIVE == before
+
+
+def test_release_native_refuses_while_loading_and_waits_for_a_destroy_in_progress(monkeypatch, tmp_path):
+    import process.app_core.inference.llama_native as native
+    loading, loaded, entered, release = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+    def create(*args):
+        loading.set()
+        assert loaded.wait(5)
+        return 5
+    library = FakeNativeLibrary(create)
+    monkeypatch.setattr(native.ctypes, 'CDLL', lambda path: library)
+    built = []
+    thread = threading.Thread(target=lambda: built.append(native.NativeRuntime(tmp_path / 'riko-native.dll', ['riko-native'])))
+    thread.start()
+    try:
+        assert loading.wait(5)
+        assert native.release_native(5) is False  # riko_create cannot be interrupted: exit must skip destructors
+        loaded.set(); thread.join(5)
+        def stalled(*args):
+            entered.set()
+            assert release.wait(5)  # a native call still inside llama.cpp when shutdown starts
+            return 1
+        library.riko_request = stalled
+        built[0].request('/v1/responses', {})
+        assert entered.wait(5)
+        closing = threading.Thread(target=built[0].close); closing.start()  # e.g. an abandoned close_bounded
+        assert native.release_native(.2) is False and library.destroyed == []
+        release.set()
+        assert native.release_native(5) is True and library.destroyed == [5]
+        closing.join(5)
+    finally:
+        loaded.set(); release.set(); native._LIVE.difference_update(built)
+
+
+def test_exit_guard_skips_native_destructors_only_when_a_context_cannot_be_destroyed():
+    import os, subprocess, sys
+    from pathlib import Path
+    script = """
+import sys
+import process.app_core.inference.llama_native as native
+class Runtime:
+    handle = None if sys.argv[1] == 'loading' else 1
+    def close(self): native._LIVE.discard(self)
+native._LIVE.add(Runtime())
+sys.exit(3)
+"""
+    env = {**os.environ, 'PYTHONPATH': str(Path('Code').resolve())}
+    run = lambda state: subprocess.run([sys.executable, '-c', script, state], env=env, capture_output=True, text=True, timeout=120)
+    ready, loading = run('ready'), run('loading')
+    assert ready.returncode == 3, ready.stderr  # destroyed in time: the real exit status survives
+    assert loading.returncode == 1 and 'leaving it to the OS' in loading.stderr, loading.stderr
+
+
+@pytest.mark.parametrize('requested, notes, identity', [
+    ('auto', 'load_tensors: offloaded 37/37 layers to GPU\nresolve_fused_ops: Flash Attention enabled', True),
+    ('auto', 'resolve_fused_ops: Flash Attention not supported, set to disabled', False),
+    ('auto', '', 'auto'),  # an older bridge reports nothing
+    ('on', 'resolve_fused_ops: Flash Attention not supported, set to disabled', True), (False, '', False)])
+def test_probe_identity_records_the_flash_attention_llama_cpp_chose(requested, notes, identity):
+    provider = InProcessLlamaProvider(RuntimeConfig(provider='llama_cpp', model_path='unused.gguf', flash_attn=requested))
+    try:
+        provider.native = SimpleNamespace(notes=notes)
+        assert provider._flash_attention_identity() == identity
+    finally: provider.native = None; provider.close()

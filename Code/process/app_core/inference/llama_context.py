@@ -9,7 +9,7 @@ import hashlib
 import uuid
 import math
 
-from .llama_runtime import validate_slots
+from .llama_runtime import flash_attention, validate_slots
 logger = logging.getLogger(__name__)
 
 
@@ -96,8 +96,9 @@ def native_arguments(config, model):
     args = ['riko-native', '--model', str(model),
         '--parallel', str(config.parallel_slots), '--ctx-size', str(context_capacity(config)),
         '--kv-unified' if config.kv_unified else '--no-kv-unified', '--cont-batching', '--jinja', '--slots', '--no-context-shift',
-        '--n-gpu-layers', str(config.n_gpu_layers), '--batch-size', str(config.n_batch),
-        '--ubatch-size', str(config.n_ubatch), '--flash-attn', 'on' if config.flash_attn else 'off',
+        # -1 lets llama.cpp's --fit lower the layer count to keep 1 GiB of GPU memory free; any other value is exact.
+        '--n-gpu-layers', str(config.n_gpu_layers), '--fit', 'on' if config.n_gpu_layers == -1 else 'off',
+        '--batch-size', str(config.n_batch), '--ubatch-size', str(config.n_ubatch), '--flash-attn', flash_attention(config.flash_attn),
         '--cache-type-k', config.type_k, '--cache-type-v', config.type_v,
         '--main-gpu', str(config.main_gpu), '--split-mode', config.split_mode,
         '--cache-ram', str(config.cache_size_mb), '--seed', str(config.seed)]
@@ -163,11 +164,15 @@ class LlamaContextProvider(InferenceLane):
         identity = {'gguf_sha256': digest.hexdigest(), 'server_build': props.get('build_info'),
             'chat_template': props.get('chat_template'), 'feature_version': FEATURE_VERSION,
             'type_k': self.config.type_k, 'type_v': self.config.type_v,
-            'flash_attn': self.config.flash_attn, 'n_ctx': self.config.n_ctx,
+            'flash_attn': self._flash_attention_identity(), 'n_ctx': self.config.n_ctx,
             'runtime_fingerprint': self._probe_runtime_fingerprint()}
         self.probe = self.probe_factory(identity, self.probe_idle)
 
     def _probe_runtime_fingerprint(self): return None
+
+    def _flash_attention_identity(self):
+        # on/off keep the true/false of probe data recorded before flash_attn had an auto setting.
+        return {'on': True, 'off': False}.get(flash_attention(self.config.flash_attn), 'auto')
 
     def set_foreground(self, active): self.scheduler.set_foreground(active)
 

@@ -1,11 +1,24 @@
 """Backend entry point: standalone in development, Electron-owned in releases."""
 from pathlib import Path
+import asyncio
 import os
 import logging
 
 import uvicorn
 
 from process.app_core.configuration.config import load_config
+
+
+class Server(uvicorn.Server):
+    """uvicorn, except that the active turn ends before requests drain: a reply still generating would hold its
+    request for the whole drain, and Electron allows the entire shutdown 15 s (electron/release.cjs)."""
+    def __init__(self, config, stop_turn):
+        super().__init__(config)
+        self.stop_turn = stop_turn
+
+    async def shutdown(self, sockets=None):
+        await asyncio.to_thread(self.stop_turn)
+        await super().shutdown(sockets=sockets)
 
 
 def main():
@@ -55,16 +68,22 @@ def main():
     listener.listen(2048)
     desktop_server.api_secrets()
     if os.environ.get('RIKO_MANAGED') == '1': print('RIKO_BACKEND_LISTENING', flush=True)  # see electron/release.cjs
-    server = uvicorn.Server(uvicorn.Config(desktop_server.app, host="127.0.0.1", port=8765,
-                log_level="info", timeout_graceful_shutdown=10))
+    server = Server(uvicorn.Config(desktop_server.app, host="127.0.0.1", port=8765,
+                log_level="info", timeout_graceful_shutdown=2), desktop_server.stop_turn)
     if os.environ.get('RIKO_MANAGED') == '1':
+        import faulthandler
         import threading
         def managed_shutdown():
             for line in sys.stdin:
                 if line.strip() == 'shutdown': break
+            # Electron kills us 15 s after asking (electron/release.cjs). If teardown hangs, write every thread's
+            # stack to the launch log and exit at 14 s instead of outliving the app with :8765 and the model.
+            try: faulthandler.dump_traceback_later(14, exit=True)
+            except Exception: pass  # no usable stderr
             server.should_exit = True
         threading.Thread(target=managed_shutdown, name='release-shutdown', daemon=True).start()
-    server.run(sockets=[listener])
+    try: server.run(sockets=[listener])
+    except KeyboardInterrupt: pass  # uvicorn re-raises Ctrl+C after its graceful shutdown; uvicorn.run() swallows it too
 
 
 if __name__ == "__main__":

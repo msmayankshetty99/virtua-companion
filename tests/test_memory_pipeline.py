@@ -164,3 +164,74 @@ def test_invalid_reflection_does_not_restart_inference(tmp_path, content, finish
         assert len(calls) == 1
         assert len(memory.list_records()) == 1
     finally: memory.close()
+
+
+def test_semantic_index_is_an_in_memory_unit_matrix_and_ranks_by_cosine(tmp_path):
+    np = pytest.importorskip('numpy')
+    vectors = {'I drink oat milk': [2, 0, 0], 'My cat is called Mochi': [0, 3, 0], 'Unknown words': [0, 0, 0], 'pet': [0, 1, .1]}
+    config = MemoryConfig(store_file=tmp_path / 'memories.json', index_file=tmp_path / 'index', system1_enabled=False, embeddings_enabled=True)
+    memory = MemoryStore(config, start_worker=False)
+    memory.embedder = SimpleNamespace(encode=lambda texts, convert_to_numpy=True: np.array([vectors[t] for t in texts], dtype='float64'))
+    try:
+        for text in ('I drink oat milk', 'My cat is called Mochi', 'Unknown words'): memory.remember(text)
+        memory._rebuild_index()
+        matrix, mapping = memory.index_snapshot
+        assert matrix.dtype == np.float32 and not matrix.flags.writeable
+        assert np.allclose(np.linalg.norm(matrix, axis=1), [1, 1, 0])  # unit rows; a zero row stays zero
+        assert [text for _, _, text in mapping] == ['I drink oat milk', 'My cat is called Mochi', 'Unknown words']
+        assert not config.index_file.exists() and memory.status()['semantic_index_ready']
+        assert memory.retrieve('pet', return_records=True)[0]['text'] == 'My cat is called Mochi'  # no shared words
+    finally: memory.close()
+
+
+def test_top_inner_products_is_best_first_and_keeps_the_lower_row_on_ties():
+    np = pytest.importorskip('numpy')
+    from process.app_core.persistence.memory import top_inner_products
+    matrix, query = np.array([[1, 0], [0, 1], [1, 0], [1, 0], [-1, 0]], dtype='float32'), np.array([1, 0], dtype='float32')
+    scores, rows = top_inner_products(matrix, query, 2)
+    assert rows.tolist() == [0, 2] and scores.tolist() == [1, 1]
+    assert top_inner_products(matrix, query, 9)[1].tolist() == [0, 2, 3, 1, 4]
+    assert top_inner_products(matrix, query, 0)[1].tolist() == [] and top_inner_products(matrix, query, -3)[1].tolist() == []
+
+
+def test_index_rebuild_beside_torch_keeps_the_process_alive(tmp_path):
+    # macOS: faiss-cpu and torch each bundled a libomp; building the index before any other torch work
+    # (runtime.warmup: false) killed the backend with SIGSEGV or OMP Error #15.
+    pytest.importorskip('torch')
+    import subprocess, sys, textwrap
+    from pathlib import Path
+    script = textwrap.dedent('''
+        import json, sys, time
+        from dataclasses import asdict
+        from pathlib import Path
+        sys.path.insert(0, sys.argv[1])
+        from process.app_core.configuration.config import MemoryConfig
+        from process.app_core.persistence.memory import MemoryStore, MemoryRecord
+        class TorchEmbedder:  # stands in for sentence-transformers: CPU torch work on every encode
+            def encode(self, texts, convert_to_numpy=True):
+                import torch
+                a = torch.randn(512, 512); (a @ a).sum().item()
+                return torch.randn(len(texts), 16).numpy()
+        data = Path(sys.argv[2])
+        (data / 'memories.json').write_text(json.dumps([asdict(MemoryRecord(text=f'memory {i}', classification_status='complete', reflection_status='skipped')) for i in range(3)]))
+        memory = MemoryStore(MemoryConfig(store_file=data / 'memories.json', index_file=data / 'index', system1_enabled=False, reflection_enabled=False), start_worker=False)
+        memory.embedder = TorchEmbedder()
+        memory.start()
+        deadline = time.monotonic() + 60
+        while memory.index_snapshot is None and not memory.embeddings_failed and time.monotonic() < deadline: time.sleep(.02)
+        assert memory.index_snapshot is not None, memory.pipeline_error
+        memory.retrieve('memory 1'); memory.close()
+        print('faiss' in sys.modules)
+    ''')
+    code = Path(__file__).resolve().parents[1] / 'Code'
+    result = subprocess.run([sys.executable, '-c', script, str(code), str(tmp_path)], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip().splitlines()[-1] == 'False'
+
+
+def test_faiss_is_no_longer_a_dependency():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    assert 'faiss' not in (root / 'requirements-runtime.txt').read_text().lower()
+    assert "'faiss'" not in (root / 'tools/release/build.py').read_text()
+    assert 'import faiss' not in (root / 'Code/process/app_core/persistence/memory.py').read_text()

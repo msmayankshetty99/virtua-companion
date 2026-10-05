@@ -10,6 +10,23 @@ EXTRA_SETTINGS = ('hf_repo_id', 'hf_filename', 'hf_revision', 'hf_local_files_on
     'offload_kqv', 'use_mmap', 'use_mlock', 'main_gpu', 'split_mode', 'tensor_split',
     'chat_format', 'cache_size_mb', 'verbose', 'parallel_slots',
     'startup_timeout_seconds', 'warmup', 'kv_unified', 'kv_pool_auto', 'kv_pool_tokens', 'pause_background_on_live')
+FLASH_ATTENTION = ('auto', 'on', 'off')
+
+
+def flash_attention(value):
+    """runtime.flash_attn as llama.cpp's --flash-attn value. A YAML boolean keeps its old meaning; PyYAML also
+    reads the bare on/off that ruamel writes back as booleans."""
+    if type(value) is bool: return 'on' if value else 'off'
+    if value in FLASH_ATTENTION: return value
+    raise ValueError('runtime.flash_attn must be auto, on or off')
+
+
+def check_native_build(config):
+    """Settings the pinned llama.cpp cannot load. Checked when the provider starts, not when the YAML loads,
+    so desktop.setup_on_startup_error keeps Settings open to repair them."""
+    if config.split_mode == 'row':
+        raise ValueError("runtime.split_mode 'row' is not available: llama.cpp removed it from CUDA and ROCm, and Metal "
+            "and Vulkan never had it. Choose layer (or none for one GPU) in Settings.")
 
 
 def configure_runtime(config, raw):
@@ -65,19 +82,21 @@ def validate_runtime(config):
         value = getattr(config, key)
         minimum = 1 if key in {'n_batch', 'n_ubatch'} else 0
         if type(value) is not int or value < minimum: raise ValueError(f'runtime.{key} must be an integer >= {minimum}')
-    if type(config.n_gpu_layers) is not int or config.n_gpu_layers < -1:
-        raise ValueError('runtime.n_gpu_layers must be -1 or a nonnegative integer')
+    if type(config.n_gpu_layers) is not int or config.n_gpu_layers < -2:
+        raise ValueError('runtime.n_gpu_layers must be -1 (fit to free GPU memory), -2 (all layers) or a layer count >= 0')
     if config.n_ubatch > config.n_batch: raise ValueError('runtime.n_ubatch must not exceed n_batch')
     for key in ('n_threads', 'n_threads_batch'):
         value = getattr(config, key)
         if value is not None and (type(value) is not int or value < 1): raise ValueError(f'runtime.{key} must be null or a positive integer')
-    for key in ('flash_attn', 'offload_kqv', 'use_mmap', 'use_mlock', 'hf_local_files_only', 'verbose'):
+    for key in ('offload_kqv', 'use_mmap', 'use_mlock', 'hf_local_files_only', 'verbose'):
         if type(getattr(config, key)) is not bool: raise ValueError(f'runtime.{key} must be boolean')
+    config.flash_attn = flash_attention(config.flash_attn)
     for key in ('type_k', 'type_v'):
         if getattr(config, key) not in KV_TYPES: raise ValueError(f'runtime.{key} must be one of {sorted(KV_TYPES)}')
-    if config.type_v not in {'f16', 'f32', 'bf16'} and not config.flash_attn:
-        raise ValueError('Quantized runtime.type_v requires flash_attn: true')
-    if config.split_mode not in {'none', 'layer', 'row'}: raise ValueError('runtime.split_mode must be none, layer or row')
+    if config.type_v not in {'f16', 'f32', 'bf16'} and config.flash_attn == 'off':
+        raise ValueError('Quantized runtime.type_v requires flash_attn auto or on')
+    # 'row' still loads from YAML so Settings can open and fix it; check_native_build rejects it at startup.
+    if config.split_mode not in {'none', 'layer', 'row'}: raise ValueError('runtime.split_mode must be layer or none')
     if config.tensor_split is not None:
         values = config.tensor_split
         if not isinstance(values, list) or not values or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in values) or sum(values) <= 0:

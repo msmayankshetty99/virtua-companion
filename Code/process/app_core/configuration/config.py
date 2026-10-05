@@ -37,7 +37,7 @@ class RuntimeConfig:
     n_ubatch: int = 512
     n_threads: int | None = None
     n_threads_batch: int | None = None
-    flash_attn: bool = False
+    flash_attn: str | bool = 'auto'  # auto, on or off; YAML true/false still mean on/off
     type_k: str = 'f16'
     type_v: str = 'f16'
     offload_kqv: bool = True
@@ -75,7 +75,7 @@ class MemoryConfig:
     history_file: Path = Path("persistent_memories/chat_history.json")
     context_window_tokens: int = 8192
     store_file: Path = Path("persistent_memories/memory_store.json")
-    index_file: Path = Path("persistent_memories/faiss_index.index")
+    index_file: Path = Path("persistent_memories/faiss_index.index")  # legacy: no longer written or read
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimension: int = 384
     max_results: int = 8
@@ -89,6 +89,7 @@ class MemoryConfig:
     system1_model_id: str = "SupersonicLabs/Julia-1"
     system1_cache_dir: Path | None = None
     system1_max_length: int = 8192
+    device: str = "cpu"
     minimum_importance: float = 0.35
     default_memories: list[dict[str, Any]] = field(default_factory=list)
 
@@ -248,6 +249,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             system1_model_id=str(memory_raw.get("system1_model_id", "SupersonicLabs/Julia-1")),
             system1_cache_dir=_path(root, memory_raw.get("system1_cache_dir")),
             system1_max_length=int(memory_raw.get("system1_max_length", 8192)),
+            device=str(memory_raw.get("device", "cpu")),
             minimum_importance=float(memory_raw.get("minimum_importance", 0.35)),
             default_memories=list(memory_raw.get("default_memories", preset.get("memories", []))),
         ),

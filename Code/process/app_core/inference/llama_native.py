@@ -4,6 +4,7 @@ The private DLL reuses native server-context queues, Responses formatting and
 chat/tool parsers. Transport-compatible response objects keep the application
 streaming/cancellation contract unchanged. All callbacks enqueue bytes only.
 """
+import atexit
 import ctypes
 import hashlib
 import json
@@ -11,33 +12,65 @@ import logging
 import os
 from pathlib import Path
 import queue
+import re
 import threading
 import time
 
 from .llama_context import LlamaContextProvider, context_capacity, native_arguments
-from .llama_runtime import resolve_model, validate_runtime
+from .llama_runtime import check_native_build, resolve_model, validate_runtime
+from ..runtime.lifecycle import close_bounded
 
 logger = logging.getLogger(__name__)
 OUTPUT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 CANCEL = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+# Every NativeRuntime from riko_create until riko_destroy returns; a None handle is still loading. ggml-metal keeps
+# its devices in a C++ static whose destructor, run by exit(), asserts that every Metal buffer was already freed.
+_LIVE = set()
+
+
+def release_native(timeout):
+    """Destroy every live native context. False when one is still loading or does not stop in time."""
+    runtimes = list(_LIVE)
+    if any(runtime.handle is None for runtime in runtimes): return False  # riko_create cannot be interrupted
+    deadline = time.monotonic() + timeout
+    for runtime in runtimes: close_bounded(runtime, max(0, deadline - time.monotonic()))
+    while _LIVE and time.monotonic() < deadline: time.sleep(.02)
+    return not _LIVE
+
+
+@atexit.register
+def _release_at_exit():
+    # Python's atexit runs before C++ static destructors. A context that cannot be destroyed in time is left to the
+    # OS instead: os._exit skips those destructors, so Metal cannot turn the exit into a GGML_ASSERT abort.
+    if not _LIVE: return
+    try:
+        import signal
+        if threading.current_thread() is threading.main_thread(): signal.signal(signal.SIGINT, signal.SIG_IGN)  # a late Ctrl+C must not skip the fallback
+        if release_native(2): return
+    except BaseException: pass
+    logger.error('Native inference context still loading or in use at exit; leaving it to the OS')
+    logging.shutdown()
+    os._exit(1)
 
 
 class NativeRuntime:
     def __init__(self, library, arguments, interval=0):
         path = Path(library).resolve()
+        self.lock, self.requests, self.closed, self.handle = threading.Lock(), set(), False, None
         self.directory = os.add_dll_directory(str(path.parent)) if os.name == 'nt' else None
+        _LIVE.add(self)
         try:
             self.dll = ctypes.CDLL(str(path))
             self._bind()
-            error = ctypes.create_string_buffer(4096)
+            error = ctypes.create_string_buffer(8192)
             self.handle = self.dll.riko_create(json.dumps(arguments).encode(), interval, error, len(error))
             if not self.handle: raise RuntimeError(error.value.decode('utf-8', errors='replace'))
+            # On success the bridge reports layer offload and flash attention here (older builds leave it empty).
+            self.notes = error.value.decode('utf-8', errors='replace')
         except BaseException:
+            _LIVE.discard(self)
             if self.directory: self.directory.close()
             raise
-        self.lock = threading.Lock()
-        self.requests = set()
-        self.closed = False
 
     def _bind(self):
         self.dll.riko_create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
@@ -83,6 +116,7 @@ class NativeRuntime:
     def _destroy_after(self, requests):
         for request in requests: request.thread.join()
         self.dll.riko_destroy(self.handle)
+        _LIVE.discard(self)  # before the handle clears: release_native reads a None handle as still loading
         self.handle = None
         if self.directory: self.directory.close()
 
@@ -227,9 +261,19 @@ class NativeClient:
     def get(self, path, **kwargs): return self.post(path)
 
 
+def training_context(model):
+    """The GGUF's {arch}.context_length: llama.cpp caps every slot's context there. None when unreadable."""
+    from ..resources.vram_estimate import read_gguf
+    try: meta = read_gguf(model)
+    except (OSError, ValueError, UnicodeDecodeError): return None
+    value = meta.get(str(meta.get('general.architecture', '')) + '.context_length')
+    return value if type(value) is int and value > 0 else None
+
+
 class InProcessLlamaProvider(LlamaContextProvider):
     def __init__(self, config):
         validate_runtime(config)
+        check_native_build(config)
         context_capacity(config)
         super().__init__(config)
         self.native = None
@@ -244,19 +288,31 @@ class InProcessLlamaProvider(LlamaContextProvider):
             if not Path(self.config.native_library).is_file():
                 raise RuntimeError(f'runtime.native_library does not exist: {self.config.native_library}. Build or select a compatible riko-native library before loading the model.')
             model = resolve_model(self.config)
+            budgets = {'runtime.n_ctx': self.config.n_ctx, 'initiative.context_window_tokens': getattr(self.config, 'initiative_n_ctx', 4096),
+                'memory.reflection_context_window_tokens': getattr(self.config, 'reflection_n_ctx', 4096)}
+            limit = training_context(model)
+            if limit and max(budgets.values()) > limit:
+                over = ', '.join(f'{key} ({value})' for key, value in budgets.items() if value > limit)
+                raise RuntimeError(f'This model was trained for {limit} tokens and llama.cpp caps each slot there. Lower {over} to {limit} or less.')
             args = native_arguments(self.config, model)
             native = NativeRuntime(self.config.native_library, args, self.probe_interval if self.probe_factory else 0)
-            logger.info('Inference transport=in_process requested_gpu_layers=%s threads=%s flash_attention=%s kv_k=%s kv_v=%s slots=%s probe_interval=%s',
+            notes = getattr(native, 'notes', '')
+            logger.info('Inference transport=in_process requested_gpu_layers=%s threads=%s flash_attention=%s kv_k=%s kv_v=%s slots=%s probe_interval=%s native=%r',
                 self.config.n_gpu_layers, self.config.n_threads, self.config.flash_attn, self.config.type_k, self.config.type_v,
-                self.config.parallel_slots, self.probe_interval if self.probe_factory else 0)
+                self.config.parallel_slots, self.probe_interval if self.probe_factory else 0, notes)
+            offload = re.search(r'offloaded (\d+)/(\d+) layers', notes)
+            if offload and self.config.n_gpu_layers == -1 and int(offload[1]) < int(offload[2]):
+                logger.warning('llama.cpp put only %s of %s layers on the GPU to keep 1 GiB of GPU memory free; replies will be slower. '
+                    'Free GPU memory, or set runtime.n_gpu_layers to -2 to require every layer on the GPU.', offload[1], offload[2])
             self.native, self.client = native, NativeClient(native, self.config.request_timeout_seconds)
             try:
                 response = self.client.get('/slots')
                 self._check_response(response)
                 slots = response.json()
-                required = max(self.config.n_ctx, getattr(self.config, 'initiative_n_ctx', 4096), getattr(self.config, 'reflection_n_ctx', 4096))
+                required = max(budgets.values())
                 if len(slots) != self.config.parallel_slots or any(s['n_ctx'] < required for s in slots):
-                    raise RuntimeError('Native context did not allocate the requested per-slot context')
+                    raise RuntimeError(f'llama.cpp allocated {len(slots)} slots of {sorted({s["n_ctx"] for s in slots})} tokens, but Riko needs '
+                        f'{self.config.parallel_slots} slots of {required} (the largest of {", ".join(budgets)}).')
                 self._initialize_probe(model)
             except BaseException:
                 self.client.close()
@@ -265,6 +321,13 @@ class InProcessLlamaProvider(LlamaContextProvider):
                 raise
 
     def _inference_client(self): return NativeClient(self.native, self.config.request_timeout_seconds)
+
+    def _flash_attention_identity(self):
+        # With auto, record what llama.cpp chose (the bridge reports it), so a config that never set flash_attn
+        # and resolves to off keeps its earlier probe data, and captures with and without it never mix.
+        notes, requested = getattr(self.native, 'notes', ''), super()._flash_attention_identity()
+        if requested != 'auto' or 'Flash Attention' not in notes: return requested
+        return 'Flash Attention enabled' in notes
 
     def _probe_runtime_fingerprint(self):
         path = Path(self.config.native_library)

@@ -13,7 +13,10 @@ Install Python runtime dependencies in your virtual environment:
 .venv\Scripts\python.exe -m pip install --no-deps EfficientWord-Net
 ```
 
-`install_reqs.sh` provides the shell-based alternative. Python package metadata
+`install_reqs.sh` (macOS, Linux or Git Bash) installs the same into the active environment, or `PYTHON=...`,
+using uv when present. It picks the PyTorch wheels for the machine: PyPI (Metal/MPS) on macOS, CUDA 13 (driver 580+)
+or 12.6 when `nvidia-smi` sees a GPU, ROCm 7.2 when `rocminfo` exists on Linux, CPU otherwise; set
+`RIKO_TORCH_INDEX` (`default`, `cpu`, `cu126`, `cu130`, `rocm7.2`, ...) to choose. Python package metadata
 requires 3.11 or newer; model dependencies and CUDA wheels must support your chosen
 Python/GPU combination. The current local environment uses Python 3.14. Installing
 the requirements alone does not guarantee GPU support. Faster-Whisper GPU use
@@ -53,9 +56,10 @@ npm run build
 npm run start
 ```
 
-Electron does not start or stop Python. Quit Python with Ctrl+C; the default
-Electron quit shortcut is Ctrl+Shift+Q. Default controls/whiteboard shortcuts are
-Ctrl+Shift+Space and Ctrl+Shift+W; supported overrides are in desktop settings.
+Electron does not start or stop Python. Quit Python with Ctrl+C. The only default global shortcut is
+Ctrl+Shift+Space (Cmd+Shift+Space on macOS), which opens the controls; Quit, Settings and the whiteboard are in
+the tray menu. `desktop.shortcuts` binds `popup`, `settings`, `whiteboard`, `quit`, `mic`, `audio` or `sleep` to an
+Electron accelerator, and `null` or `''` unbinds one. Electron reads it at launch.
 
 For frontend development, run `npm run dev` in `electron/`, then launch Electron
 from a separate terminal with `$env:RIKO_DEV="1"` and `npm run start`.

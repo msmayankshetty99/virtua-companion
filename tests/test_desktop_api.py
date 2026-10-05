@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 import importlib
 import os
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -491,3 +493,35 @@ def test_secrets_are_fresh_each_start_and_never_inherited_by_children(tmp_path, 
     assert client_token() == token
     monkeypatch.setenv('RIKO_API_TOKEN', 'c' * 43)
     assert client_token() == 'c' * 43
+
+
+def test_stop_turn_cancels_the_live_session_before_the_drain(backend, monkeypatch):
+    calls = []
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(_closed=False, cancel=lambda: calls.append('cancel')))
+    backend.stop_turn()
+    assert calls == ['cancel']
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(_closed=True, cancel=lambda: calls.append('closed')))
+    backend.stop_turn()
+    monkeypatch.setattr(backend, 'session', None)  # setup mode: nothing to stop
+    backend.stop_turn()
+    stuck = threading.Event()
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(_closed=False, cancel=lambda: stuck.wait(5)))
+    started = time.monotonic()
+    try: backend.stop_turn()
+    finally: stuck.set()
+    assert calls == ['cancel'] and time.monotonic() - started < 3  # a stuck cancel is abandoned after 1 s
+
+
+def test_lifespan_stops_discord_while_the_session_closes(backend, monkeypatch):
+    closing, calls = threading.Event(), []
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace())
+    class Session:
+        def __init__(self, *args): pass
+        def runtime_snapshot(self): return {'runtime': {}}
+        def close(self): closing.set(); calls.append('close')
+    monkeypatch.setattr(backend, 'SessionManager', Session)
+    monkeypatch.setattr(backend, 'Initiative', lambda session: None)
+    monkeypatch.setattr(backend, 'discord_launcher', SimpleNamespace(status=lambda: {'running': False, 'error': ''},
+        stop=lambda: calls.append(('discord', closing.wait(5)))))
+    with client_for(backend): pass
+    assert ('discord', True) in calls and 'close' in calls  # Discord's stop overlapped the session close

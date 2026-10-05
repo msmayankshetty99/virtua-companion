@@ -9,6 +9,7 @@ let backendProcess,sovitsProcess,setupWindow,shutdownRequested=false;
 if(app.isPackaged&&!app.requestSingleInstanceLock())app.quit();
 app.on('second-instance',()=>{if(setupWindow&&!setupWindow.isDestroyed())setupWindow.focus();else if(control&&!control.isDestroyed())showControls();});
 const release=require('./release.cjs');
+const {shortcutBindings}=require('./shortcuts.cjs');
 function setupSender(event){if(!setupWindow||setupWindow.isDestroyed()||event.sender.id!==setupWindow.webContents.id)throw new Error('Setup window required');}
 ipcMain.handle('setup-hardware',async event=>{setupSender(event);const hw=await release.hardware();try{hw.gpus=(await app.getGPUInfo('basic')).gpuDevice?.map(device=>device.deviceString||`GPU vendor ${device.vendorId}, device ${device.deviceId}`)||[];hw.vulkan=hw.gpus.join('\n')+'\n'+hw.vulkan;}catch{}return hw;});
 ipcMain.handle('setup-directory',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openDirectory','createDirectory']});return result.canceled?null:result.filePaths[0];});
@@ -220,14 +221,11 @@ app.whenReady().then(async () => {
       screen.on(name, () => {displaySignature = ''; publishDisplays();});
     }
     if (debug) control.show();
-    const shortcuts=config.desktop?.shortcuts||{};
     const actions={popup:()=>showControls(),quit:()=>app.quit(),whiteboard:()=>patchBoard({visible:!whiteboard.isVisible()}),
       settings:()=>showControls('settings'),
       mic:()=>backendFetch('/api/mic/toggle',{method:'POST'}).catch(()=>{}),audio:()=>backendFetch('/api/audio/toggle',{method:'POST'}).catch(()=>{}),sleep:()=>backendFetch('/api/sleep/toggle',{method:'POST'}).catch(()=>{})};
-    const defaults={popup:'CommandOrControl+Shift+Space',quit:'CommandOrControl+Shift+Q',whiteboard:'CommandOrControl+Shift+W',settings:'CommandOrControl+Shift+,'};
-    for(const [name,action] of Object.entries(actions)){
-      const accelerator=shortcuts[name]??defaults[name];
-      if(accelerator){try{if(!globalShortcut.register(accelerator,action))console.warn('Shortcut unavailable:',name,accelerator);}catch(error){console.warn('Invalid shortcut:',name,error.message);}}
+    for(const [name,accelerator] of shortcutBindings(config.desktop?.shortcuts,Object.keys(actions))){
+      try{if(!globalShortcut.register(accelerator,actions[name]))console.warn('Shortcut unavailable:',name,accelerator);}catch(error){console.warn('Invalid shortcut:',name,error.message);}
     }
   } catch (error) {
     dialog.showErrorBox('Desktop startup failed', error.stack || error.message);

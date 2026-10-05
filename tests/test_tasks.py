@@ -1,9 +1,12 @@
+import os
 from pathlib import Path
+import re
 import sys
 
 import pytest
 
 from process.app_core.persistence.tasks import TaskStore, TaskMCP, TaskConflict
+from process.app_core.tools import registry as tool_registry
 from process.app_core.tools.registry import ToolRegistry, StdioMCPClient
 from process.app_core.conversation.chat import ChatService
 from process.app_core.conversation.messages import ChatMessage, ModelResponse, ToolCall
@@ -89,6 +92,38 @@ def test_real_stdio_mcp_handshake_and_task_round_trip(tmp_path):
     finally:
         client.close()
         client.process.wait(timeout=5)
+
+
+def test_mcp_command_is_found_on_the_child_path_and_a_miss_names_that_path(tmp_path, monkeypatch):
+    with pytest.raises(FileNotFoundError, match="'riko-missing-mcp' was not found on PATH: " + re.escape(str(tmp_path))):
+        StdioMCPClient('riko-missing-mcp', env={'PATH': str(tmp_path)})
+    seen = []  # Windows: which() applies PATHEXT, so a bare npx becomes its npx.CMD shim on the merged PATH.
+    monkeypatch.setattr(tool_registry.shutil, 'which', lambda command, path=None: seen.append((command, path)) or 'C:/node/npx.CMD')
+    assert tool_registry.resolve_command('npx', {'PATH': os.pathsep.join(['/a', '/b'])}) == 'C:/node/npx.CMD'
+    assert seen == [('npx', os.pathsep.join(['/a', '/b']))]
+    assert tool_registry.resolve_command('C:/proj/.venv/Scripts/python', {}) == 'C:/proj/.venv/Scripts/python'  # a path runs as written
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX shell wrapper')
+def test_mcp_server_named_by_bare_command_on_a_configured_path(tmp_path):
+    entry, store = Path(__file__).resolve().parents[1] / 'Code' / 'task_mcp_server.py', tmp_path / 'tasks.sqlite3'
+    wrapper = tmp_path / 'riko-task-mcp'
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{entry}" --store "{store}"\n'); wrapper.chmod(0o755)
+    client = StdioMCPClient('riko-task-mcp', env={'PATH': str(tmp_path)})
+    try: assert 'task_create' in {tool['name'] for tool in client.list_tools()}
+    finally: client.close()
+
+
+def test_unloadable_mcp_server_is_reported_to_the_desktop(tmp_path):
+    from types import SimpleNamespace
+    from process.app_core.desktop.state import get_desktop_state
+    (tmp_path / 'mcp.json').write_text('{"mcpServers": {"broken": {"command": "riko-missing-mcp"}}}', encoding='utf-8')
+    config = SimpleNamespace(root=tmp_path, tools=SimpleNamespace(mcp_config=tmp_path / 'mcp.json', timeout_seconds=5, require_approval=True))
+    registry = ToolRegistry.from_config(config)
+    try:
+        notice = get_desktop_state().notifications[0]
+        assert notice['source'] == 'tools' and notice['level'] == 'error' and 'broken' in notice['text'] and 'riko-missing-mcp' in notice['text']
+    finally: registry.close()
 
 
 def test_task_validation_does_not_commit_failed_changes(tmp_path):

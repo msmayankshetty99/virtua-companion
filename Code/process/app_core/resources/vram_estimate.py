@@ -140,7 +140,7 @@ def estimate(config, telemetry, metadata=None):
         fraction = min(1, runtime.n_gpu_layers / max(1, layers)) if layers and runtime.n_gpu_layers >= 0 else 1
         weight = meta.get('weight_bytes')
         add('llm_weights', 'Shared LLM weights (one copy)', weight / MIB * fraction if weight else None,
-            weight / MIB * fraction * 1.1 if weight else None, meta.get('source', 'Unknown model metadata') + '; partial offload approximated by layer fraction')
+            weight / MIB * fraction * 1.1 if weight else None, meta.get('source', 'Unknown model metadata') + '; partial offload approximated by layer fraction' + ('; -1 assumes the automatic fit offloads every layer' if runtime.n_gpu_layers == -1 else ''))
         if all(type(v) in (int, float) and v > 0 for v in (layers, embedding, heads, kv_heads)):
             key_dim = meta.get('key_length') or embedding / heads
             value_dim = meta.get('value_length') or embedding / heads
@@ -157,19 +157,20 @@ def estimate(config, telemetry, metadata=None):
                 add('kv', 'KV pool — all slots occupied', pool * kv_per_token, pool * kv_per_token * 1.15, 'Attention dimensions × pooled tokens × selected K/V tensor formats; 15% padding allowance')
             else: add('kv', 'KV cache (CPU)', 0, 0, 'GPU KV offload disabled')
             batch = (max(128, runtime.n_ubatch) * embedding * max(4, heads) * 4 + runtime.n_batch * embedding * 8) / MIB
-            add('llm_compute', 'LLM compute / CUDA graphs', max(128, batch), max(384, batch * (1.25 if runtime.flash_attn else 2)), 'Heuristic workspace affected by batch, microbatch and flash attention')
+            add('llm_compute', 'LLM compute / CUDA graphs', max(128, batch), max(384, batch * (1.25 if runtime.flash_attn in ('on', True) else 2)), 'Heuristic workspace affected by batch, microbatch and flash attention')
         else:
             add('kv', 'KV pool — all slots occupied', None, None, 'Attention metadata unavailable; cannot compute KV bytes per token')
             add('llm_compute', 'LLM compute workspace', 128, 768, 'Heuristic; missing architecture details')
     else:
         add('llm_weights', 'LLM', 0, 0, 'CPU-only owned model' if managed else 'External provider excluded (any local GPU use appears in Other)')
     voice = config.raw.get('voice', {})
-    device = voice.get('asr_device', 'cuda')
-    model = str(voice.get('asr_model', 'distil-small.en')).lower()
+    from ..audio.asr import MODEL, resolve
+    device, precision, note = resolve(voice)
+    model = str(voice.get('asr_model', MODEL)).lower()
     base = next((size for name, size in [('large', 3100), ('medium', 1600), ('small', 600), ('base', 200), ('tiny', 100)] if name in model), None)
-    if device == 'cpu': add('asr', 'Whisper / faster-whisper ASR', 0, 0, 'CPU configured')
+    if note: warnings.append(f'Speech recognition runs as {device}/{precision} here: {note}.')
+    if device == 'cpu': add('asr', 'Whisper / faster-whisper ASR', 0, 0, f'CPU ({precision})')
     elif base:
-        precision = voice.get('asr_compute_type', 'int8_float16')
         factor = .65 if precision.startswith('int8') else 2 if precision == 'float32' else 1
         add('asr', 'Whisper / faster-whisper ASR', base * factor + 128, base * factor * 1.4 + 384,
             f'{model}, {precision}, {device}; heuristic resident weights + decoder workspace, included even if microphone is idle')
@@ -206,6 +207,9 @@ def estimate(config, telemetry, metadata=None):
     if gpu and gpu.get('other_mib') is not None and not unknown and not runtime.tensor_split:
         projection = {'low_mib': low + gpu['other_mib'], 'high_mib': high + gpu['other_mib'], 'total_mib': gpu['total_mib'],
             'fits_upper_estimate': high + gpu['other_mib'] <= gpu['total_mib']}
+    if managed and runtime.n_gpu_layers == -1 and projection and projection['high_mib'] + 1024 > projection['total_mib']:
+        # llama.cpp's --fit offloads every layer only while 1 GiB of device memory stays free at load time.
+        warnings.append('With GPU layer offload -1, llama.cpp keeps 1 GiB of GPU memory free and would probably run some layers on the CPU (slower) at these settings; -2 requires every layer on the GPU.')
     return {'components': components, 'low_mib': low, 'high_mib': high, 'complete': not unknown, 'unknown_components': unknown,
         'confidence': 'low',
         'confidence_basis': 'Model/KV metadata is used where available; compute, recurrent state, ASR and graphics reserves remain heuristic, not a native backend dry-run allocation report.',

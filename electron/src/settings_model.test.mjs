@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {parseSetting,settingsPatch,inputValues,llamaServerCommand} from './settings_model.mjs';
+import {parseSetting,settingsPatch,inputValues,llamaServerCommand,runtimePresets} from './settings_model.mjs';
 
 test('numeric inputs validate immediately and do not coerce blanks to zero',()=>{
   const field={kind:'number',integer:true,min:2,max:4};
@@ -20,6 +20,11 @@ test('native cross-field validation enforces physical batch and V-cache constrai
   const values={'runtime.provider':'llama_cpp','runtime.model_path':'model.gguf','runtime.n_batch':128,'runtime.n_ubatch':256,'runtime.type_v':'q8_0','runtime.flash_attn':false};
   const result=settingsPatch([],{},values);
   assert.ok(result.errors['runtime.n_ubatch']);assert.ok(result.errors['runtime.type_v']);
+  for(const flash of ['off',false])assert.ok(settingsPatch([],{},{...values,'runtime.n_ubatch':128,'runtime.flash_attn':flash}).errors['runtime.type_v']);
+  for(const flash of ['auto','on'])assert.deepEqual(settingsPatch([],{},{...values,'runtime.n_ubatch':128,'runtime.flash_attn':flash}).errors,{});
+});
+test('runtime presets use llama.cpp automatic flash attention',()=>{
+  for(const preset of Object.values(runtimePresets))assert.equal(preset['runtime.flash_attn'],'auto');
 });
 test('form hydration preserves zero, false and JSON arrays',()=>{
   const values={zero:0,flag:false,split:[1,1]};

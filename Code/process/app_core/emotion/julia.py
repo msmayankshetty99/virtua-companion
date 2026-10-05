@@ -7,13 +7,31 @@ from collections import deque
 from pathlib import Path
 from typing import Callable
 
+from ..runtime.torch_device import validate as validate_device
 from .models import EMOTIONS, EmotionEvent, EmotionState
 
 logger = logging.getLogger(__name__)
 
 
+def load_julia(julia, source, device, **options):
+    """Load without leaking Julia's process-wide torch settings; a failed GPU load retries on CPU.
+
+    Julia's FastEngine moves inputs to the device only for CUDA, so on MPS every predict fails
+    ('Passed CPU tensor to MPS op'): run it on CPU there until upstream supports MPS.
+    """
+    from ..runtime.torch_device import preserve_torch_globals, resolve
+    target = resolve(device)
+    if target == 'mps': logger.info('Julia 1 does not support MPS yet; using CPU'); target = 'cpu'
+    with preserve_torch_globals():
+        try: return julia.load_model(source, device=target, **options), target
+        except Exception as exc:
+            if target == 'cpu': raise
+            logger.warning('Julia 1 could not load on %s; retrying on CPU: %s', target, exc)
+            return julia.load_model(source, device='cpu', **options), 'cpu'
+
+
 class JuliaEmotionEngine:
-    """Iterative emotional interpreter for Julia 1; CPU by default, CUDA opt-in.
+    """Iterative emotional interpreter for Julia 1; CPU by default, CUDA (or auto) opt-in.
 
     The engine stores a rolling transcript made from user and assistant deltas.
     It evaluates that window after meaningful deltas rather than retaining the
@@ -30,8 +48,7 @@ class JuliaEmotionEngine:
         self.model_path = Path(model_path).expanduser() if model_path else None
         self.model_id = model_id
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
-        self.device = device
-        if device not in {'cpu', 'cuda', 'cuda:0'}: raise ValueError('Unsupported Julia device')
+        self.device, self.active_device = validate_device(device), None
         self.strict_encoding = strict_encoding
         self.max_length = max_length
         self.context_tokens = max(128, context_tokens)
@@ -67,9 +84,8 @@ class JuliaEmotionEngine:
                 sys.path.insert(0, source)
             julia = import_module("julia")
             self._resolved_source = source
-            self._model = julia.load_model(source, device=self.device, strict_encoding=self.strict_encoding,
-                                           max_length=self.max_length,
-                                            head_length=max(128, self.max_length - self.context_tokens))
+            self._model, self.active_device = load_julia(julia, source, self.device, strict_encoding=self.strict_encoding,
+                max_length=self.max_length, head_length=max(128, self.max_length - self.context_tokens))
             from .compat import compatible_engine
             compatible_engine(self._model)
         except Exception as exc:
@@ -168,7 +184,7 @@ class JuliaEmotionEngine:
         try:
             self._trim_window()
             response = model.predict(state=self._transcript(), questions=self._questions())
-            logger.debug('Julia interpretation duration_s=%.3f device=%s', time.perf_counter()-started, self.device)
+            logger.debug('Julia interpretation duration_s=%.3f device=%s', time.perf_counter()-started, self.active_device)
             return self._parse_julia_result(response, stream)
         except Exception as exc:
             logger.warning("Julia 1 interpretation failed: %s", exc)

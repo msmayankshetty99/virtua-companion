@@ -24,7 +24,7 @@ from process.app_core.runtime.initiative import Initiative
 from process.app_core.persistence.tasks import TaskConflict
 from process.app_core.events.stream import stream_events
 from process.app_core.persistence.conversation_store import ConversationStore
-from process.app_core.runtime.lifecycle import close_bounded
+from process.app_core.runtime.lifecycle import close_bounded, run_bounded
 from process.app_core.desktop.media import resolve_media
 from fastapi.responses import FileResponse
 
@@ -114,14 +114,23 @@ async def lifespan(_app):
         event_bus.publish("runtime.ready", provider=config.runtime.provider)
         yield
     finally:
-        await run_in_threadpool(discord_launcher.stop)
+        # Electron allows the whole shutdown 15 s: run_server spends at most 1 s stopping the turn and 2 s draining
+        # requests, this block at most about 8.5 s, and llama_native 2 s destroying the native context at exit.
+        discord = asyncio.create_task(run_in_threadpool(discord_launcher.stop))  # a separate process; stop it meanwhile
         if task_file_events: task_file_events.close(); task_file_events = None
         if resource_events: resource_events.close(); resource_events = None
-        if session: await run_in_threadpool(close_bounded, session, 10)
+        if session: await run_in_threadpool(close_bounded, session, 8)
         elif chat: await run_in_threadpool(close_bounded, chat, 6)
+        await discord
         for unsubscribe in reversed(unsubscribers): unsubscribe()
         if conversation_store: conversation_store.close()
         event_bus.publish("runtime.stopped")
+
+def stop_turn():
+    """run_server calls this before uvicorn drains requests, so an in-flight chat returns now instead of generating
+    through the drain. Bounded: a stuck cancel must not hold up the rest of shutdown."""
+    cancel = getattr(session, 'cancel', None)
+    if cancel and not getattr(session, '_closed', False): run_bounded(cancel, 1, 'SessionManager.cancel')
 
 _dev = os.environ.get('RIKO_DEV') == '1'  # The API map is published only while developing.
 app = FastAPI(title="Riko Local Desktop Runtime", lifespan=lifespan,

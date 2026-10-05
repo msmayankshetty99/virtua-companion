@@ -5,6 +5,7 @@ from copy import deepcopy
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import urllib.request
@@ -65,13 +66,24 @@ class RegisteredTool:
     prepare: Any = None
 
 
+def resolve_command(command, env):
+    """Find an MCP server command on the PATH its process will get. Windows CreateProcess applies neither PATHEXT nor
+    the child's PATH, so npx/uvx (.cmd shims) fail by bare name; a resolved .cmd/.bat path runs through cmd.exe."""
+    if os.path.dirname(command): return command  # an explicit path runs as written (CreateProcess still adds .exe)
+    search = os.pathsep.join(os.get_exec_path(env))
+    found = shutil.which(command, path=search)
+    if not found: raise FileNotFoundError(f'MCP server command {command!r} was not found on PATH: {search}')
+    return found
+
+
 class StdioMCPClient:
     """Minimal MCP JSON-RPC stdio client with a persistent server process."""
     def __init__(self, command: str, args: list[str] | None = None, env: dict[str, str] | None = None):
         self.command, self.args, self.env = command, args, env
         self._restart_lock = threading.Lock()
-        self.process = subprocess.Popen([command, *(args or [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True, encoding='utf-8', bufsize=1, env={**os.environ, **(env or {})})
+        environment = {**os.environ, **(env or {})}
+        self.process = subprocess.Popen([resolve_command(command, environment), *(args or [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, encoding='utf-8', bufsize=1, env=environment)
         self._counter = 0
         self._lock = threading.Lock()
         self._responses = queue.Queue(maxsize=256)
@@ -319,6 +331,8 @@ class ToolRegistry:
                 except Exception as exc:
                     if client: client.close()
                     logger.warning('Could not load MCP server %s: %s', name, exc)
+                    from ..desktop.state import get_desktop_state
+                    get_desktop_state().notify('tools', f'MCP server {name} was not loaded: {exc}', 'error')
             return registry
         except BaseException:
             registry.close()

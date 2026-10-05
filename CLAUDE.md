@@ -15,11 +15,11 @@ This layout is on `main` (formerly the `rewrite-2` branch). `origin/llama.cpp` i
 No linter or formatter is configured. Besides tests, the README's only checks are `node --check main.cjs` and `node --check preload.cjs` in `electron/`.
 
 ```bash
-# Python >= 3.11 (CI uses 3.11). Tests need the full runtime deps; `pip install -e .[test]` alone fails collection.
+# Python >= 3.11 (CI uses 3.11). Tests need the full runtime deps; the [test] extra pulls the [runtime] extra, which tests/test_dependency_manifests.py keeps equal to requirements-runtime.txt.
 python -m pip install -r requirements-runtime.txt
 python -m pip install --no-deps EfficientWord-Net
 # Linux CI pre-installs CPU torch: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-# install_reqs.sh pins CUDA 13 (cu130) torch wheels, which do not exist for macOS.
+# install_reqs.sh (bash, set -euo pipefail) picks torch wheels per machine: PyPI on macOS, cu130/cu126 by NVIDIA driver, rocm7.2 with rocminfo, else cpu; RIKO_TORCH_INDEX overrides.
 
 python -u Code/run_server.py   # backend; run from the repo root; Ctrl+C stops it
 
@@ -71,7 +71,7 @@ Release (CI only, `.github/workflows/release.yml`): `python tools/release/build.
 - The FastAPI lifespan calls `create_chat_service` (`app_core/factory.py`), which builds everything inside an `ExitStack` that rolls back on failure: `ActionController` → optional Julia emotion engine → `create_provider` (+ optional emotion probe) → `provider.warmup()` (loads the GGUF, no timeout) → `TaskStore` / `ToolRegistry` → `MemoryStore` → `ChatService`. Then come `SessionManager`, `warm_session` (ASR/VAD/wake/TTS, bounded by `runtime.startup_timeout_seconds`), `ConversationStore`, `Initiative` and the resource/task-file watchers, and finally `runtime.ready` is published.
 - `run_server.py` binds 127.0.0.1:8765 before the model loads (retrying for 20 s while a previous backend exits) and mints the API secrets right after; connections queue until lifespan startup finishes, so requests hang rather than fail while the model loads.
 - With `desktop.setup_on_startup_error: true`, a failing `create_chat_service` leaves only the settings/status/resource/media routes up (the rest return 503) so Settings can repair the YAML.
-- Shutdown: stop Discord → `close_bounded(session, 10)` (`app_core/runtime/lifecycle.py`; a hung close is abandoned to a daemon thread) → unwind the ExitStack.
+- Shutdown: `run_server.Server.shutdown` first cancels the active turn (`desktop_server.stop_turn`, bounded 1 s), then uvicorn drains for 2 s; the lifespan stops Discord in parallel with `close_bounded(session, 8)` (`app_core/runtime/lifecycle.py`; a hung close is abandoned to a daemon thread) → unwind the ExitStack. An atexit guard in `llama_native.py` destroys live native contexts, or `os._exit`s when one cannot be destroyed, because ggml-metal's static destructor aborts on leftover Metal buffers. The whole sequence stays under Electron's 15 s.
 
 ### Threading and events
 - `event_bus` (`app_core/events/bus.py`) is synchronous: listeners run on the publisher's thread, their exceptions are swallowed, and every event carries a monotonic `sequence`.
@@ -85,7 +85,7 @@ Release (CI only, `.github/workflows/release.yml`): `python tools/release/build.
   - `llama_server` → `LlamaServerProvider` (`llama_server.py`): the same `LlamaContextProvider` protocol (slot 0 for live, exact `/apply-template` + `/tokenize` counts, `/v1/responses` streaming and tools) against a llama-server the user runs at `runtime.base_url` (default `http://127.0.0.1:8080`; validated by `server_address` in `llama_runtime.py`). It uses `http.client`, one connection per request, and cancels by shutting the socket down (closing alone does not wake a read blocked during prefill). Startup waits on `/health` (503 while loading), then requires exactly `parallel_slots` slots each holding the largest of the live, initiative and reflection budgets, and prints the matching `llama-server` command otherwise; a connection failure resets it so the next request checks again. The server owns the model and GPU settings, and there is no emotion probe.
   - `openai`, `lm_studio`, `openai_compatible`, `ollama`, `local_http` → `OpenAIProvider`: Responses API with a Chat Completions fallback, byte-based token estimates, no slots, no provider-level cancel.
 - `SlotScheduler` (`llama_context.py`) reserves slot 0 for the `live` lane. `initiative` and `reflection` share slots 1..N-1 (`runtime.parallel_slots`, 2–4), and live turns preempt them when `runtime.pause_background_on_live` is set. The emotion probe captures only on slot 0.
-- `--ctx-size` comes from `kv_budget.pool_capacity`. Per-role budgets are enforced only by Python-side packing (`context_budget.pack_context`, with exact native token counts) and by `max_output_tokens`.
+- `--ctx-size` comes from `kv_budget.pool_capacity`. `runtime.flash_attn` is `auto`/`on`/`off` (YAML booleans mean on/off); `n_gpu_layers` -1 lets llama.cpp `--fit` keep 1 GiB free, -2 requires every layer, and only -1 passes `--fit on`. `split_mode: row` loads but the native provider refuses it. Budgets above the GGUF's training context fail before loading, and `riko_create` returns llama.cpp's own WARN/ERROR lines on failure and its offload/flash-attention notes on success. Per-role budgets are enforced only by Python-side packing (`context_budget.pack_context`, with exact native token counts) and by `max_output_tokens`.
 - Turn flow: `SessionManager.respond` → `ChatService.respond` (`app_core/conversation/chat.py`):
   1. memory capture and recall;
   2. the prompt: a stable system + history prefix (so the KV cache is reused), then `context_kind='optional'` system messages;
@@ -108,7 +108,7 @@ Release (CI only, `.github/workflows/release.yml`): `python tools/release/build.
 The data root is the directory holding `character_config.yaml`.
 - `persistent_memories/` is user data: never delete it during cleanup. Runtime files:
   - `chat_history.json`: the model's context. Both `ChatService` and `SessionManager` rewrite the whole file (fsynced). An unreadable file is kept as `chat_history.json.unreadable-<timestamp>` before anything replaces it. Only a turn still generating or playing is cut by Stop/Sleep/shutdown; failed and cancelled turns keep the user's message.
-  - `memory_store.json` (`app_core/persistence/memory.py`): written via temp file, fsync and replace; fails closed. Its FAISS index is written but rebuilt from embeddings on load.
+  - `memory_store.json` (`app_core/persistence/memory.py`): written via temp file, fsync and replace; fails closed. Its semantic index is an in-memory float32 numpy matrix, re-embedded from record text on every start and never written (FAISS was dropped: its libomp crashed beside torch's on macOS); `memory.index_file` is ignored.
   - `conversations.sqlite3`: the UI archive, built from bus events. It is a second history and can diverge from `chat_history.json`.
   - `tasks.sqlite3` (`app_core/persistence/tasks.py`): revision-checked, and shared with `Code/task_mcp_server.py`.
   - The whiteboard, desktop, initiative, tool-approval and Discord JSON files, plus `wake_words/`.
@@ -149,7 +149,7 @@ The data root is the directory holding `character_config.yaml`.
 - **Packaged, later launches:**
   - Electron spawns `backend/riko-backend` with `RIKO_MANAGED=1`, `RIKO_DATA_DIR`, `RIKO_CONFIG` and `RIKO_BUNDLE_ROOT`.
   - Hugging Face and torch caches go under `<data>/models`.
-  - A `shutdown` line or EOF on stdin stops the backend; Electron kills it after 15 s.
+  - A `shutdown` line or EOF on stdin stops the backend (it dumps stacks and exits itself after 14 s); Electron sends SIGTERM after 15 s and SIGKILL 3 s later. On macOS the backend's PATH gets the Homebrew prefixes so MCP servers and ffmpeg resolve (`finderPath`).
   - `runtime.native_library: bundled:<cuda|vulkan>` resolves to `$RIKO_BUNDLE_ROOT/native/<backend>/`.
 
 ## Conventions and gotchas
@@ -179,6 +179,6 @@ Backend and device assumptions live here:
 - **Bundled-backend allowlists and library names:** `app_core/configuration/config.py`, `electron/release.cjs` (detects GPUs via nvidia-smi and vulkaninfo) and `electron/src/first_setup.jsx`. They are asserted by `tests/test_release_config.py` and `electron/src/release.test.mjs`.
 - **Library loading:** `os.add_dll_directory` is called only on Windows (`app_core/inference/llama_native.py`, `Code/run_server.py`).
 - **NVIDIA-only telemetry:** `app_core/resources/gpu_memory.py` (nvidia-smi, DXGI vendor `0x10de`, PowerShell counters) and the CUDA rows in `app_core/resources/vram_estimate.py`.
-- **ASR defaults:** `device='cuda'` and `compute_type='int8_float16'` are set in `app_core/audio/voice_input.py`, `app_core/runtime/warmup.py`, `app_core/integrations/discord/api.py` and `app_core/configuration/settings_store.py`. They fail on macOS, where CTranslate2 has no GPU backend; `auto` + `default` works on CPU.
-- **Julia devices:** the allowlist is `cpu`/`cuda`/`cuda:0`, with no `mps`. It lives in `app_core/emotion/julia.py` and the settings `ENUMS`, and `tests/test_llama_native.py` asserts it.
+- **ASR:** every faster-whisper model is built by `app_core/audio/asr.py:create_whisper`. Defaults are `auto`/`default`, resolved from what CTranslate2 reports (CPU int8 on macOS, which has no CTranslate2 GPU backend); an unsupported configured pair falls back once with a warning, and Settings refuses one when it is edited. GPU ASR on Metal or ROCm needs a different engine (whisper.cpp, mlx-whisper, or a HIP-built CTranslate2).
+- **Torch devices:** `app_core/runtime/torch_device.py` accepts `auto`/`cpu`/`cuda[:n]`/`mps` (ROCm torch reports `cuda`). Julia maps `mps` to CPU until upstream moves inputs for MPS, retries a failed GPU load on CPU, and restores torch's thread count after loading. `memory.device` covers the memory classifier and embedder; the settings `ENUMS` and `tests/test_llama_native.py` pin the lists.
 - **Windows-only behaviour:** `WindowsActivity` in `app_core/runtime/initiative.py`, the Win32 pointer hooks in `electron/main.cjs`, and the acrylic material in `electron/window_material.cjs`.

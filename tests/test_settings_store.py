@@ -126,6 +126,19 @@ def test_background_budgets_are_exposed_and_validated(store):
     assert store.validate({'memory.reflection_max_output_tokens': 1536, 'memory.reflection_context_window_tokens': 8192})['valid']
 
 
+def test_speech_recognition_pair_defaults_to_auto_and_is_checked_only_when_edited(store, monkeypatch):
+    from process.app_core.audio import asr
+    monkeypatch.setattr(asr, 'supported_types', lambda: {'cpu': frozenset({'float32', 'int8', 'int8_float32'})})
+    values = store.snapshot()['values']
+    assert (values['voice.asr_device'], values['voice.asr_compute_type']) == ('auto', 'default')
+    assert store.validate({'voice.asr_device': 'cpu', 'voice.asr_compute_type': 'int8'})['valid']
+    assert 'voice.asr_device' in store.validate({'voice.asr_device': 'cuda'})['errors']
+    assert 'voice.asr_compute_type' in store.validate({'voice.asr_compute_type': 'int8_float16'})['errors']
+    # A pair already in the file falls back at startup; it must not block saving anything else.
+    store.path.write_text(store.path.read_text().replace('  wake_threshold: 0.9\n', '  wake_threshold: 0.9\n  asr_device: cuda\n  asr_compute_type: int8_float16\n'))
+    assert store.save({'voice.wake_threshold': .8}, store.snapshot()['revision'])['saved']
+
+
 def test_resource_fields_are_grouped_with_models(store):
     fields = {field['path']:field for field in store.snapshot()['fields']}
     for path in ('voice.asr_device','memory.embedding_model','emotion.max_length','memory.reflection_max_output_tokens','initiative.context_window_tokens','memory.system1_model_id'):
@@ -180,3 +193,49 @@ def test_concurrent_same_name_tool_results_update_the_correct_activity():
     assert activities[first]['status']=='complete'
     assert activities[second]['status']=='running'
     assert activities[first]['duration_ms']>=0
+
+
+def test_legacy_faiss_index_file_is_not_offered(store):
+    assert 'memory.index_file' not in {field['path'] for field in store.snapshot()['fields']}
+
+
+def test_memory_device_is_a_background_model_setting(store):
+    snapshot = store.snapshot()
+    spec = next(item for item in snapshot['fields'] if item['path'] == 'memory.device')
+    assert snapshot['values']['memory.device'] == 'cpu' and spec['section'] == 'Background models' and spec['restart']
+    assert store.validate({'memory.device': 'mps', 'emotion.device': 'auto'})['valid']
+    assert not store.validate({'memory.device': 'vulkan'})['valid']
+    assert not store.validate({'emotion.device': 'mps'})['valid']
+
+
+def test_flash_attention_is_a_choice_that_keeps_old_boolean_files(store):
+    snapshot = store.snapshot()
+    spec = next(item for item in snapshot['fields'] if item['path'] == 'runtime.flash_attn')
+    assert snapshot['values']['runtime.flash_attn'] == 'off' and spec['kind'] == 'text' and spec['options'] == ['auto', 'on', 'off']
+    result = store.save({'runtime.flash_attn': 'on'}, snapshot['revision'])
+    assert result['saved'] and result['values']['runtime.flash_attn'] == 'on'
+    assert 'flash_attn: on' in store.path.read_text()  # ruamel writes it bare, so PyYAML reads true
+    from process.app_core.configuration.config import load_config
+    native = store.path.with_name('native.yaml')
+    native.write_text('runtime:\n  provider: llama_cpp\n  model_path: model.gguf\n  flash_attn: on\n')
+    assert load_config(native).runtime.flash_attn == 'on'
+    assert not store.save({'runtime.flash_attn': True}, store.snapshot()['revision'])['saved']
+
+
+def test_layer_offload_and_split_choices_match_llama_cpp(store):
+    assert store.validate({'runtime.n_gpu_layers': -2})['valid']
+    assert not store.validate({'runtime.n_gpu_layers': -3})['valid']
+    assert not store.validate({'runtime.split_mode': 'row'})['valid']
+    store.path.write_text(store.path.read_text().replace('provider: lm_studio', 'provider: llama_cpp')
+        .replace('  model_path: null', '  model_path: model.gguf').replace('  flash_attn: false', '  flash_attn: false\n  split_mode: row'))
+    assert store.snapshot()['values']['runtime.split_mode'] == 'row'  # an old file still opens
+    assert 'runtime.split_mode' in store.validate({})['errors']
+
+
+def test_speech_recognition_error_names_the_value_that_cannot_run(store, monkeypatch):
+    from process.app_core.audio import asr
+    monkeypatch.setattr(asr, 'supported_types', lambda: {'cpu': frozenset({'float32', 'int8'}), 'cuda': frozenset({'float32', 'int8', 'int8_float16'})})
+    store.path.write_text(store.path.read_text().replace('  wake_threshold: 0.9\n', '  wake_threshold: 0.9\n  asr_device: cuda\n  asr_compute_type: int8_float16\n'))
+    errors = store.validate({'voice.asr_device': 'cpu'})['errors']  # CPU is fine; the stored precision is what cannot run there
+    assert 'voice.asr_device' not in errors and 'cpu cannot run int8_float16' in errors['voice.asr_compute_type']
+    assert store.validate({'voice.asr_device': 'cpu', 'voice.asr_compute_type': 'default'})['valid']

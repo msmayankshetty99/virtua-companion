@@ -37,10 +37,8 @@ def warm_session(session):
     session.asr_lock = threading.Lock()
     def asr():
         import numpy as np
-        from faster_whisper import WhisperModel
-        settings = session.config.raw.get('voice', {})
-        model = WhisperModel(settings.get('asr_model', 'distil-small.en'), device=settings.get('asr_device', 'cuda'),
-            compute_type=settings.get('asr_compute_type', 'int8_float16'))
+        from ..audio.asr import create_whisper
+        model = create_whisper(session.config.raw.get('voice', {}))
         segments, _ = model.transcribe(np.zeros(16000, dtype='float32'), beam_size=1, vad_filter=False)
         list(segments)
         if not session._closed: session.warmed_asr = model

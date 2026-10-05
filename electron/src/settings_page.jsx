@@ -131,7 +131,7 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
     try {const value=await request('/api/settings/path',{method:'POST',body:{value:String(inputs[field.path]||'')}});setPathChecks(old=>({...old,[field.path]:value}));}
     catch(e){setError(e.message);}
   }
-  function preset(name){setInputs(old=>syncPool({...old,...runtimePresets[name]}));setNotice(name==='compact'?'Compact preset requires compatible flash attention and quantized KV support. No hardware capability is inferred.':'Preset applied to your draft. Review and save when ready.');}
+  function preset(name){setInputs(old=>syncPool({...old,...runtimePresets[name]}));setNotice(name==='compact'?'Compact preset quantizes the KV cache, which turns flash attention on. If your GPU backend lacks flash attention for this model, attention runs on the CPU.':'Preset applied to your draft. Review and save when ready.');}
   const searchItems=useMemo(()=>settingsIndex(snapshot?.fields||[],groups,catalog),[snapshot?.fields,catalog]);
   const fields=(snapshot?.fields||[]).filter(field=>field.path===destination?.path||(field.group===group
     &&!['avatar.model','avatar.format','runtime.kv_pool_auto','runtime.kv_pool_tokens'].includes(field.path)

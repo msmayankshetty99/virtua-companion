@@ -1,4 +1,4 @@
-"""Python capture, VAD, incremental GPU ASR and turn dispatch are separate workers."""
+"""Python capture, VAD, incremental ASR and turn dispatch are separate workers."""
 import logging
 import queue
 import threading
@@ -7,6 +7,7 @@ from ..runtime.workers import DaemonExecutor
 
 from ..runtime.cancellation import TurnCancelled
 from ..events.bus import event_bus
+from .asr import create_whisper
 from .voice_segments import VoiceSegments
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,6 @@ class VoiceInput:
                     self._parts.pop(segment.utterance_id, None)
                     continue
                 import numpy as np
-                from faster_whisper import WhisperModel
                 config = self.session.config.raw.get("voice", {})
                 if not segment.provisional: event_bus.publish('voice.transcribing', utterance_id=segment.utterance_id)
                 parts = self._parts.setdefault(segment.utterance_id, [])
@@ -159,9 +159,7 @@ class VoiceInput:
                         if self.model is None:
                             self.model = getattr(self.session, 'warmed_asr', None)
                             if self.model is None:
-                                self.model = WhisperModel(config.get("asr_model", "distil-small.en"),
-                                    device=config.get("asr_device", "cuda"), compute_type=config.get("asr_compute_type", "int8_float16"))
-                                self.session.warmed_asr = self.model
+                                self.model = self.session.warmed_asr = create_whisper(config)
                         segments, _ = self.model.transcribe(audio, beam_size=1, vad_filter=False,
                                                            condition_on_previous_text=False)
                         text = " ".join(item.text.strip() for item in segments).strip()
