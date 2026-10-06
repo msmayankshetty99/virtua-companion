@@ -1,0 +1,50 @@
+{
+  "about": "The native llama.cpp bundles a packaged app can ship, as resources/native/<id>/<library>. Read by electron/native_backends.cjs (first-run setup), Code/process/app_core/configuration/native_backends.py (runtime.native_library: bundled:<id>; the frozen backend carries a copy) and tools/release/build.py. Backends are in preference order: setup preselects the first one shipped for the OS whose required detection, if any, found hardware. A build turns its backend's cmake_switch ON and every other backend's OFF, then adds cmake_flags.",
+  "platforms": {
+    "win32": {"library": "riko-native.dll", "shared_libraries": ["*.dll"]},
+    "linux": {"library": "libriko-native.so", "shared_libraries": ["*.so", "*.so.*"], "rpath": "$ORIGIN"},
+    "darwin": {"library": "libriko-native.dylib", "shared_libraries": ["*.dylib"], "rpath": "@loader_path"}
+  },
+  "backends": [
+    {
+      "id": "cuda",
+      "label": "CUDA",
+      "description": "preferred for NVIDIA",
+      "platforms": ["win32", "linux"],
+      "cmake_switch": "GGML_CUDA",
+      "cmake_flags": ["-DCMAKE_CUDA_FLAGS=--diag-suppress=221", "-DGGML_CUDA_NO_VMM=ON"],
+      "notes": "Upstream uses -INFINITY as a max-reduction sentinel and MSVC's expansion triggers NVCC #221 repeatedly, so it is suppressed and the upstream code kept. Without GGML_CUDA_NO_VMM, ggml-cuda links the driver library (nvcuda.dll, libcuda.so.1) directly, so the bundle could not load at all without an NVIDIA driver, as on CI runners; cudart still loads the driver when CUDA starts. The cost: the CUDA memory pool grows with cudaMalloc instead of virtual-memory mappings.",
+      "detect": {
+        "command": "nvidia-smi",
+        "args": ["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"],
+        "label": "NVIDIA GPU (nvidia-smi)",
+        "missing": "No NVIDIA GPU detected via nvidia-smi",
+        "required": true
+      }
+    },
+    {
+      "id": "vulkan",
+      "label": "Vulkan",
+      "description": "AMD/Intel/NVIDIA",
+      "platforms": ["win32", "linux"],
+      "cmake_switch": "GGML_VULKAN",
+      "cmake_flags": [],
+      "detect": {
+        "command": "vulkaninfo",
+        "args": ["--summary"],
+        "label": "Vulkan detection",
+        "missing": "Vulkan enumeration unavailable; driver support must be checked",
+        "required": false
+      }
+    },
+    {
+      "id": "metal",
+      "label": "Metal",
+      "description": "Apple silicon GPU",
+      "platforms": ["darwin"],
+      "cmake_switch": "GGML_METAL",
+      "cmake_flags": ["-DGGML_METAL_EMBED_LIBRARY=ON", "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"],
+      "notes": "The embedded shader library needs no Metal toolchain or default.metallib at run time (built and run on Apple silicon at the current llama.cpp pin). macOS 14.0 is the oldest the frozen backend runs on (the locked torch, numpy, scipy, onnxruntime and av wheels), so the library targets it rather than the build host's macOS; electron-builder.yml's mac.minimumSystemVersion matches."
+    }
+  ]
+}

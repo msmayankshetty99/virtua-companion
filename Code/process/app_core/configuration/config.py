@@ -157,12 +157,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     runtime_raw = raw.get("runtime", {})
     library = runtime_raw.get('native_library')
     if isinstance(library, str) and library.startswith('bundled:'):
-        import sys
-        backend = library.split(':', 1)[1]
-        bundle = os.getenv('RIKO_BUNDLE_ROOT')
-        if backend not in {'cuda', 'vulkan'} or not bundle:
-            raise ValueError('Bundled native library requires the packaged app and CUDA or Vulkan backend')
-        library = Path(bundle) / 'native' / backend / ('riko-native.dll' if sys.platform == 'win32' else 'libriko-native.so')
+        from .native_backends import bundled_library  # electron/native_backends.json: shipped backends, library names
+        library = bundled_library(library.split(':', 1)[1], os.getenv('RIKO_BUNDLE_ROOT'))
     runtime = RuntimeConfig(
         provider=runtime_raw.get("provider", "openai"),
         model=runtime_raw.get("model", raw.get("model", "")),

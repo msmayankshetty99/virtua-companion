@@ -3,10 +3,11 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 
 import pytest
 
+from process.app_core.configuration.config import load_config
+from process.app_core.configuration.native_backends import backends_for, bundled_library
 from process.app_core.configuration.settings_store import SettingsStore, SettingsConflict
 
 
@@ -249,7 +250,7 @@ def test_live_budget_is_checked_only_when_edited_so_older_setups_can_save(tmp_pa
     # The setup wizard used to write memory.context_window_tokens equal to n_ctx, which never leaves room for the reply.
     monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(tmp_path / 'application'))
     path = tmp_path / 'character_config.yaml'
-    path.write_text('runtime:\n  provider: llama_cpp\n  native_library: bundled:cuda\n  hf_repo_id: owner/model\n  hf_filename: model.gguf\n'
+    path.write_text(f'runtime:\n  provider: llama_cpp\n  native_library: bundled:{backends_for()[0]}\n  hf_repo_id: owner/model\n  hf_filename: model.gguf\n'
         '  n_ctx: 8192\n  max_output_tokens: 1024\nmemory:\n  context_window_tokens: 8192\n')
     store = SettingsStore(path)
     assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
@@ -266,14 +267,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.skipif(not shutil.which('node') or not (ROOT / 'electron' / 'node_modules' / 'yaml').is_dir(), reason='needs node and the Electron dependencies')
 def test_packaged_setup_writes_a_config_settings_can_save(tmp_path, monkeypatch):
-    resources = tmp_path / 'application'
-    library = resources / 'native' / 'cuda' / ('riko-native.dll' if sys.platform == 'win32' else 'libriko-native.so')
+    # Electron's setup refuses a backend whose library is not where it looks, so this also proves that both languages
+    # resolve bundled:<backend> to the same file for this OS.
+    resources, backend = tmp_path / 'application', backends_for()[0]
+    library = bundled_library(backend, resources)
     library.parent.mkdir(parents=True); library.write_text('test')
-    form = {'backend': 'cuda', 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 4}
+    form = {'backend': backend, 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 4}
     script = "require('./release.cjs').saveSetup(process.argv[1], JSON.parse(process.argv[2]), process.argv[3])"
     subprocess.run(['node', '-e', script, str(tmp_path / 'data'), json.dumps(form), str(resources)], cwd=ROOT / 'electron', check=True, timeout=60)
     monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(resources))
     store = SettingsStore(tmp_path / 'data' / 'character_config.yaml')
+    assert load_config(store.path).runtime.native_library == library
     assert store.validate({'runtime.n_ctx': 8192}) == {'valid': True, 'errors': {}}  # the wizard's budget fits
     assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
 

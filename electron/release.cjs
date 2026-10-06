@@ -3,18 +3,24 @@ const fs=require('fs');
 const os=require('os');
 const {execFile,spawn}=require('child_process');
 const YAML=require('yaml');
+const native=require('./native_backends.cjs');
 const run=(file,args)=>new Promise(resolve=>execFile(file,args,{timeout:5000,windowsHide:true},(error,stdout)=>resolve(error?'':stdout.trim())));
 
-async function hardware(){
- const gpu=await run('nvidia-smi',['--query-gpu=name,memory.total,driver_version','--format=csv,noheader,nounits']);
- const vulkan=await run('vulkaninfo',['--summary']);
- return {cpu:os.cpus()[0]?.model||'Unknown',threads:os.cpus().length,ramGB:Math.round(os.totalmem()/2**30),nvidia:gpu,vulkan:vulkan||'Vulkan enumeration unavailable; driver support must be checked',preferred:gpu?'cuda':'vulkan'};
+// Runs only the detection tools of this OS's bundles (macOS ships Metal and has neither nvidia-smi nor vulkaninfo).
+async function hardware(platform=process.platform,probe=run){
+ const backends=native.backendsFor(platform),probed=backends.filter(backend=>backend.detect);
+ const outputs=await Promise.all(probed.map(backend=>probe(backend.detect.command,backend.detect.args)));
+ const detected=Object.fromEntries(probed.map((backend,index)=>[backend.id,outputs[index]]));
+ return {cpu:os.cpus()[0]?.model||'Unknown',threads:os.cpus().length,ramGB:Math.round(os.totalmem()/2**30),platform,
+  backends:backends.map(({id,label,description})=>({id,label,description})),
+  detections:probed.map(backend=>({backend:backend.id,label:backend.detect.label,required:!!backend.detect.required,output:detected[backend.id]||backend.detect.missing})),
+  preferred:native.preferredBackend(platform,detected)};
 }
-function nativeLibrary(resources,backend){return path.join(resources,'native',backend,process.platform==='win32'?'riko-native.dll':'libriko-native.so');}
-function configuration(input,resources){
+function configuration(input,resources,platform=process.platform){
  if(input.sovitsAuto&&(!path.isAbsolute(input.sovitsExecutable||'')||!fs.existsSync(input.sovitsExecutable)))throw new Error('Choose an existing absolute GPT-SoVITS executable');
- if(!['cuda','vulkan'].includes(input.backend))throw new Error('Choose CUDA or Vulkan');
- const library=nativeLibrary(resources,input.backend);
+ const shipped=native.backendsFor(platform);
+ if(!shipped.some(backend=>backend.id===input.backend))throw new Error(shipped.length?'Choose '+shipped.map(backend=>backend.label).join(' or '):'No native backend ships for '+platform);
+ const library=native.nativeLibrary(resources,input.backend,platform);
  if(!fs.existsSync(library))throw new Error('Packaged native backend is missing: '+library);
  const context=Number(input.context),output=Number(input.output),threads=Number(input.threads);
  if(!Number.isInteger(context)||context<2048||context>131072||!Number.isInteger(output)||output<64||output>=context)throw new Error('Invalid context/output budget');
@@ -31,10 +37,10 @@ function configuration(input,resources){
 // macOS, the executable's folder elsewhere.
 function installRoot(executable,platform=process.platform){return platform==='darwin'?path.resolve(executable,'..','..','..'):path.dirname(executable);}
 function inside(parent,child){const relative=path.relative(path.resolve(parent),path.resolve(child));return relative===''||relative!=='..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);}
-function saveSetup(directory,input,resources,install=resources){
+function saveSetup(directory,input,resources,install=resources,platform=process.platform){
  if(!path.isAbsolute(directory))throw new Error('Choose an absolute data directory');
  if([install,resources].some(root=>inside(root,directory)))throw new Error('Choose a data folder outside the application folder ('+path.resolve(install)+'); updates and uninstall delete everything inside it');
- const config=configuration(input,resources);
+ const config=configuration(input,resources,platform);
  fs.mkdirSync(directory,{recursive:true});
  for(const folder of ['models','persistent_memories','logs'])fs.mkdirSync(path.join(directory,folder),{recursive:true});
  // Never overwrite an existing user configuration, even after a failed first run.
@@ -56,6 +62,17 @@ function watchListening(onListening){
 // npx, uvx and ffmpeg from MCP servers and the Discord worker; put its prefixes first, as a Terminal does.
 const HOMEBREW_PATHS=['/opt/homebrew/bin','/opt/homebrew/sbin','/usr/local/bin'];
 function finderPath(current){const parts=String(current||'/usr/bin:/bin:/usr/sbin:/sbin').split(':').filter(Boolean);return [...HOMEBREW_PATHS.filter(dir=>!parts.includes(dir)),...parts].join(':');}
+// macOS attributes the packaged backend's microphone use to this app: the hardened runtime needs the audio-input
+// entitlement, and the prompt shows NSMicrophoneUsageDescription. Ask before the backend starts, so the prompt names Riko
+// at launch instead of interrupting the first voice turn. Resolves true/false once answered, null when nothing was asked.
+// 'blocked' when macOS already denies the microphone: the backend's input then opens but records silence.
+function askMicrophone(preferences,platform=process.platform){
+ if(platform!=='darwin')return Promise.resolve(null);
+ const status=preferences.getMediaAccessStatus('microphone');
+ if(status==='denied'||status==='restricted')return Promise.resolve('blocked');
+ if(status!=='not-determined')return Promise.resolve(null);
+ return Promise.resolve().then(()=>preferences.askForMediaAccess('microphone')).catch(()=>false);
+}
 function startBackend(directory,resources,secrets={},onListening=()=>{}){
  const executable=path.join(resources,'backend',process.platform==='win32'?'riko-backend.exe':'riko-backend');
  const logPath=path.join(directory,'logs','backend-launch.log');
@@ -80,4 +97,4 @@ function startSovits(settings){
 }
 // Ask first; the backend gives itself 14 s. uvicorn ignores SIGTERM while already shutting down, so escalate to SIGKILL.
 function stopBackend(child,grace=15000,force=3000){return new Promise(resolve=>{if(!child||child.exitCode!==null||child.signalCode!==null){resolve();return;}let timer=setTimeout(()=>{child.kill();timer=setTimeout(()=>{child.kill('SIGKILL');resolve();},force);},grace);child.once('exit',()=>{clearTimeout(timer);resolve();});child.stdin.end('shutdown\n');});}
-module.exports={hardware,configuration,saveSetup,installRoot,startBackend,nativeLibrary,startSovits,stopBackend,watchListening,finderPath,LISTENING};
+module.exports={hardware,configuration,saveSetup,installRoot,askMicrophone,startBackend,nativeLibrary:native.nativeLibrary,startSovits,stopBackend,watchListening,finderPath,LISTENING};

@@ -77,6 +77,10 @@ def release_check(library=None):
     import importlib
     import subprocess
     import tempfile
+    from process.app_core.configuration.native_backends import backends_for, library_name
+    shipped, name = backends_for(sys.platform), library_name(sys.platform)  # the frozen copy bundled:<backend> resolves with
+    if library and (Path(library).name != name or Path(library).absolute().parent.name not in shipped):
+        raise SystemExit(f'{library} is not where bundled:<backend> looks on {sys.platform}: native/<{"|".join(shipped)}>/{name}')
     if library:
         library = Path(library).resolve()
         directory = os.add_dll_directory(str(library.parent)) if os.name == 'nt' else None

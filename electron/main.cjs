@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen, session, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen, session, shell, Tray, Menu, nativeImage, systemPreferences } = require('electron');
 // Hardware acceleration is Electron's default; keep WebGL and GPU rasterization enabled.
 app.commandLine.appendSwitch('enable-gpu-rasterization');
 // Linux Wayland: the overlay needs X11 (placement, always-on-top, click-through) and Ozone is chosen before this file
@@ -16,7 +16,7 @@ app.on('second-instance',()=>{if(setupWindow&&!setupWindow.isDestroyed())setupWi
 const release=require('./release.cjs');
 const {shortcutBindings}=require('./shortcuts.cjs');
 function setupSender(event){if(!setupWindow||setupWindow.isDestroyed()||event.sender.id!==setupWindow.webContents.id)throw new Error('Setup window required');}
-ipcMain.handle('setup-hardware',async event=>{setupSender(event);const hw=await release.hardware();try{hw.gpus=(await app.getGPUInfo('basic')).gpuDevice?.map(device=>device.deviceString||`GPU vendor ${device.vendorId}, device ${device.deviceId}`)||[];hw.vulkan=hw.gpus.join('\n')+'\n'+hw.vulkan;}catch{}return hw;});
+ipcMain.handle('setup-hardware',async event=>{setupSender(event);const hw=await release.hardware();try{hw.gpus=(await app.getGPUInfo('basic')).gpuDevice?.map(device=>device.deviceString||`GPU vendor ${device.vendorId}, device ${device.deviceId}`)||[];}catch{hw.gpus=[];}return hw;});
 ipcMain.handle('setup-directory',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openDirectory','createDirectory']});return result.canceled?null:result.filePaths[0];});
 ipcMain.handle('setup-model',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openFile'],filters:[{name:'GGUF models',extensions:['gguf']}]});return result.canceled?null:result.filePaths[0];});
 ipcMain.handle('setup-sovits',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openFile']});return result.canceled?null:result.filePaths[0];});
@@ -196,6 +196,16 @@ function setBoardMode(mode,instant=false){
  whiteboard.setAlwaysOnTop(true);whiteboard.show();whiteboard.focus();
 }
 function showControls(view,mode=controlMode,anchor){if(view&&view!=='chat')mode='full';else if(mode==='collapsed')mode='compact';setControlMode(mode,anchor);if(control.isMinimized())control.restore();control.show();control.focus();if(view)control.webContents.send('navigate',view);}
+// macOS hands a process without microphone access silent buffers, not an error, so say so once (until access is granted).
+function microphoneNotice(blocked){
+  const marker=path.join(app.getPath('userData'),'microphone-blocked-notice');
+  if(!blocked){fs.rmSync(marker,{force:true});return;}
+  if(fs.existsSync(marker))return;
+  try{fs.writeFileSync(marker,'');}catch{}
+  dialog.showMessageBox({type:'info',buttons:['Open Settings','Not now'],defaultId:0,cancelId:1,message:'Riko cannot hear you',
+    detail:'Microphone access for Riko is off, so voice input records silence. Turn it on in System Settings → Privacy & Security → Microphone.'})
+    .then(({response})=>{if(response===0)shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone');}).catch(()=>{});
+}
 function createTray(characterName){
   const icon=nativeImage.createFromPath(brandIcon);
   if(icon.isEmpty())throw new Error('Tray icon is missing or invalid: assets/tray.png');
@@ -216,6 +226,8 @@ app.whenReady().then(async () => {
       process.env.RIKO_CONFIG=path.join(root,'character_config.yaml');
       const crypto=require('crypto');
       ownSecrets={api_token:crypto.randomBytes(32).toString('base64url'),confirm_key:crypto.randomBytes(32).toString('base64url'),listening:false};
+      // macOS attributes the backend's microphone use to this app, so it asks now; the answer does not hold up the model load.
+      release.askMicrophone(systemPreferences).then(state=>microphoneNotice(state==='blocked')).catch(()=>{});
       // Nothing carries the token until the backend says it holds the port, and nothing does after it exits.
       backendProcess=release.startBackend(root,process.resourcesPath,ownSecrets,()=>{ownSecrets.listening=true;publishProcesses(true);});
       backendProcess.on('error',error=>dialog.showErrorBox('Backend failed to launch',error.message));
