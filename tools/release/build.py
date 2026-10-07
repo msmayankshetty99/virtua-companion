@@ -151,6 +151,31 @@ def apply_patch(checkout, patch):
         subprocess.run(['git', 'apply', *options, '-'], input=content, cwd=checkout, check=True)
 
 
+def build_bundle(checkout, backend, destination):
+    """One native bundle from a patched checkout: riko-native and every library it loads, side by side in `destination`."""
+    build = checkout / ('build-' + backend)
+    run('cmake', '-S', checkout, '-B', build, *native_flags(backend))
+    run('cmake', '--build', build, '--config', 'Release', '--target', 'riko-native', '-j', '2')
+    destination.mkdir(parents=True, exist_ok=True)
+    for file in shared_libraries(build): copy_shared_library(file, destination)
+    if backend == 'cuda': copy_cuda_redistributables(destination)
+    if dangling_links(destination): raise RuntimeError(f'Bundle links without their files: {dangling_links(destination)}')
+    library = destination / native.library_name(sys.platform)
+    if not library.exists(): raise RuntimeError('Native library was not produced')
+    return library
+
+
+def smoke_bundle(backend, checkout, destination):
+    """`build.py --smoke-bundle <backend> <checkout> <destination>`: .github/workflows/native-smoke.yml builds one bundle as a
+    release does, with the same patch, flags and library copying, from an unpatched checkout of PIN that it caches."""
+    checkout, destination = Path(checkout).resolve(), Path(destination).resolve()
+    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=checkout, capture_output=True, text=True, check=True).stdout.strip()
+    if head != PIN: raise RuntimeError(f'{checkout} is at {head}, not the pinned llama.cpp {PIN}')
+    if backend not in native.backends_for(sys.platform): raise RuntimeError(f'{sys.platform} does not ship a {backend} bundle')
+    apply_patch(checkout, ROOT / 'tools/llama_cpp/emotion-probe.patch')
+    return build_bundle(checkout, backend, destination)
+
+
 def main():
     checkout = ROOT / '.native/llama.cpp-release'
     if checkout.exists(): raise RuntimeError('Use a clean release workspace; refusing to overwrite a checkout')
@@ -159,16 +184,7 @@ def main():
     run('git', '-c', 'core.autocrlf=false', 'checkout', '--detach', PIN, cwd=checkout)
     apply_patch(checkout, ROOT / 'tools/llama_cpp/emotion-probe.patch')
     for backend in native.backends_for(sys.platform):  # cuda and vulkan on Windows and Linux, metal on macOS
-        build = checkout / ('build-' + backend)
-        run('cmake', '-S', checkout, '-B', build, *native_flags(backend))
-        run('cmake', '--build', build, '--config', 'Release', '--target', 'riko-native', '-j', '2')
-        destination = STAGE / 'native' / backend
-        destination.mkdir(parents=True, exist_ok=True)
-        for file in shared_libraries(build): copy_shared_library(file, destination)
-        if backend == 'cuda': copy_cuda_redistributables(destination)
-        if dangling_links(destination): raise RuntimeError(f'Bundle links without their files: {dangling_links(destination)}')
-        library = destination / native.library_name(sys.platform)
-        if not library.exists(): raise RuntimeError('Native library was not produced')
+        build_bundle(checkout, backend, STAGE / 'native' / backend)
     notices = STAGE / 'notices'
     notices.mkdir(parents=True, exist_ok=True)
     shutil.copy2(checkout / 'LICENSE', notices / 'llama.cpp-LICENSE')
@@ -205,4 +221,7 @@ if __name__ == '__main__':
     if sys.argv[1:2] == ['--check-app']:
         if len(sys.argv) < 3: raise SystemExit('usage: build.py --check-app <path to Riko.app>')
         check_app(sys.argv[2])
+    elif sys.argv[1:2] == ['--smoke-bundle']:
+        if len(sys.argv) != 5: raise SystemExit('usage: build.py --smoke-bundle <backend> <llama.cpp checkout at PIN> <destination>')
+        print(smoke_bundle(*sys.argv[2:5]), flush=True)
     else: main()

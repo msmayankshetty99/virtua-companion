@@ -177,7 +177,7 @@ def test_each_os_builds_its_own_bundles_with_an_rpath_its_loader_expands():
         windows = build.native_flags(backend, 'win32')  # multi-config Visual Studio: --config Release, and no rpath
         assert f'-DGGML_{backend.upper()}=ON' in windows and not any('RPATH' in flag or 'BUILD_TYPE' in flag for flag in windows)
     source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
-    assert source.count('native.backends_for(sys.platform)') == 2  # what to build, and what to release-check
+    assert source.count('native.backends_for(sys.platform)') == 3  # what to build, what to release-check, what a smoke build may build
     assert "('cuda', 'vulkan')" not in source and 'RPATH=$ORIGIN' not in source
 
 
@@ -309,3 +309,10 @@ def test_release_check_runs_per_shipped_bundle_on_the_stage_and_inside_the_signe
     assert check['if'] == "runner.os == 'macOS'" and check['run'] == 'python tools/release/build.py --check-app electron/release/mac-arm64/Riko.app'
     names = [step.get('name') for step in workflow['jobs']['package']['steps']]
     assert names.index('Package installers') < names.index('Release check inside the signed macOS app') < len(names) - 1  # before the upload
+
+
+def test_probe_feature_version_matches_the_native_patch():
+    # The bridge reports this string in /props and tags every sample with it; the provider refuses a mismatch at startup.
+    from process.app_core.emotion.probe import FEATURE_VERSION
+    patch = (Path(__file__).resolve().parents[1] / 'tools/llama_cpp/emotion-probe.patch').read_text(encoding='utf-8')
+    assert f'"{FEATURE_VERSION}"' in patch

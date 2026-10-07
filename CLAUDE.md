@@ -27,7 +27,8 @@ python -u Code/run_server.py   # backend; run from the repo root; Ctrl+C stops i
 HF_HUB_OFFLINE=1 python -m pytest -q
 python -m pytest tests/test_tasks.py -q
 python -m pytest tests/test_tasks.py::test_real_stdio_mcp_handshake_and_task_round_trip -q
-RIKO_RELEASE_BUILD=1 python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q   # everything CI runs
+RIKO_RELEASE_BUILD=1 python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q   # the release workflow's subset
+RIKO_TEST_NATIVE_LIBRARY=.native/metal/libriko-native.dylib RIKO_TEST_GGUF=<small.gguf> python -m pytest -m native -q   # real bridge + model (native-smoke.yml does this weekly on macos-15)
 python Code/run_server.py --release-check   # the frozen build's Python-side self-check, against the dev tree (no native library)
 python tools/release/lock.py               # after editing requirements-runtime.txt or tools/release/requirements-build.in (needs uv)
 
@@ -43,9 +44,9 @@ python -u Code/task_mcp_server.py --store persistent_memories/tasks.sqlite3   # 
 
 Test caveats:
 - Use `HF_HUB_OFFLINE=1`: otherwise `tests/test_emotion.py` downloads Julia-1 (unpinned) and imports code from it.
-- `tests/test_server_logging.py` is stale (2 failures). `tests/test_settings_store.py::test_current_character_configuration_has_valid_settings` needs the private, gitignored `character_config.yaml` and only skips under `RIKO_RELEASE_BUILD=1`.
+- `tests/test_settings_store.py::test_current_character_configuration_has_valid_settings` validates the private, gitignored `character_config.yaml` and skips when it is absent (a fresh clone). The full suite passes with no failures on macOS and Linux (the windows-2022 CI leg has not had a run yet); `.github/workflows/ci.yml` runs it on every push and pull request (ubuntu, windows, macOS, with the hash-locked deps and `--timeout=300`, which needs pytest-timeout from the lock or the `[test]` extra).
 - Some tests use cwd-relative paths (`Path('Code')`, `Path('.')`), and `electron/src/formatted_text.test.mjs` / `polished_ui.test.mjs` start Vite SSR servers, so keep the working directories above.
-- Every GPU and audio-device path is mocked; a green suite says nothing about CUDA, Metal or ROCm behaviour.
+- Every GPU and audio-device path is mocked except `tests/test_native_smoke.py` (marker `native`, skipped unless its env vars are set); a green default suite says nothing about CUDA, Metal or ROCm behaviour.
 
 ### Native llama.cpp bridge
 

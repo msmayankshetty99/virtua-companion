@@ -117,6 +117,7 @@ def test_current_character_configuration_has_valid_settings():
     if os.environ.get('RIKO_RELEASE_BUILD') == '1':
         pytest.skip('Release builds exclude the private local configuration')
     path=Path(__file__).resolve().parents[1]/'character_config.yaml'
+    if not path.is_file(): pytest.skip('No local character_config.yaml: it is private and gitignored, so a fresh clone has none')
     store=SettingsStore(path)
     assert store.validate({}) == {'valid':True,'errors':{}}
     assert 'runtime.provider' in store.snapshot()['values']

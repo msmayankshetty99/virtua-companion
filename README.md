@@ -220,6 +220,13 @@ From `electron/`: `npm test`, `npm run build`, `node --check main.cjs` and
 `node --check preload.cjs`. Automated tests do not establish real microphone,
 GPU throughput or desktop-device behavior; consult the live-check guides.
 
+`.github/workflows/ci.yml` runs all of the above on every push and pull request,
+the Python suite on Windows, Linux and macOS. Those tests mock every GPU, audio and
+native path. `tests/test_native_smoke.py` loads a real riko-native build and GGUF
+when `RIKO_TEST_NATIVE_LIBRARY` and `RIKO_TEST_GGUF` name them
+(`python -m pytest -m native`); `.github/workflows/native-smoke.yml` builds the
+Metal bundle and runs it on Apple silicon weekly and when the bridge changes.
+
 Generated dependencies/builds/models are ignored. `persistent_memories/` contains
 user data and must not be deleted during cleanup. Existing staged artifact removals
 do not erase blobs from historical commits; see the repository review.

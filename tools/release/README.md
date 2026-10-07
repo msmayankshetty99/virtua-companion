@@ -6,7 +6,10 @@ libraries, and a macOS arm64 (Apple silicon) DMG with a Metal library. Each
 includes frozen Python and Electron; electron/native_backends.json lists which
 bundles an OS ships. It uploads CI artifacts; it does not publish a GitHub release
 automatically. Builds must pass loader/ABI smoke checks. These do not replace
-GPU/model/audio tests on clean machines.
+GPU/model/audio tests on clean machines. `.github/workflows/native-smoke.yml`
+builds the Metal bundle the same way (`build.py --smoke-bundle`) and generates
+with a small model through it; no CI runner exercises the CUDA or Vulkan bundles
+on a GPU.
 
 macOS: requires macOS 14 or later. Without signing secrets the app is signed ad
 hoc with the hardened runtime, so Gatekeeper blocks the first open of a download;

@@ -13,6 +13,8 @@ jobs:
         # macos-15 is Apple silicon (arm64): it builds the Metal bundle and a DMG (electron/native_backends.json).
         os: [windows-2022, ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
+    # The native CUDA/Vulkan builds and the freeze take hours on hosted runners; the checks that can hang have their own limits.
+    timeout-minutes: 300
     defaults:
       run:
         # bash -eo pipefail stops a step at its first failing command; Windows' default pwsh checks only the last one.
@@ -62,19 +64,23 @@ jobs:
       - name: Frontend dependencies
         working-directory: electron
         run: npm ci
-      - name: Backend release regression checks
-        env:
-          RIKO_RELEASE_BUILD: '1'
-        run: python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q
-      - name: Build the native backends and freeze Python
-        # CUDA and Vulkan on Windows and Linux, Metal on macOS: the backends electron/native_backends.json ships for the OS.
-        run: python tools/release/build.py
-      - name: Frontend dependencies and tests
+      - name: Frontend tests and build
+        # Before the native build, so a JavaScript failure stops the job in minutes rather than after hours.
+        timeout-minutes: 20
         working-directory: electron
         run: |
           npm test
           npm run build
+      - name: Backend release regression checks
+        timeout-minutes: 30
+        env:
+          RIKO_RELEASE_BUILD: '1'
+        run: python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q --timeout=300
+      - name: Build the native backends and freeze Python
+        # CUDA and Vulkan on Windows and Linux, Metal on macOS: the backends electron/native_backends.json ships for the OS.
+        run: python tools/release/build.py
       - name: Package installers
+        timeout-minutes: 60
         working-directory: electron
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
@@ -99,6 +105,7 @@ jobs:
           npx --no-install electron-builder --config electron-builder.yml --publish never "-c.extraMetadata.homepage=${{ github.server_url }}/${{ github.repository }}"
       - name: Release check inside the signed macOS app
         if: runner.os == 'macOS'
+        timeout-minutes: 30
         # build.py checked the unsigned stage; this repeats it under the hardened runtime and entitlements users get.
         run: python tools/release/build.py --check-app electron/release/mac-arm64/Riko.app
       - uses: actions/upload-artifact@v4

@@ -178,21 +178,25 @@ def test_chat_history_is_never_saved_over_a_file_that_could_not_be_kept(tmp_path
     assert path.read_bytes() == original
 
 
-def test_permission_denied_files_are_moved_aside_instead_of_blocking_forever(tmp_path):
+def test_permission_denied_files_are_moved_aside_instead_of_blocking_forever(tmp_path, monkeypatch):
     history, approvals = tmp_path / 'chat_history.json', tmp_path / 'tool_approvals.json'
     history.write_text('[]', encoding='utf-8')
     approvals.write_text('{"calculator": true}', encoding='utf-8')
-    for path in (history, approvals): path.chmod(0)  # e.g. left behind by a run under another account
+    # e.g. files left behind by a run under another account. Simulated rather than chmod(0), which on Windows only sets
+    # the read-only attribute: the first read of each file is denied, as the OS would deny it.
+    denied, read_text = {history, approvals}, Path.read_text
+    def guarded(self, *args, **kwargs):
+        if self in denied: denied.discard(self); raise PermissionError(13, 'Permission denied', str(self))
+        return read_text(self, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', guarded)
+    service = ChatService(provider(), system_prompt='test', history_file=history)
+    service.respond('hello')
+    gate = ToolApprovals(approvals)
     try:
-        service = ChatService(provider(), system_prompt='test', history_file=history)
-        service.respond('hello')
-        gate = ToolApprovals(approvals)
-        try:
-            assert gate.snapshot()['default_required'] is True  # the UI shows what is enforced
-            gate.configure({'calculator': False}, names=['calculator', 'task_create'])
-        finally: gate.close()
-    finally:
-        for kept in tmp_path.glob('*.unreadable-*'): kept.chmod(0o600)
+        assert gate.snapshot()['default_required'] is True  # the UI shows what is enforced
+        gate.configure({'calculator': False}, names=['calculator', 'task_create'])
+    finally: gate.close()
+    assert not denied  # both reads were denied once
     assert [record['content'] for record in json.loads(history.read_text(encoding='utf-8'))] == ['User: hello', 'hi']
     assert json.loads(approvals.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True}
     assert {kept.name.split('.unreadable-')[0] for kept in tmp_path.glob('*.unreadable-*')} == {history.name, approvals.name}

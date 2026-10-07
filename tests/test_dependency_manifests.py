@@ -41,6 +41,6 @@ def test_release_locks_pin_every_runtime_and_build_requirement_with_hashes():
     for name, spec in (requirement(line) for line in inputs if line):
         assert name in lock, f'{name} is not locked'
         assert all(SpecifierSet(spec).contains(version, prereleases=True) for version, _ in lock[name]), (name, spec, lock[name])
-    assert {'pyinstaller', 'pyinstaller-hooks-contrib', 'pytest'} <= set(lock)
+    assert {'pyinstaller', 'pyinstaller-hooks-contrib', 'pytest', 'pytest-timeout'} <= set(lock)  # pytest-timeout: ci.yml's --timeout
     assert set(no_deps) == {'efficientword-net'} and 'efficientword-net' not in lock
     assert all(hashes for entries in (*lock.values(), *no_deps.values()) for _, hashes in entries)
