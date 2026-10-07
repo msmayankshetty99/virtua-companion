@@ -1,4 +1,5 @@
-"""Native model request protocol, context budgeting and priority-ordered slots."""
+"""llama.cpp request protocol, context budgeting and priority-ordered slots, shared by the
+in-process native library and an external llama-server."""
 from contextlib import contextmanager
 import logging
 import queue
@@ -8,7 +9,7 @@ import hashlib
 import uuid
 import math
 
-from .llama_runtime import validate_runtime
+from .llama_runtime import flash_attention, validate_slots
 logger = logging.getLogger(__name__)
 
 
@@ -95,8 +96,9 @@ def native_arguments(config, model):
     args = ['riko-native', '--model', str(model),
         '--parallel', str(config.parallel_slots), '--ctx-size', str(context_capacity(config)),
         '--kv-unified' if config.kv_unified else '--no-kv-unified', '--cont-batching', '--jinja', '--slots', '--no-context-shift',
-        '--n-gpu-layers', str(config.n_gpu_layers), '--batch-size', str(config.n_batch),
-        '--ubatch-size', str(config.n_ubatch), '--flash-attn', 'on' if config.flash_attn else 'off',
+        # -1 lets llama.cpp's --fit lower the layer count to keep 1 GiB of GPU memory free; any other value is exact.
+        '--n-gpu-layers', str(config.n_gpu_layers), '--fit', 'on' if config.n_gpu_layers == -1 else 'off',
+        '--batch-size', str(config.n_batch), '--ubatch-size', str(config.n_ubatch), '--flash-attn', flash_attention(config.flash_attn),
         '--cache-type-k', config.type_k, '--cache-type-v', config.type_v,
         '--main-gpu', str(config.main_gpu), '--split-mode', config.split_mode,
         '--cache-ram', str(config.cache_size_mb), '--seed', str(config.seed)]
@@ -119,10 +121,11 @@ class InferenceLane:
 
 class LlamaContextProvider(InferenceLane):
     supports_latent_probe = True
+    transport = 'Native llama.cpp'  # names the transport in errors
+    missing_route_hint = ' Rebuild the compatible riko-native library with Responses support.'
     def __init__(self, config):
-        validate_runtime(config)
-        context_capacity(config)
-        if not config.n_ctx: raise ValueError('Native llama.cpp requires explicit per-slot runtime.n_ctx > 0')
+        validate_slots(config)
+        if not config.n_ctx: raise ValueError('llama.cpp requires explicit per-slot runtime.n_ctx > 0')
         super().__init__(self, 'live')
         self.config = config
         self.scheduler = SlotScheduler(config.parallel_slots, pause_background=config.pause_background_on_live)
@@ -161,11 +164,15 @@ class LlamaContextProvider(InferenceLane):
         identity = {'gguf_sha256': digest.hexdigest(), 'server_build': props.get('build_info'),
             'chat_template': props.get('chat_template'), 'feature_version': FEATURE_VERSION,
             'type_k': self.config.type_k, 'type_v': self.config.type_v,
-            'flash_attn': self.config.flash_attn, 'n_ctx': self.config.n_ctx,
+            'flash_attn': self._flash_attention_identity(), 'n_ctx': self.config.n_ctx,
             'runtime_fingerprint': self._probe_runtime_fingerprint()}
         self.probe = self.probe_factory(identity, self.probe_idle)
 
     def _probe_runtime_fingerprint(self): return None
+
+    def _flash_attention_identity(self):
+        # on/off keep the true/false of probe data recorded before flash_attn had an auto setting.
+        return {'on': True, 'off': False}.get(flash_attention(self.config.flash_attn), 'auto')
 
     def set_foreground(self, active): self.scheduler.set_foreground(active)
 
@@ -258,8 +265,8 @@ class LlamaContextProvider(InferenceLane):
     def _inference_client(self):
         raise NotImplementedError('Native transport must provide a request client')
 
-    @staticmethod
-    def _check_response(response):
+    @classmethod
+    def _check_response(cls, response):
         if response.is_success: return
         response.read()
         try:
@@ -267,8 +274,8 @@ class LlamaContextProvider(InferenceLane):
             error = body.get('error', body)
             detail = error.get('message', str(error)) if isinstance(error, dict) else str(error)
         except (ValueError, AttributeError): detail = response.text
-        hint = ' Rebuild the compatible riko-native library with Responses support.' if response.status_code in {404, 405, 501} else ''
-        raise RuntimeError(f'Native llama.cpp operation {response.status_code}: {str(detail).strip()[:2000]}{hint}')
+        hint = cls.missing_route_hint if response.status_code in {404, 405, 501} else ''
+        raise RuntimeError(f'{cls.transport} operation {response.status_code}: {str(detail).strip()[:2000]}{hint}')
 
     def stream(self, messages, *, tools=None, **options):
         output = queue.Queue(maxsize=128)

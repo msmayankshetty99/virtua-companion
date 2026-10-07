@@ -34,9 +34,13 @@ def test_discord_policy_fails_closed_and_separates_admins(tmp_path):
     assert not any('key' in key or 'path' in key or 'command' in key for key in BASIC_SETTINGS)
 
 
-@pytest.mark.parametrize('url', ['https://example.com', 'http://localhost/secret', 'http://user:pass@localhost', 'http://localhost?key=secret'])
+@pytest.mark.parametrize('url', ['https://example.com', 'http://localhost/secret', 'http://user:pass@localhost', 'http://localhost?key=secret', 'http://[::1]:8765'])
 def test_discord_backend_url_cannot_send_runtime_secrets_remotely(tmp_path, url):
     with pytest.raises(ValueError): BotSettings.from_env(tmp_path, {'Discord_backend_url': url})
+
+
+def test_existing_localhost_backend_urls_keep_working_over_ipv4_loopback(tmp_path):
+    assert BotSettings.from_env(tmp_path, {'Discord_backend_url': 'http://localhost:8765/'}).backend_url == 'http://127.0.0.1:8765'
 
 
 def test_discord_preferences_roundtrip_and_bad_data_preserved(tmp_path):

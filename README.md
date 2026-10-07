@@ -13,7 +13,10 @@ Install Python runtime dependencies in your virtual environment:
 .venv\Scripts\python.exe -m pip install --no-deps EfficientWord-Net
 ```
 
-`install_reqs.sh` provides the shell-based alternative. Python package metadata
+`install_reqs.sh` (macOS, Linux or Git Bash) installs the same into the active environment, or `PYTHON=...`,
+using uv when present. It picks the PyTorch wheels for the machine: PyPI (Metal/MPS) on macOS, CUDA 13 (driver 580+)
+or 12.6 when `nvidia-smi` sees a GPU, ROCm 7.2 when `rocminfo` exists on Linux, CPU otherwise; set
+`RIKO_TORCH_INDEX` (`default`, `cpu`, `cu126`, `cu130`, `rocm7.2`, ...) to choose. Python package metadata
 requires 3.11 or newer; model dependencies and CUDA wheels must support your chosen
 Python/GPU combination. The current local environment uses Python 3.14. Installing
 the requirements alone does not guarantee GPU support. Faster-Whisper GPU use
@@ -26,6 +29,12 @@ Review `character_config.yaml` before starting:
   `riko-native` library. Set `runtime.native_library` to a compatible build and
   select a local GGUF or exact Hugging Face file/revision. No HTTP listener,
   llama-server process or llama-cpp-python binding is used. See [model runtime](docs/llama-runtime.md).
+- `runtime.provider: llama_server` connects to a llama-server you run yourself, built
+  for any llama.cpp backend (CUDA, ROCm/HIP, Metal, Vulkan or CPU), on this machine or
+  another. Set `runtime.base_url` (default `http://127.0.0.1:8080`) and start it with
+  `--parallel` equal to `runtime.parallel_slots` and enough `--ctx-size` for every slot;
+  Riko prints the exact command if they do not match. Riko keeps its reserved live slot,
+  exact token counts, streaming and cancellation. The emotion probe needs `llama_cpp`.
 - Remote OpenAI-compatible providers, including LM Studio, are optional alternatives.
 - Start GPT-SoVITS separately. `sovits_ping_config` configures its HTTP endpoint,
   reference audio/transcript and PCM sample rate. Python does not load its model.
@@ -47,9 +56,10 @@ npm run build
 npm run start
 ```
 
-Electron does not start or stop Python. Quit Python with Ctrl+C; the default
-Electron quit shortcut is Ctrl+Shift+Q. Default controls/whiteboard shortcuts are
-Ctrl+Shift+Space and Ctrl+Shift+W; supported overrides are in desktop settings.
+Electron does not start or stop Python. Quit Python with Ctrl+C. The only default global shortcut is
+Ctrl+Shift+Space (Cmd+Shift+Space on macOS), which opens the controls; Quit, Settings and the whiteboard are in
+the tray menu. `desktop.shortcuts` binds `popup`, `settings`, `whiteboard`, `quit`, `mic`, `audio` or `sleep` to an
+Electron accelerator, and `null` or `''` unbinds one. Electron reads it at launch.
 
 For frontend development, run `npm run dev` in `electron/`, then launch Electron
 from a separate terminal with `$env:RIKO_DEV="1"` and `npm run start`.
@@ -210,6 +220,13 @@ From `electron/`: `npm test`, `npm run build`, `node --check main.cjs` and
 `node --check preload.cjs`. Automated tests do not establish real microphone,
 GPU throughput or desktop-device behavior; consult the live-check guides.
 
+`.github/workflows/ci.yml` runs all of the above on every push and pull request,
+the Python suite on Windows, Linux and macOS. Those tests mock every GPU, audio and
+native path. `tests/test_native_smoke.py` loads a real riko-native build and GGUF
+when `RIKO_TEST_NATIVE_LIBRARY` and `RIKO_TEST_GGUF` name them
+(`python -m pytest -m native`); `.github/workflows/native-smoke.yml` builds the
+Metal bundle and runs it on Apple silicon weekly and when the bridge changes.
+
 Generated dependencies/builds/models are ignored. `persistent_memories/` contains
 user data and must not be deleted during cleanup. Existing staged artifact removals
 do not erase blobs from historical commits; see the repository review.
@@ -225,4 +242,4 @@ Settings -> Performance & logs includes logging level (DEBUG, INFO, WARNING, ERR
 
 Chat displays live llama.cpp per-request token counts and tokens/second from `timings_per_token`. Other providers use explicitly labelled estimates until final usage arrives. Counts include reasoning tokens. Julia remains live for cumulative partial user transcriptions. Settings -> Custom neural network settings manages the agent-expression probe and training data.
 
-`runtime.native_library` is required for native llama.cpp inference. There is no external-server fallback; unset paths produce an actionable startup error. Choose a GPU-enabled build for GPU inference: requesting GPU layers alone does not prove backend support. Remote OpenAI-compatible providers remain available.
+`runtime.native_library` is required for native llama.cpp inference (`llama_cpp`); unset paths produce an actionable startup error. To use a llama.cpp build Riko does not bundle, run llama-server and choose `llama_server` instead. Choose a GPU-enabled build for GPU inference: requesting GPU layers alone does not prove backend support. Remote OpenAI-compatible providers remain available.

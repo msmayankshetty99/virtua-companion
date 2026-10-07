@@ -368,10 +368,10 @@ class Initiative:
                         rule, event, queued = job
                         self.pending.pop(rule['id'], None)
                         self.busy = True
-                        event_bus.publish('initiative.started')
                         version = self.version
                     else: job = None
                 if job:
+                    event_bus.publish('initiative.started')
                     self.executor.submit(self._evaluate_job, rule, event, queued, version)
             except Exception as exc:
                 with self.lock: self.error = str(exc)

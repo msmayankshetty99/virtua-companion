@@ -1,8 +1,13 @@
 from pathlib import Path
+import json
 import os
+import shutil
+import subprocess
 
 import pytest
 
+from process.app_core.configuration.config import load_config
+from process.app_core.configuration.native_backends import backends_for, bundled_library
 from process.app_core.configuration.settings_store import SettingsStore, SettingsConflict
 
 
@@ -112,6 +117,7 @@ def test_current_character_configuration_has_valid_settings():
     if os.environ.get('RIKO_RELEASE_BUILD') == '1':
         pytest.skip('Release builds exclude the private local configuration')
     path=Path(__file__).resolve().parents[1]/'character_config.yaml'
+    if not path.is_file(): pytest.skip('No local character_config.yaml: it is private and gitignored, so a fresh clone has none')
     store=SettingsStore(path)
     assert store.validate({}) == {'valid':True,'errors':{}}
     assert 'runtime.provider' in store.snapshot()['values']
@@ -124,6 +130,19 @@ def test_background_budgets_are_exposed_and_validated(store):
     assert store.validate({'initiative.max_output_tokens': 4096})['valid'] is False
     assert store.validate({'memory.reflection_max_output_tokens': 4096})['valid'] is False
     assert store.validate({'memory.reflection_max_output_tokens': 1536, 'memory.reflection_context_window_tokens': 8192})['valid']
+
+
+def test_speech_recognition_pair_defaults_to_auto_and_is_checked_only_when_edited(store, monkeypatch):
+    from process.app_core.audio import asr
+    monkeypatch.setattr(asr, 'supported_types', lambda: {'cpu': frozenset({'float32', 'int8', 'int8_float32'})})
+    values = store.snapshot()['values']
+    assert (values['voice.asr_device'], values['voice.asr_compute_type']) == ('auto', 'default')
+    assert store.validate({'voice.asr_device': 'cpu', 'voice.asr_compute_type': 'int8'})['valid']
+    assert 'voice.asr_device' in store.validate({'voice.asr_device': 'cuda'})['errors']
+    assert 'voice.asr_compute_type' in store.validate({'voice.asr_compute_type': 'int8_float16'})['errors']
+    # A pair already in the file falls back at startup; it must not block saving anything else.
+    store.path.write_text(store.path.read_text().replace('  wake_threshold: 0.9\n', '  wake_threshold: 0.9\n  asr_device: cuda\n  asr_compute_type: int8_float16\n'))
+    assert store.save({'voice.wake_threshold': .8}, store.snapshot()['revision'])['saved']
 
 
 def test_resource_fields_are_grouped_with_models(store):
@@ -180,3 +199,94 @@ def test_concurrent_same_name_tool_results_update_the_correct_activity():
     assert activities[first]['status']=='complete'
     assert activities[second]['status']=='running'
     assert activities[first]['duration_ms']>=0
+
+
+def test_legacy_faiss_index_file_is_not_offered(store):
+    assert 'memory.index_file' not in {field['path'] for field in store.snapshot()['fields']}
+
+
+def test_memory_device_is_a_background_model_setting(store):
+    snapshot = store.snapshot()
+    spec = next(item for item in snapshot['fields'] if item['path'] == 'memory.device')
+    assert snapshot['values']['memory.device'] == 'cpu' and spec['section'] == 'Background models' and spec['restart']
+    assert store.validate({'memory.device': 'mps', 'emotion.device': 'auto'})['valid']
+    assert not store.validate({'memory.device': 'vulkan'})['valid']
+    assert not store.validate({'emotion.device': 'mps'})['valid']
+
+
+def test_flash_attention_is_a_choice_that_keeps_old_boolean_files(store):
+    snapshot = store.snapshot()
+    spec = next(item for item in snapshot['fields'] if item['path'] == 'runtime.flash_attn')
+    assert snapshot['values']['runtime.flash_attn'] == 'off' and spec['kind'] == 'text' and spec['options'] == ['auto', 'on', 'off']
+    result = store.save({'runtime.flash_attn': 'on'}, snapshot['revision'])
+    assert result['saved'] and result['values']['runtime.flash_attn'] == 'on'
+    assert 'flash_attn: on' in store.path.read_text()  # ruamel writes it bare, so PyYAML reads true
+    from process.app_core.configuration.config import load_config
+    native = store.path.with_name('native.yaml')
+    native.write_text('runtime:\n  provider: llama_cpp\n  model_path: model.gguf\n  flash_attn: on\n')
+    assert load_config(native).runtime.flash_attn == 'on'
+    assert not store.save({'runtime.flash_attn': True}, store.snapshot()['revision'])['saved']
+
+
+def test_layer_offload_and_split_choices_match_llama_cpp(store):
+    assert store.validate({'runtime.n_gpu_layers': -2})['valid']
+    assert not store.validate({'runtime.n_gpu_layers': -3})['valid']
+    assert not store.validate({'runtime.split_mode': 'row'})['valid']
+    store.path.write_text(store.path.read_text().replace('provider: lm_studio', 'provider: llama_cpp')
+        .replace('  model_path: null', '  model_path: model.gguf').replace('  flash_attn: false', '  flash_attn: false\n  split_mode: row'))
+    assert store.snapshot()['values']['runtime.split_mode'] == 'row'  # an old file still opens
+    assert 'runtime.split_mode' in store.validate({})['errors']
+
+
+def test_speech_recognition_error_names_the_value_that_cannot_run(store, monkeypatch):
+    from process.app_core.audio import asr
+    monkeypatch.setattr(asr, 'supported_types', lambda: {'cpu': frozenset({'float32', 'int8'}), 'cuda': frozenset({'float32', 'int8', 'int8_float16'})})
+    store.path.write_text(store.path.read_text().replace('  wake_threshold: 0.9\n', '  wake_threshold: 0.9\n  asr_device: cuda\n  asr_compute_type: int8_float16\n'))
+    errors = store.validate({'voice.asr_device': 'cpu'})['errors']  # CPU is fine; the stored precision is what cannot run there
+    assert 'voice.asr_device' not in errors and 'cpu cannot run int8_float16' in errors['voice.asr_compute_type']
+    assert store.validate({'voice.asr_device': 'cpu', 'voice.asr_compute_type': 'default'})['valid']
+
+
+def test_live_budget_is_checked_only_when_edited_so_older_setups_can_save(tmp_path, monkeypatch):
+    # The setup wizard used to write memory.context_window_tokens equal to n_ctx, which never leaves room for the reply.
+    monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(tmp_path / 'application'))
+    path = tmp_path / 'character_config.yaml'
+    path.write_text(f'runtime:\n  provider: llama_cpp\n  native_library: bundled:{backends_for()[0]}\n  hf_repo_id: owner/model\n  hf_filename: model.gguf\n'
+        '  n_ctx: 8192\n  max_output_tokens: 1024\nmemory:\n  context_window_tokens: 8192\n')
+    store = SettingsStore(path)
+    assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
+    assert 'Context must fit' in store.validate({'runtime.max_output_tokens': 512})['errors']['runtime.n_ctx']
+    assert store.validate({'memory.context_window_tokens': 7168})['valid']
+    path.write_text(path.read_text().replace('memory:\n  context_window_tokens: 8192\n', ''))
+    assert store.snapshot()['values']['memory.context_window_tokens'] == 7168  # the prompt gets what the reply leaves
+    assert store.validate({'runtime.n_ctx': 4096})['valid']
+    assert 'runtime.n_ctx' in store.validate({'runtime.max_output_tokens': 8192})['errors']
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.skipif(not shutil.which('node') or not (ROOT / 'electron' / 'node_modules' / 'yaml').is_dir(), reason='needs node and the Electron dependencies')
+def test_packaged_setup_writes_a_config_settings_can_save(tmp_path, monkeypatch):
+    # Electron's setup refuses a backend whose library is not where it looks, so this also proves that both languages
+    # resolve bundled:<backend> to the same file for this OS.
+    resources, backend = tmp_path / 'application', backends_for()[0]
+    library = bundled_library(backend, resources)
+    library.parent.mkdir(parents=True); library.write_text('test')
+    form = {'backend': backend, 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 4}
+    script = "require('./release.cjs').saveSetup(process.argv[1], JSON.parse(process.argv[2]), process.argv[3])"
+    subprocess.run(['node', '-e', script, str(tmp_path / 'data'), json.dumps(form), str(resources)], cwd=ROOT / 'electron', check=True, timeout=60)
+    monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(resources))
+    store = SettingsStore(tmp_path / 'data' / 'character_config.yaml')
+    assert load_config(store.path).runtime.native_library == library
+    assert store.validate({'runtime.n_ctx': 8192}) == {'valid': True, 'errors': {}}  # the wizard's budget fits
+    assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
+
+
+def test_legacy_preset_context_leaves_room_for_the_reply(tmp_path):
+    from process.app_core.configuration.config import load_config
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: llama_cpp\n  model_path: model.gguf\n  max_output_tokens: 1024\npresets:\n  default:\n    model_params:\n      context_window_token_limit: 8192\n')
+    config = load_config(path)
+    assert config.runtime.n_ctx == 8192 and config.memory.context_window_tokens == 7168
+    assert SettingsStore(path).validate({'runtime.max_output_tokens': 512})['valid']

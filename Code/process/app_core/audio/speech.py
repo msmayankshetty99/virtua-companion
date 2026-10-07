@@ -47,17 +47,19 @@ class SpeechQueue:
         with self._submit_lock:
             if self.closed.is_set(): return False
             if self._failed_turn == turn_id: return False
-            if self.queue.full():
-                event_bus.publish("speech.error", turn_id=turn_id, error="Speech queue full")
-                return False
-            chunks = queue.Queue(maxsize=256)
-            interrupt = self._interrupt
-            future = self.requests.submit(self._receive, text, chunks, interrupt, turn_id)
-            self._futures.add(future)
-            def finished(completed):
-                with self._submit_lock: self._futures.discard(completed)
-            # A done callback can run inline; register it outside the submit lock.
-            self.queue.put_nowait((text, turn_id, chunks, future, interrupt, start_offset, end_offset))
+            full = self.queue.full()
+            if not full:
+                chunks = queue.Queue(maxsize=256)
+                interrupt = self._interrupt
+                future = self.requests.submit(self._receive, text, chunks, interrupt, turn_id)
+                self._futures.add(future)
+                def finished(completed):
+                    with self._submit_lock: self._futures.discard(completed)
+                self.queue.put_nowait((text, turn_id, chunks, future, interrupt, start_offset, end_offset))
+        # Publish and register callbacks outside the submit lock: both can run listeners inline.
+        if full:
+            event_bus.publish("speech.error", turn_id=turn_id, error="Speech queue full", queued=False)
+            return False
         future.add_done_callback(finished)
         return True
 
@@ -78,10 +80,11 @@ class SpeechQueue:
         clip = AudioClip(path, volume, max_seconds, dict(context or {}))
         with self._submit_lock:
             if self.closed.is_set(): return False
-            if self.queue.full():
-                event_bus.publish('wake.feedback.error', asset='audio', error='Audio queue full; wake cue skipped')
-                return False
-            self.queue.put_nowait((clip, None, None, None, self._interrupt, 0, None))
+            full = self.queue.full()
+            if not full: self.queue.put_nowait((clip, None, None, None, self._interrupt, 0, None))
+        if full:
+            event_bus.publish('wake.feedback.error', asset='audio', error='Audio queue full; wake cue skipped')
+            return False
         event_bus.publish('wake.feedback.queued', **clip.context)
         return True
 

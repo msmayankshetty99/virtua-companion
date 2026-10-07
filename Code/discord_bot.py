@@ -1,7 +1,19 @@
 """Start the optional Discord client of the already-running Python backend."""
+import asyncio
 import logging
 import os
 from pathlib import Path
+import sys
+import threading
+
+
+def exit_with_backend(bot):
+    """Started by the desktop backend: stop when its pipe closes, which happens however the backend exits."""
+    try: sys.stdin.read()
+    except (OSError, ValueError): pass
+    try: asyncio.run_coroutine_threadsafe(bot.close(), bot.loop).result(10)
+    except Exception: pass  # not logged in yet, or already closing
+    os._exit(0)
 
 
 def main():
@@ -9,12 +21,20 @@ def main():
     from process.app_core.integrations.discord.access import DiscordAccess
     from process.app_core.integrations.discord.bot import CompanionBot
     root = Path(os.environ.get('RIKO_DATA_DIR', Path(__file__).resolve().parents[1]))
+    os.environ.setdefault('RIKO_DATA_DIR', str(root))  # Where the backend client finds the API token.
     load_dotenv(root / '.env') # Never search parent/private directories for credentials.
     settings = DiscordAccess(root).settings()
+    if '--dry-run' in sys.argv:  # run_server.release_check: the worker starts and builds its client, but never logs in
+        CompanionBot(settings)
+        print('RIKO_DISCORD_DRY_RUN_OK', flush=True)
+        return
     if not settings.token: raise ValueError('Discord_bot_token is required')
     if not settings.admins: raise ValueError('Configure Discord_admins before starting the bot')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-    CompanionBot(settings).run(settings.token)
+    bot = CompanionBot(settings)
+    if os.environ.get('RIKO_EXIT_WITH_BACKEND') == '1':
+        threading.Thread(target=exit_with_backend, args=(bot,), name='backend-watch', daemon=True).start()
+    bot.run(settings.token)
 
 
 if __name__ == '__main__':
@@ -24,4 +44,5 @@ if __name__ == '__main__':
         name = type(exc).__name__
         code = 'login' if name == 'LoginFailure' else 'intents' if name == 'PrivilegedIntentsRequired' else 'dependency' if isinstance(exc, ImportError) else 'backend' if isinstance(exc, TimeoutError) else 'startup'
         print('RIKO_DISCORD_ERROR:' + code, flush=True)
+        if '--dry-run' in sys.argv: raise  # the release check shows the traceback; the launcher never passes --dry-run
         raise SystemExit(1) from None

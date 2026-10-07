@@ -5,6 +5,7 @@ from copy import deepcopy
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import urllib.request
@@ -65,13 +66,26 @@ class RegisteredTool:
     prepare: Any = None
 
 
+def resolve_command(command, env):
+    """Find an MCP server command on the PATH its process will get. Windows CreateProcess applies neither PATHEXT nor
+    the child's PATH, so npx/uvx (.cmd shims) fail by bare name; a resolved .cmd/.bat path runs through cmd.exe."""
+    if os.path.dirname(command): return command  # an explicit path runs as written (CreateProcess still adds .exe)
+    search = os.pathsep.join(os.get_exec_path(env))
+    found = shutil.which(command, path=search)
+    if not found: raise FileNotFoundError(f'MCP server command {command!r} was not found on PATH: {search}')
+    return found
+
+
 class StdioMCPClient:
     """Minimal MCP JSON-RPC stdio client with a persistent server process."""
     def __init__(self, command: str, args: list[str] | None = None, env: dict[str, str] | None = None):
         self.command, self.args, self.env = command, args, env
         self._restart_lock = threading.Lock()
-        self.process = subprocess.Popen([command, *(args or [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True, encoding='utf-8', bufsize=1, env={**os.environ, **(env or {})})
+        # MCP stdio is UTF-8. Python servers on Windows write the ANSI code page unless told otherwise, and one byte that
+        # does not decode would stop the stderr drain; PYTHONIOENCODING changes only their stdio, not their file encodings.
+        environment = {'PYTHONIOENCODING': 'utf-8', **os.environ, **(env or {})}
+        self.process = subprocess.Popen([resolve_command(command, environment), *(args or [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', bufsize=1, env=environment)
         self._counter = 0
         self._lock = threading.Lock()
         self._responses = queue.Queue(maxsize=256)
@@ -226,8 +240,9 @@ class ToolRegistry:
 
     def _isolated_call(self, tool, arguments):
         command = [sys.executable, '--tool-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(Path(__file__).with_name('worker.py'))]
+        # stderr carries whatever the tool's libraries print, in the ANSI code page on Windows: never fail decoding it.
         process = subprocess.Popen(command,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         with self._execution_lock:
             if self._closed:
                 process.kill(); process.wait()
@@ -235,10 +250,13 @@ class ToolRegistry:
             self._processes.add(process)
         try:
             try:
-                output, _ = process.communicate(json.dumps({**tool.isolated, 'arguments': arguments}), timeout=self.timeout_seconds)
+                output, errors = process.communicate(json.dumps({**tool.isolated, 'arguments': arguments}), timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired:
                 process.kill(); process.communicate()
                 raise TimeoutError('Isolated tool terminated at deadline')
+            if not output.strip():  # the worker itself failed to start (a frozen build missing a module, say)
+                logger.warning('Tool worker exited with code %s and no result:\n%s', process.returncode, errors[-4000:])
+                raise RuntimeError(f'Tool worker exited with code {process.returncode} and no result')
             payload = json.loads(output.splitlines()[-1])
             if 'error' in payload: raise RuntimeError(payload['error'])
             return payload['result']
@@ -319,6 +337,8 @@ class ToolRegistry:
                 except Exception as exc:
                     if client: client.close()
                     logger.warning('Could not load MCP server %s: %s', name, exc)
+                    from ..desktop.state import get_desktop_state
+                    get_desktop_state().notify('tools', f'MCP server {name} was not loaded: {exc}', 'error')
             return registry
         except BaseException:
             registry.close()

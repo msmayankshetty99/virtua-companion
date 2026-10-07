@@ -44,6 +44,11 @@ output.wav
 /release-stage/
 /release-build/
 /persistent_memories/discord_access.json
+# Per-start backend secrets, wherever the data root is (and their write temporaries).
+**/persistent_memories/api_token
+**/persistent_memories/confirm_key
+**/persistent_memories/.api_token.*.tmp
+**/persistent_memories/.confirm_key.*.tmp
 /.native/
 /character_config.yaml.previous
 /.settings-save-*

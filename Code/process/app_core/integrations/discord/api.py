@@ -14,13 +14,10 @@ MAX_PCM_BYTES = 16000 * 2 * MAX_AUDIO_SECONDS
 
 def transcribe_pcm(session, pcm):
     import numpy as np
-    from faster_whisper import WhisperModel
+    from ...audio.asr import create_whisper
     with session.asr_lock:
         model = getattr(session, 'warmed_asr', None) or getattr(getattr(session, 'voice', None), 'model', None)
-        if model is None:
-            config = session.config.raw.get('voice', {})
-            model = WhisperModel(config.get('asr_model', 'distil-small.en'),
-                device=config.get('asr_device', 'cuda'), compute_type=config.get('asr_compute_type', 'int8_float16'))
+        if model is None: model = create_whisper(session.config.raw.get('voice', {}))
         session.warmed_asr = model
         samples = np.frombuffer(pcm, dtype='<i2').astype('float32') / 32768
         segments, _ = model.transcribe(samples, beam_size=1, vad_filter=True, condition_on_previous_text=False)

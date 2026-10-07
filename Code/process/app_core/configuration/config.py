@@ -37,7 +37,7 @@ class RuntimeConfig:
     n_ubatch: int = 512
     n_threads: int | None = None
     n_threads_batch: int | None = None
-    flash_attn: bool = False
+    flash_attn: str | bool = 'auto'  # auto, on or off; YAML true/false still mean on/off
     type_k: str = 'f16'
     type_v: str = 'f16'
     offload_kqv: bool = True
@@ -75,7 +75,7 @@ class MemoryConfig:
     history_file: Path = Path("persistent_memories/chat_history.json")
     context_window_tokens: int = 8192
     store_file: Path = Path("persistent_memories/memory_store.json")
-    index_file: Path = Path("persistent_memories/faiss_index.index")
+    index_file: Path = Path("persistent_memories/faiss_index.index")  # legacy: no longer written or read
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimension: int = 384
     max_results: int = 8
@@ -89,6 +89,7 @@ class MemoryConfig:
     system1_model_id: str = "SupersonicLabs/Julia-1"
     system1_cache_dir: Path | None = None
     system1_max_length: int = 8192
+    device: str = "cpu"
     minimum_importance: float = 0.35
     default_memories: list[dict[str, Any]] = field(default_factory=list)
 
@@ -156,16 +157,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     runtime_raw = raw.get("runtime", {})
     library = runtime_raw.get('native_library')
     if isinstance(library, str) and library.startswith('bundled:'):
-        import sys
-        backend = library.split(':', 1)[1]
-        bundle = os.getenv('RIKO_BUNDLE_ROOT')
-        if backend not in {'cuda', 'vulkan'} or not bundle:
-            raise ValueError('Bundled native library requires the packaged app and CUDA or Vulkan backend')
-        library = Path(bundle) / 'native' / backend / ('riko-native.dll' if sys.platform == 'win32' else 'libriko-native.so')
+        from .native_backends import bundled_library  # electron/native_backends.json: shipped backends, library names
+        library = bundled_library(library.split(':', 1)[1], os.getenv('RIKO_BUNDLE_ROOT'))
     runtime = RuntimeConfig(
         provider=runtime_raw.get("provider", "openai"),
         model=runtime_raw.get("model", raw.get("model", "")),
-        base_url=runtime_raw.get("base_url", raw.get("base_url", "http://localhost:1234/v1")),
+        base_url=runtime_raw.get("base_url", raw.get("base_url", "http://127.0.0.1:8080"
+            if str(runtime_raw.get("provider", "")).lower().replace("-", "_") == "llama_server" else "http://localhost:1234/v1")),
         api_key=runtime_raw.get("api_key", raw.get("api_key", os.getenv("RIKO_API_KEY", "local"))),
         model_path=_path(root, runtime_raw.get("model_path")),
         native_library=_path(root, library),
@@ -215,6 +213,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         runtime.initiative_max_output_tokens = persisted_output
     except (OSError, ValueError, TypeError, AttributeError): pass
     runtime.reflection_n_ctx = memory_raw.get('reflection_context_window_tokens', 4096)
+    # The in-process context holds the prompt and the reply, so by default the prompt gets what the reply leaves.
+    native = str(runtime.provider).lower().replace('-', '_') == 'llama_cpp'
+    live_prompt = max(1, runtime.n_ctx - runtime.max_output_tokens) if native else 8192
+    # The legacy preset key sets n_ctx; as a prompt budget it would leave no room for the reply.
+    legacy_prompt = params.get('context_window_token_limit', live_prompt)
     from ..inference.kv_budget import pool_capacity
     if runtime.kv_pool_auto: runtime.kv_pool_tokens = pool_capacity(runtime)
     return AppConfig(
@@ -231,7 +234,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         memory=MemoryConfig(
             history_file=_path(root, raw.get("history_file", memory_raw.get("history_file", "persistent_memories/chat_history.json"))) or root / "persistent_memories/chat_history.json",
-            context_window_tokens=int(memory_raw.get("context_window_tokens", params.get("context_window_token_limit", 8192))),
+            context_window_tokens=int(memory_raw.get("context_window_tokens", min(legacy_prompt, live_prompt) if native else legacy_prompt)),
             store_file=_path(root, memory_raw.get("store_file", "persistent_memories/memory_store.json")) or root / "persistent_memories/memory_store.json",
             index_file=_path(root, memory_raw.get("index_file", "persistent_memories/faiss_index.index")) or root / "persistent_memories/faiss_index.index",
             embedding_model=str(memory_raw.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")),
@@ -247,6 +250,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             system1_model_id=str(memory_raw.get("system1_model_id", "SupersonicLabs/Julia-1")),
             system1_cache_dir=_path(root, memory_raw.get("system1_cache_dir")),
             system1_max_length=int(memory_raw.get("system1_max_length", 8192)),
+            device=str(memory_raw.get("device", "cpu")),
             minimum_importance=float(memory_raw.get("minimum_importance", 0.35)),
             default_memories=list(memory_raw.get("default_memories", preset.get("memories", []))),
         ),

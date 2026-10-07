@@ -151,6 +151,8 @@ class EmotionProbe:
         self.metadata = {}
         self.save_lock = threading.Lock()
         self.error = ''
+        self.save_blocked = ''  # Set when unreadable artifacts could not be kept aside: never overwrite them.
+        self._dormant = None  # (weights, validation) restored but not loaded; written back until replaced.
         self.segment_features=deque(maxlen=512)
         self._restore()
         self.thread = threading.Thread(target=self._run, name='emotion-probe', daemon=True)
@@ -227,7 +229,7 @@ class EmotionProbe:
                 self.samples[index]=(row[0],target,row[2]);found=True
             if not found: raise ValueError('Sample is no longer available')
             self.metadata.setdefault(sample_id,{})['edited']=True
-            self.network=None;self.validation={};self.since_train=max(self.since_train,self.config.retrain_every)
+            self.network=None;self.validation={};self._dormant=None;self.since_train=max(self.since_train,self.config.retrain_every)
             self.data_revision=str(uuid.uuid4())
             self._save(list(self.samples))
             return self.status()
@@ -275,36 +277,90 @@ class EmotionProbe:
             if event.stream == 'assistant':
                 if self.active_group is not None and event.state.turn_id != self.active_group: return
                 if self.prediction_turn_id == event.state.turn_id: return
-            publish(event.state)
+        # Callbacks reach DesktopState and the session; never run them under the condition.
+        publish(event.state)
 
     def _publish(self, state, group, cancelled, *, fallback=False):
         with self.condition:
             if self.closed or cancelled() or self.active_group != group: return
             self.prediction_turn_id = None if fallback or state is None else group
             callback = self.on_fallback if fallback else self.on_prediction
-            if state is not None and callback: callback(replace(state, turn_id=group))
+        if state is not None and callback: callback(replace(state, turn_id=group))
+
+    def _load_artifact(self, path):
+        """Return a readable artifact dict, or None after setting the file aside (or blocking saves)."""
+        import torch
+        try:
+            saved = torch.load(path, map_location='cpu', weights_only=True)
+            if not isinstance(saved, dict): raise ValueError('Not an emotion probe artifact')
+            return saved
+        except Exception as exc:
+            self._quarantine(path, exc)
+            return None
+
+    def _quarantine(self, path, exc):
+        if path == self.legacy_path:
+            # Legacy storage is read-only discovery: saves never write there, so leave it alone.
+            self.error = f'Ignored unreadable legacy probe file {path.name} ({exc})'
+            logger.warning('Ignoring unreadable legacy emotion probe file %s', path, exc_info=exc)
+            return
+        logger.warning('Unreadable emotion probe file %s', path, exc_info=exc)
+        related = [path, path.with_name('examples.json')] if path == self.data_path and self.data_path != self.path else [path]
+        if all(self._set_aside(item) for item in related):
+            self.error = f'Unreadable probe file kept as a backup: {path.name} ({exc})'
+        else:
+            self.error = self.save_blocked = f'Could not read or set aside {path.name}; probe data is not saved until it is readable'
+
+    def _set_aside(self, path):
+        """Move an unreadable file out of the way so later saves cannot overwrite it."""
+        if not path.exists(): return True
+        target = path.with_name(f'{path.name}.unreadable-{time.strftime("%Y%m%d-%H%M%S")}-{uuid.uuid4().hex[:6]}')
+        try: path.replace(target)
+        except OSError:
+            logger.exception('Could not set aside %s', path)
+            return False
+        logger.warning('Kept unreadable emotion probe file as %s', target)
+        return True
 
     def _restore(self):
-        source = self.data_path if self.data_path.exists() else self.path if self.path.exists() else self.legacy_path
-        if source is None or not source.exists(): return
+        # Fail closed: unreadable files are set aside or block saving, never silently overwritten.
+        source = next((path for path in (self.data_path, self.path, self.legacy_path) if path is not None and path.exists()), None)
+        if source is None: return
+        def fall_back():
+            # training.pt was set aside, but the trained weights in probe.pt may still be fine.
+            if source == self.data_path and self.data_path != self.path and not self.save_blocked: self._restore()
+        saved = self._load_artifact(source)
+        if saved is None: return fall_back()
+        if saved.get('identity') != self.identity: return
+        weights, weights_validation = saved.get('weights'), saved.get('validation')
+        if source == self.data_path and self.data_path != self.path and self.path.exists():
+            artifact = self._load_artifact(self.path)
+            if artifact is not None and artifact.get('identity') == self.identity:
+                weights, weights_validation = artifact.get('weights'), artifact.get('validation')
         try:
-            import torch
-            saved = torch.load(source, map_location='cpu', weights_only=True)
-            if saved['identity'] != self.identity: return
-            self.samples.extend(saved['samples'][-self.config.max_samples:])
-            self.since_train = min(len(self.samples), saved.get('since_train', len(self.samples)))
-            self.validation = saved['validation']
-            self.metadata = saved.get('metadata', {})
-            if source == self.data_path and self.data_path != self.path and self.path.exists():
-                artifact = torch.load(self.path, map_location='cpu', weights_only=True)
-                if artifact.get('identity') == self.identity:
-                    saved['weights'] = artifact.get('weights')
-            if saved.get('weights') is not None and qualified(self.validation, self.config):
+            samples, since_train, metadata = [], 0, {}
+            if 'samples' in saved: # A weights-only probe.pt has no samples, metadata or since_train.
+                samples = list(saved['samples'])[-self.config.max_samples:]
+                since_train = min(len(samples), int(saved.get('since_train', len(samples))))
+                metadata = dict(saved.get('metadata') or {})
+            validation = dict(saved.get('validation') or {})
+        except Exception as exc:
+            self._quarantine(source, exc)
+            return fall_back()
+        self.samples.extend(samples)
+        self.since_train, self.metadata, self.validation = since_train, metadata, validation
+        if weights is not None:
+            try:
+                weights_validation = dict(weights_validation or {})
+                if not qualified(weights_validation, self.config): raise ValueError('below the configured quality thresholds')
                 network = build_network(self.config)
-                network.load_state_dict(saved['weights'])
-                self.network = network.eval().requires_grad_(False)
-        except Exception:
-            logger.warning('Ignoring incompatible emotion probe artifact', exc_info=True)
+                network.load_state_dict(weights)
+                self.network, self.validation = network.eval().requires_grad_(False), weights_validation
+            except Exception as exc:
+                # Unused now (stricter thresholds or incompatible), but still the user's trained
+                # weights: keep writing them back so a later save cannot erase the only copy.
+                self._dormant = (weights, weights_validation)
+                logger.warning('Trained emotion probe weights not loaded (%s); keeping them on disk', exc)
 
     def _run(self):
         try: self._work()
@@ -391,6 +447,7 @@ class EmotionProbe:
                 if qualified(result, self.config) and (incumbent is None or result['macro_f1'] >= incumbent['macro_f1']):
                     self.network = network
                     self.validation = result
+                    self._dormant = None
                 elif self.network is None: self.validation = result
                 self.since_train = 0
             self._save(data)
@@ -399,18 +456,24 @@ class EmotionProbe:
 
     def _save(self, samples):
         import torch
+        if self.save_blocked:
+            logger.warning('Emotion probe not saved: %s', self.save_blocked)
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
         with self.save_lock:
+            weights = {key: value.cpu() for key, value in self.network.state_dict().items()} if self.network is not None else None
+            artifact_validation = self.validation
+            if weights is None and self._dormant: weights, artifact_validation = self._dormant
             dataset = {'identity': self.identity, 'samples': samples, 'validation': self.validation, 'since_train': self.since_train,
-                'metadata':self.metadata,
-                'weights': {key: value.cpu() for key, value in self.network.state_dict().items()} if self.network is not None else None}
+                'metadata':self.metadata, 'weights': weights}
             if self.data_path != self.path:
                 data_temporary = self.data_path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
                 torch.save({key: value for key, value in dataset.items() if key != 'weights'}, data_temporary)
                 data_temporary.replace(self.data_path)
                 artifact = {key: value for key, value in dataset.items() if key not in {'samples', 'metadata', 'since_train'}}
+                artifact['validation'] = artifact_validation
             else:
                 artifact = dataset
             torch.save(artifact, temporary)

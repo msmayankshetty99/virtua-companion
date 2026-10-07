@@ -1,7 +1,7 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {Save, FolderOpen, Check, RefreshCw, AlertCircle, Plus, Trash2} from './ui/icons.jsx';
 import {request} from './api.mjs';
-import {inputValues, settingsPatch, runtimePresets} from './settings_model.mjs';
+import {inputValues, settingsPatch, settingsEdited, runtimePresets, llamaServerCommand} from './settings_model.mjs';
 import InitiativeSettings from './initiative_settings.jsx';
 import DisplaySettings from './display_settings.jsx';
 import VoiceInput from './voice_input.jsx';
@@ -50,17 +50,19 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
   const parsed=useMemo(()=>snapshot?settingsPatch(snapshot.fields,snapshot.values,inputs):{changes:{},errors:{}},[snapshot,inputs]);
   const sourceDirty=!!snapshot&&inputs['runtime.provider']==='llama_cpp'&&modelSource!==(snapshot.values['runtime.model_path']?'local':'huggingface');
   const dirty=sourceDirty || Object.keys(parsed.changes).length>0 || Object.keys(parsed.errors).length>0;
-  useEffect(()=>{onDirty?.(dirty);},[dirty,onDirty]);
+  // Only user edits guard navigation, reload and quit: opening Settings on a config it flags must not block them.
+  const edited=sourceDirty || (!!snapshot&&settingsEdited(snapshot,inputs,parsed));
+  useEffect(()=>{onDirty?.(edited);},[edited,onDirty]);
   useEffect(()=>()=>onDirty?.(false),[onDirty]);
   useEffect(()=>{
-    if(!dirty)return;
+    if(!edited)return;
     const handler=event=>{event.preventDefault();event.returnValue='';};
     window.addEventListener('beforeunload',handler);
     return()=>window.removeEventListener('beforeunload',handler);
-  },[dirty]);
+  },[edited]);
   const errors={...serverErrors,...parsed.errors};
   if(inputs['runtime.provider']==='llama_cpp'&&modelSource==='local'&&!inputs['runtime.model_path'])errors['runtime.model_path']='Choose a local GGUF file';
-  if(inputs['runtime.provider']==='llama_cpp'&&!inputs['runtime.native_library'])errors['runtime.native_library']='Choose a compatible riko-native library; the HTTP server backend is no longer supported';
+  if(inputs['runtime.provider']==='llama_cpp'&&!inputs['runtime.native_library'])errors['runtime.native_library']='Choose a compatible riko-native library, or choose llama_server to use a llama-server you run';
   if(inputs['runtime.provider']==='llama_cpp'&&inputs['runtime.model_path']&&!String(inputs['runtime.model_path']).toLowerCase().endsWith('.gguf'))errors['runtime.model_path']='Choose a .gguf model file';
   if(inputs['runtime.provider']==='llama_cpp'&&!inputs['runtime.model_path']&&files.length&&inputs['runtime.hf_filename']&&!files.includes(inputs['runtime.hf_filename']))errors['runtime.hf_filename']='File is not in this repository/revision listing';
   async function load() {
@@ -131,13 +133,13 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
     try {const value=await request('/api/settings/path',{method:'POST',body:{value:String(inputs[field.path]||'')}});setPathChecks(old=>({...old,[field.path]:value}));}
     catch(e){setError(e.message);}
   }
-  function preset(name){setInputs(old=>syncPool({...old,...runtimePresets[name]}));setNotice(name==='compact'?'Compact preset requires compatible flash attention and quantized KV support. No hardware capability is inferred.':'Preset applied to your draft. Review and save when ready.');}
+  function preset(name){setInputs(old=>syncPool({...old,...runtimePresets[name]}));setNotice(name==='compact'?'Compact preset quantizes the KV cache, which turns flash attention on. If your GPU backend lacks flash attention for this model, attention runs on the CPU.':'Preset applied to your draft. Review and save when ready.');}
   const searchItems=useMemo(()=>settingsIndex(snapshot?.fields||[],groups,catalog),[snapshot?.fields,catalog]);
   const fields=(snapshot?.fields||[]).filter(field=>field.path===destination?.path||(field.group===group
     &&!['avatar.model','avatar.format','runtime.kv_pool_auto','runtime.kv_pool_tokens'].includes(field.path)
     &&(advanced||!field.advanced)
     &&(advanced||group!=='models'||inputs['runtime.provider']!=='llama_cpp'||(modelSource==='local'?!field.path.startsWith('runtime.hf_'):field.path!=='runtime.model_path'))
-    &&(advanced||group!=='models'||!(inputs['runtime.provider']==='llama_cpp'?['runtime.api_mode','runtime.reuse_response_ids','runtime.base_url','runtime.api_key','runtime.model'].includes(field.path):field.path.startsWith('runtime.')&&!['runtime.provider','runtime.api_mode','runtime.reuse_response_ids','runtime.base_url','runtime.api_key','runtime.model','runtime.temperature','runtime.max_output_tokens','runtime.n_ctx','runtime.request_timeout_seconds','runtime.warmup'].includes(field.path)))));
+    &&(advanced||group!=='models'||!(inputs['runtime.provider']==='llama_cpp'?['runtime.api_mode','runtime.reuse_response_ids','runtime.base_url','runtime.api_key','runtime.model'].includes(field.path):field.path.startsWith('runtime.')&&!['runtime.provider','runtime.api_mode','runtime.reuse_response_ids','runtime.base_url','runtime.api_key','runtime.model','runtime.temperature','runtime.max_output_tokens','runtime.n_ctx','runtime.request_timeout_seconds','runtime.warmup',...(inputs['runtime.provider']==='llama_server'?['runtime.parallel_slots','runtime.startup_timeout_seconds','runtime.pause_background_on_live']:[])].includes(field.path)))));
   const sections=[...new Set(fields.map(field=>field.section||'Settings'))].sort((a,b)=>{
     const order=['Model source','Token budgets','Generation','Scheduling & startup','Compute & cache','Speech recognition model','Background models','Embedding model','Emotion model','Renderer assets','Preset fallbacks','Settings','Emotion'];return order.indexOf(a)-order.indexOf(b);
   });
@@ -161,7 +163,7 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
     </div>;
    }
    return <main ref={page} className="settings-page">
-     <header className="page-heading"><SettingsNavigation groups={groups} group={group} sections={jumpSections} onSelect={selectGroup} onJump={jump}/><h1>Settings</h1><button className="icon-button" title="Reload settings" aria-label="Reload settings" disabled={busy} onClick={()=>{if(!dirty||confirm('Discard unsaved changes and reload?'))load();}}><RefreshCw size={18}/></button></header>
+     <header className="page-heading"><SettingsNavigation groups={groups} group={group} sections={jumpSections} onSelect={selectGroup} onJump={jump}/><h1>Settings</h1><button className="icon-button" title="Reload settings" aria-label="Reload settings" disabled={busy} onClick={()=>{if(!edited||confirm('Discard unsaved changes and reload?'))load();}}><RefreshCw size={18}/></button></header>
       <div className="settings-search"><SettingsSearchMenu items={searchItems} groups={groups} onNavigate={navigateSetting} renderRuntime={renderField} preferences={preferences} catalog={catalog} updatePreferences={updatePreferences} onSave={save} canSave={!!snapshot&&dirty&&!validating&&!Object.values(errors).some(Boolean)} saving={busy} status={error||errors.__all__||notice||(validating?'Checking your changes…':dirty?'Unsaved runtime changes':'Runtime settings saved')} /><label><input type="checkbox" checked={advanced} onChange={e=>setAdvanced(e.target.checked)}/>Advanced controls</label></div>
       <SettingsTabs groups={groups} group={group} onSelect={selectGroup}/>
       {group==='discord'&&<DiscordSettings/>}
@@ -179,6 +181,7 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
           {group==='appearance'&&<><p className="caption">Model setup, animation connections, physics and effects live here. Interface colors and speech popups remain in Appearance. Local model overrides apply immediately.</p><nav className="appearance-links"><a href="#desktop-model-library">Model & animation library</a><a href="#appearance-avatar-hits">Interaction connections</a><a href="#appearance-avatar-studio">Physics, calibration & effects</a></nav><div id="desktop-model-library" tabIndex={-1} ref={sectionRef('Avatar library')}><AnimationLibraryPanel avatarModel={inputs['avatar.model']} avatarFormat={inputs['avatar.format']} onAvatarChange={change} onAvatarUse={useAvatar} settingsBusy={busy}/></div><AvatarHitSettings preferences={preferences} update={updatePreferences}/><AvatarStudio preferences={preferences} update={updatePreferences}/></>}
         {group==='tools'&&<div id="settings-tool-approvals"><ToolApprovalSettings/></div>}
         {group==='neural'&&<NeuralSettings/>}
+        {group==='models'&&inputs['runtime.provider']==='llama_server'&&<section id="settings-llama-server" tabIndex={-1}><h3>Your llama-server</h3><p>Riko connects to a llama-server you start yourself, built for any backend: CUDA, ROCm, Metal, Vulkan or CPU. Riko still reserves a slot for live replies, counts tokens exactly and streams. The server chooses the model and GPU settings; the emotion probe needs the native library instead.</p><p>Start it with <code>{llamaServerCommand(inputs)}</code>, set the address below, then Save and restart Python.</p></section>}
         {group==='models'&&inputs['runtime.provider']==='llama_cpp'&&<section id="settings-inference-transport" tabIndex={-1}><h3>How llama.cpp runs</h3><p><strong>{inputs['runtime.native_library']?'Draft: in-process native library':'Native library required — select a compatible riko-native library'}</strong> · Changes take effect after Save and a Python restart.</p><p>llama.cpp runs inside Python with one main model, reserved inference slots, streaming, cancellation, tools and prompt caching. There is no separate llama-server process or HTTP listener. A CPU-only library cannot provide CUDA acceleration. The API mode, base URL and API key fields apply to other providers, not native llama.cpp.</p></section>}
         {group==='performance'&&<section id="settings-performance" tabIndex={-1}><h3>Measure before tuning</h3><p>Tokens/second measures generation speed; first-token delay measures how long a reply takes to start. llama.cpp supplies exact per-request stream timings, including reasoning tokens, without polling server-wide /metrics. Other providers may show an explicitly labelled estimate.</p><label className="switch-row">Show live inference statistics<input type="checkbox" role="switch" checked={preferences.showInferenceStats!==false} onChange={e=>updatePreferences({showInferenceStats:e.target.checked})}/></label><p className="caption">Applies immediately to full and mini chat. Hiding statistics does not change inference or logging.</p><p>Deferring Julia reduces competing analysis while the main model generates. Emotion and motion decisions may update later; an already-running call can still overlap. Main-model background slot priority is controlled separately in Models.</p><p>Logs go to <code>logs/debug.log</code>. DEBUG includes slot waits, prompt packing and Julia analysis time; INFO includes generation timings. Review logs before sharing: timing instrumentation does not collect conversation text, but other errors can contain local paths. Choose the level, size and backup count below, then Save and restart Python.</p></section>}
         {group==='graphics'&&<div id="settings-graphics"><GraphicsSettings preferences={preferences} update={updatePreferences}/></div>}

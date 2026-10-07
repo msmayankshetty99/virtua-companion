@@ -58,6 +58,8 @@ def test_server_flags_allocate_per_slot_context_and_one_model():
     assert args[args.index('--ctx-size')+1] == '12288'
     assert args[args.index('--parallel')+1] == '3'
     assert args[args.index('--cache-type-v')+1] == 'q8_0'
+    assert args[args.index('--flash-attn')+1] == 'on'
+    assert args[args.index('--fit')+1] == 'on'
     assert '--kv-unified' in args and '--no-context-shift' in args
 
 

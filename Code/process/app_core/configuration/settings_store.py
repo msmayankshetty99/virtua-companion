@@ -17,16 +17,17 @@ LOCK = threading.RLock()
 OBSOLETE = {'avatar.camera.distance', 'avatar.expression_engine', 'avatar.view', 'desktop.shortcuts.effects',
             'emotion.pause_during_inference', 'runtime.server_path',
             'emotion.temperature', 'sovits_ping_config.media_type', 'your_name',
-            'model','base_url','api_key','tokenizer_model'}
+            'model','base_url','api_key','tokenizer_model', 'memory.index_file'}
 ENUMS = {
     'logging.level': ['DEBUG','INFO','WARNING','ERROR'],
-    'runtime.provider': ['llama_cpp', 'lm_studio', 'openai', 'openai_compatible', 'ollama', 'local_http'],
+    'runtime.provider': ['llama_cpp', 'llama_server', 'lm_studio', 'openai', 'openai_compatible', 'ollama', 'local_http'],
     'runtime.api_mode': ['auto', 'responses', 'chat_completions'],
     'runtime.type_k': ['f16', 'f32', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'],
     'runtime.type_v': ['f16', 'f32', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'],
-    'runtime.split_mode': ['none', 'layer', 'row'], 'voice.mode': ['wake_word', 'continuous', 'manual'],
-    'voice.asr_device': ['cuda', 'cpu', 'auto'], 'voice.asr_compute_type': ['int8_float16', 'float16', 'int8', 'float32', 'default'],
-    'emotion.device': ['cpu', 'cuda', 'cuda:0'], 'avatar.format': ['auto', 'vrm0', 'vrm1'], 'avatar.view': ['full_body'],
+    'runtime.split_mode': ['none', 'layer'], 'runtime.flash_attn': ['auto', 'on', 'off'], 'voice.mode': ['wake_word', 'continuous', 'manual'],
+    'voice.asr_device': ['auto', 'cuda', 'cpu'], 'voice.asr_compute_type': ['default', 'int8_float16', 'float16', 'int8', 'float32'],
+    'emotion.device': ['cpu', 'auto', 'cuda', 'cuda:0'], 'memory.device': ['cpu', 'auto', 'cuda', 'cuda:0', 'mps'],
+    'avatar.format': ['auto', 'vrm0', 'vrm1'], 'avatar.view': ['full_body'],
     'sovits_ping_config.text_lang': ['en', 'zh', 'ja', 'ko', 'yue', 'auto'],
     'sovits_ping_config.prompt_lang': ['en', 'zh', 'ja', 'ko', 'yue', 'auto'],
     'sovits_ping_config.media_type': ['raw'],
@@ -35,7 +36,7 @@ RANGES = {
     'logging.max_mb': (1,100), 'logging.backups': (1,10),
     'emotion.probe.interval_tokens': (1, 512),
     'runtime.parallel_slots': (2, 4), 'runtime.n_ctx': (1, 1048576),
-    'runtime.n_gpu_layers': (-1, 1000), 'runtime.n_batch': (1, 65536), 'runtime.n_ubatch': (1, 65536),
+    'runtime.n_gpu_layers': (-2, 1000), 'runtime.n_batch': (1, 65536), 'runtime.n_ubatch': (1, 65536),
     'runtime.n_threads': (1, 1024), 'runtime.n_threads_batch': (1, 1024),
     'runtime.request_timeout_seconds': (.1, 86400), 'runtime.startup_timeout_seconds': (1, 86400),
     'runtime.cache_size_mb': (0, 1048576), 'runtime.main_gpu': (0, 128),
@@ -60,6 +61,9 @@ RANGES = {
     'presets.default.model_params.context_window_token_limit': (1, 1048576),
     'presets.default.model_params.max_output_tokens': (1, 1048576),
 }
+# Settings that change the live conversation budget (memory.context_window_tokens + runtime.max_output_tokens <= n_ctx).
+BUDGET_KEYS = {'runtime.provider', 'runtime.n_ctx', 'runtime.max_output_tokens', 'memory.context_window_tokens',
+    'presets.default.model_params.context_window_token_limit', 'presets.default.model_params.max_output_tokens'}
 INTEGER_NULLS = {'runtime.n_threads', 'runtime.n_threads_batch', 'runtime.kv_pool_tokens', 'voice.input_device'}
 JSON_NULLS = {'runtime.tensor_split'}
 OPTIONAL_TEXT = {'runtime.model_path', 'runtime.hf_repo_id', 'runtime.hf_filename', 'runtime.chat_format'}
@@ -70,7 +74,9 @@ HELP = {
     'sovits_ping_config.auto_start': 'Packaged app only: explicitly launch your GPT-SoVITS API executable on startup. The app stops only its owned direct process on quit. Save and restart the app, not just Python.',
     'sovits_ping_config.executable': 'Absolute path to a GPT-SoVITS API-server executable, not a GUI launcher. Its dependencies and model weights must already be installed. Save and restart the packaged app.',
     'sovits_ping_config.arguments': 'JSON list of command-line arguments passed directly without a shell. Configure its API port to match the endpoint URL. Restart the packaged app.',
-    'runtime.startup_timeout_seconds': 'Deadline for optional component warmup (ASR, TTS and auxiliary models), not a timeout for synchronous native model loading. Native request waits use Request timeout. Restart Python.',
+    'runtime.startup_timeout_seconds': 'Deadline for optional component warmup (ASR, TTS and auxiliary models), and for an external llama-server to finish loading its model; not a timeout for synchronous native model loading. Native request waits use Request timeout. Restart Python.',
+    'runtime.provider': 'llama_cpp runs llama.cpp inside Python with a riko-native library. llama_server connects to a llama-server you run, built for any backend (CUDA, ROCm, Metal, Vulkan or CPU), and keeps slots, exact token counts and streaming. The others use OpenAI-compatible APIs. Save and restart Python.',
+    'runtime.base_url': 'Server address. For llama_server, the llama-server address such as http://127.0.0.1:8080; its --parallel must equal Parallel inference slots and each slot needs at least the live, initiative and reflection context. Conversations are sent to this address. Save and restart Python.',
     'emotion.probe.enabled': 'Collect hidden-state features and Julia targets with a compatible in-process DLL. Julia stays live for user transcription. A validated probe can take over agent expressions; no extra main model is loaded. Restart Python.',
     'emotion.probe.use_for_expression': 'Automatically use the probe for agent expressions only after held-out validation passes. Julia remains for user input and low-confidence or unavailable-feature fallback. Disable to continue gathering comparisons. Restart Python.',
     'emotion.probe.auto_train': 'Train automatically only after continuous idle time and sufficient new samples. Inference, microphone activity and playback take priority. Manual Train now skips the idle delay, not foreground protection. Restart Python.',
@@ -92,7 +98,8 @@ HELP = {
     'logging.level': 'DEBUG includes detailed application diagnostics; INFO includes inference timings; WARNING and ERROR restrict output. Restart Python to apply.',
     'logging.inference_timings': 'Record provider duration, first-token latency and output rate without recording prompts or responses. Restart Python to apply.',
     'runtime.native_library': 'Required for llama_cpp: a compatible riko-native library. Runs llama.cpp inside Python, including Responses, tools, streaming, cancellation and probe capture. No server process or HTTP listener. Use a CUDA-enabled build for GPU acceleration. Save and restart Python.',
-    'emotion.device': 'Julia-1 teacher device: CPU by default; CUDA is opt-in and requires a compatible GPU torch/native Julia runtime. The latent probe always runs on CPU.',
+    'emotion.device': 'Julia-1 teacher device: CPU by default, keeping GPU memory for the main model. CUDA is opt-in and needs a GPU build of torch (ROCm builds also report cuda); auto uses it when available. Julia does not support Apple MPS yet, so Macs use CPU. A GPU that fails to load falls back to CPU. The latent probe always runs on CPU. Restart Python.',
+    'memory.device': 'Device for the memory classifier (Julia-1) and the embedding model. CPU by default. auto picks CUDA, then Apple MPS, then CPU. The classifier stays on CPU under MPS; embeddings can use it. GPU use competes with the main model for memory, and a GPU that fails to load falls back to CPU. Restart Python.',
     'emotion.probe.enabled': 'Train a read-only CPU emotion probe against genuine Julia-1 labels from native llama.cpp hidden states. Requires the custom in-process DLL. Julia remains fallback until held-out validation passes.',
     'emotion.probe.interval_tokens': 'Run native capture and the CPU emotion probe at most once per this many generated tokens (reasoning-only samples are excluded). Default 32. Applies immediately on save. Generation still evaluates every token. Smaller values increase capture and teacher work.',
     'runtime.parallel_slots': 'One slot reserved for live replies. Other slots prioritize initiative over reflection.',
@@ -108,12 +115,16 @@ HELP = {
     'runtime.hf_repo_id': 'Search Hugging Face, or paste an owner/repository ID. No download occurs until backend restart.',
     'runtime.hf_filename': 'Choose an exact GGUF. For split models choose the first shard; not the mmproj file.',
     'runtime.model_path': 'An explicit local GGUF takes precedence over Hugging Face.',
-    'runtime.flash_attn': 'Hardware/build-dependent. Quantized V cache requires flash attention.',
+    'runtime.flash_attn': 'auto lets llama.cpp use flash attention where the GPU backend supports it for this model. Quantized V cache needs auto or on (it forces flash attention on).',
+    'runtime.n_gpu_layers': '-1 fits as many layers as free GPU memory allows at load time, keeping 1 GiB free (layers left over run on the CPU, slower). -2 requires every layer on the GPU. 0 or more is an exact layer count.',
+    'runtime.split_mode': 'How a model is spread over several GPUs: layer gives each GPU whole layers; none uses only the primary GPU. Row split is not available in this llama.cpp build.',
     'runtime.type_k': 'KV tensor quantization, independent of model weight quantization.',
     'runtime.cache_size_mb': 'Optional extra RAM prompt cache; 0 still preserves per-slot live prefix reuse.',
     'runtime.warmup': 'Preload models and silently test TTS. Does not open your microphone.',
     'voice.input_device': 'Automatic uses the system microphone. Changes apply on backend restart.',
     'voice.wake_word': 'One short name supported by EfficientWord-Net. Changing name/device requires its matching enrollment.',
+    'voice.asr_device': 'auto uses CUDA when CTranslate2 sees a supported GPU (NVIDIA, or AMD with a HIP-built CTranslate2), otherwise the CPU. CTranslate2 has no Metal backend, so Macs transcribe on the CPU. Packaged builds bundle no CUDA libraries for speech recognition; keep cpu there. Save and restart Python.',
+    'voice.asr_compute_type': 'default picks the fastest precision the device supports: int8_float16 on recent NVIDIA GPUs, int8 on the CPU. float16 and int8_float16 need a GPU. A pair this machine cannot run is refused here; one already in the file is replaced at startup with a logged warning. Save and restart Python.',
     'voice.live_transcript_interval_seconds': 'Rolling provisional ASR updates while you are still speaking. One partial job at a time; final transcription replaces partial text. Smaller intervals increase ASR work. Applies on microphone restart.',
     'tools.require_approval': 'Default for new/unconfigured tools. Per-tool live permissions override this default; approval bubbles expire after two minutes without executing.',
     'tools.best_fit_inputs': 'Correct finite-choice desktop inputs before approval. Reuses the enabled, already-loaded CPU Julia model; safe spelling normalization is the fallback. Never repairs file permissions, numeric values or arbitrary paths.',
@@ -144,7 +155,7 @@ LABELS = {
     'runtime.native_library': 'In-process llama.cpp library',
     'emotion.probe.interval_tokens': 'Emotion probe interval (tokens)',
     'emotion.probe.enabled': 'Latent emotion probe',
-    'emotion.device': 'Julia-1 compute device',
+    'emotion.device': 'Julia-1 compute device', 'memory.device': 'Memory model device',
     'runtime.provider':'Backend', 'runtime.model_path':'Local GGUF file',
     'runtime.hf_repo_id':'Hugging Face model', 'runtime.hf_filename':'GGUF file', 'runtime.hf_revision':'Model revision',
     'runtime.hf_local_files_only':'Offline mode', 'runtime.n_ctx':'Live context length (tokens)',
@@ -209,6 +220,7 @@ def field(path, value):
         'memory.reflection_context_window_tokens': 'Token budgets', 'memory.reflection_max_output_tokens': 'Token budgets',
         'memory.reflection_enabled': 'Background models', 'memory.system1_enabled': 'Background models',
         'memory.system1_model_id': 'Background models', 'memory.system1_cache_dir': 'Background models', 'memory.system1_max_length': 'Token budgets',
+        'memory.device': 'Background models',
         'memory.embeddings_enabled': 'Embedding model', 'memory.embedding_model': 'Embedding model', 'memory.embedding_dimension': 'Embedding model',
     }
     if path.startswith('emotion.'): resource_sections[path] = 'Emotion model'
@@ -258,7 +270,8 @@ class SettingsStore:
         values = self._values(raw)
         return {'revision': revision(text), 'values': values, 'fields': [field(k, v) for k, v in values.items()
             if k not in OBSOLETE and not k.startswith('presets.default.model_params.')
-            and not (values.get('runtime.provider') == 'llama_cpp' and k in {'runtime.model','runtime.base_url','runtime.api_key','runtime.api_mode','runtime.reuse_response_ids','runtime.tokenizer_model'})],
+            and not (values.get('runtime.provider') == 'llama_cpp' and k in {'runtime.model','runtime.api_mode','runtime.reuse_response_ids','runtime.tokenizer_model'})
+            and not (values.get('runtime.provider') == 'llama_server' and k in {'runtime.model','runtime.api_mode','runtime.reuse_response_ids','runtime.tokenizer_model'})],
             'path': str(self.path), 'restart_required': True}
 
     def _values(self, raw):
@@ -271,6 +284,7 @@ class SettingsStore:
                 if group == 'memory' and key in {'default_memories', 'history_file'}: continue
                 values[f'{group}.{key}'] = value
         values.update(dict(flatten(raw)))
+        if type(values.get('runtime.flash_attn')) is bool: values['runtime.flash_attn'] = 'on' if values['runtime.flash_attn'] else 'off'
         for key,value in {'auto_start':False,'executable':None,'arguments':[]}.items():
             values.setdefault('sovits_ping_config.'+key,value)
         for key,value in {'file_enabled':True,'level':'INFO','inference_timings':True,'max_mb':5,'backups':3}.items():
@@ -296,7 +310,8 @@ class SettingsStore:
         values['initiative.context_window_tokens'] = candidate.runtime.initiative_n_ctx
         values['initiative.max_output_tokens'] = candidate.runtime.initiative_max_output_tokens
         if candidate.runtime.kv_pool_auto: values['runtime.kv_pool_tokens'] = candidate.runtime.kv_pool_tokens
-        for key, value in {'asr_model':'distil-small.en','asr_device':'cuda','asr_compute_type':'int8_float16','live_transcript_interval_seconds':2.0}.items():
+        from ..audio.asr import MODEL
+        for key, value in {'asr_model':MODEL,'asr_device':'auto','asr_compute_type':'default','live_transcript_interval_seconds':2.0}.items():
             values.setdefault('voice.' + key, value)
         return json.loads(json.dumps(values, default=str))
 
@@ -343,6 +358,16 @@ class SettingsStore:
             voice = candidate.raw.get('voice', {})
             if voice.get('mode', 'wake_word') not in {'wake_word', 'manual', 'continuous'}: errors['voice.mode'] = 'Invalid activation mode'
             if len(str(voice.get('wake_word', 'Riko')).split()) != 1: errors['voice.wake_word'] = 'Use one short wake name'
+            # Check the speech recognition pair only when it is edited, so a pair this machine cannot run (which
+            # falls back at startup) never blocks saving other settings.
+            asr_keys = [key for key in ('voice.asr_device', 'voice.asr_compute_type') if key in changes]
+            if asr_keys:
+                from ..audio.asr import resolve
+                device, _, note = resolve(voice)
+                # Name the field whose value cannot run here, which may be the one the user did not edit.
+                for part in filter(None, note.split('; ')):
+                    if ' does not support ' in part: errors['voice.asr_compute_type'] = f'{device} cannot run {voice.get("asr_compute_type")} here; choose default'
+                    else: errors['voice.asr_device'] = f'Not available on this machine ({part}); choose auto or cpu'
             for path, value in dict(flatten(raw)).items():
                 if path.endswith(('_url', '.url')) and isinstance(value, str) and not value.startswith(('http://', 'https://')):
                     errors[path] = 'Use an http:// or https:// URL'
@@ -361,8 +386,11 @@ class SettingsStore:
             if rt.provider == 'llama_cpp':
                 pool_capacity(rt)
                 if rt.n_ctx <= 0: errors['runtime.n_ctx'] = 'Managed server requires a positive context'
+                if rt.split_mode == 'row': errors['runtime.split_mode'] = 'Row split is not available in this llama.cpp build; choose layer or none'
+                # Check the live budget only when one of its inputs is edited: the runtime clamps it (factory.py), so a
+                # config that does not fit, such as one an older setup wizard wrote, never blocks saving other settings.
                 budget = candidate.memory.context_window_tokens + rt.max_output_tokens
-                if budget > rt.n_ctx: errors['runtime.n_ctx'] = f'Context must fit conversation budget + response ({budget} tokens)'
+                if budget > rt.n_ctx and BUDGET_KEYS & changes.keys(): errors['runtime.n_ctx'] = f'Context must fit conversation budget + response ({budget} tokens)'
         except (ValueError, TypeError, KeyError) as exc: errors['__all__'] = str(exc)
         finally: Path(temporary).unlink(missing_ok=True)
         return text, output, errors

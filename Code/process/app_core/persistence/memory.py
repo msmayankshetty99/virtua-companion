@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 MEMORY_TYPES = ("episodic", "factual", "semantic", "preference", "relationship", "procedural")
 
 
+def top_inner_products(matrix, vector, k):
+    """Rows with the highest inner product, best first; exact ties keep the lower row. Unit rows make it cosine."""
+    import numpy as np
+    scores = matrix @ vector
+    order = np.argsort(-scores, kind='stable')[:max(0, k)]
+    return scores[order], order
+
+
 @dataclass
 class MemoryRecord:
     text: str
@@ -42,9 +50,9 @@ class MemoryRecord:
 
 
 class JuliaMemoryDecider:
-    """CPU Julia 1 classifier for memory retention and categorization."""
-    def __init__(self, model_id, cache_dir=None, max_length=8192):
-        self.model_id, self.cache_dir, self.max_length = model_id, cache_dir, max_length
+    """Julia 1 classifier for memory retention and categorization (CPU unless memory.device picks CUDA)."""
+    def __init__(self, model_id, cache_dir=None, max_length=8192, device='cpu'):
+        self.model_id, self.cache_dir, self.max_length, self.device = model_id, cache_dir, max_length, device
         self.model = None
         self.attempted = False
 
@@ -56,7 +64,8 @@ class JuliaMemoryDecider:
             import importlib, sys
             path = snapshot_download(self.model_id, cache_dir=str(self.cache_dir) if self.cache_dir else None)
             if path not in sys.path: sys.path.insert(0, path)
-            self.model = importlib.import_module("julia").load_model(path, device="cpu", strict_encoding=True, max_length=self.max_length, head_length=512)
+            from ..emotion.julia import load_julia
+            self.model, _ = load_julia(importlib.import_module("julia"), path, self.device, strict_encoding=True, max_length=self.max_length, head_length=512)
             from ..emotion.compat import compatible_engine
             compatible_engine(self.model)
         except Exception as exc:
@@ -115,7 +124,9 @@ class MemoryStore:
         self.index_snapshot = None
         self.index_dirty = bool(self.records)
         self.embeddings_failed = False
-        self.decider = JuliaMemoryDecider(config.system1_model_id, config.system1_cache_dir, config.system1_max_length) if config.system1_enabled else None
+        from ..runtime.torch_device import validate
+        validate(config.device)
+        self.decider = JuliaMemoryDecider(config.system1_model_id, config.system1_cache_dir, config.system1_max_length, config.device) if config.system1_enabled else None
         if not self.records and config.default_memories:
             self.records = [MemoryRecord(text=item["text"], memory_type=item.get("memory_type", "factual"), importance=float(item.get("importance_score", item.get("importance", .5))), confidence=float(item.get("confidence", .9)), tags=list(item.get("tags", [])), source="configuration") for item in config.default_memories if item.get("text")]
             self._save()
@@ -389,13 +400,19 @@ class MemoryStore:
         self._event('reflected', source_id=snapshot.id, records=[asdict(r) for r in derived_records])
 
     def _embed(self, texts):
+        import numpy as np
         if self.embedder is None:
             from sentence_transformers import SentenceTransformer
-            self.embedder = SentenceTransformer(self.config.embedding_model, device='cpu')
+            from ..runtime.torch_device import resolve
+            device = resolve(self.config.device)
+            try: self.embedder = SentenceTransformer(self.config.embedding_model, device=device)
+            except Exception as exc:
+                if device == 'cpu': raise
+                logger.warning('Embedding model could not load on %s; retrying on CPU: %s', device, exc)
+                self.embedder = SentenceTransformer(self.config.embedding_model, device='cpu')
         vectors = self.embedder.encode(texts, convert_to_numpy=True).astype('float32')
-        import faiss
-        faiss.normalize_L2(vectors)
-        return vectors
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)  # unit rows; an all-zero row stays zero
+        return np.divide(vectors, norms, out=vectors, where=norms > 0)
 
     def _rebuild_index(self):
         with self.lock:
@@ -406,21 +423,17 @@ class MemoryStore:
                 self.index_dirty = False
             return
         try:
-            import faiss
+            # A plain float32 matrix, rebuilt from record text on every start and never written to disk.
+            # Not FAISS: on macOS its bundled libomp crashes the process once torch's libomp is also running.
             with self.embed_lock: vectors = self._embed([r.text for r in records])
-            index = faiss.IndexFlatIP(vectors.shape[1])
-            index.add(vectors)
+            vectors.setflags(write=False)
             mapping = [(r.id, r.revision, r.text) for r in records]
             with self.lock:
                 # Publish only if the source snapshot is still current. Query fallbacks
                 # cover records added or corrected while vectors were being computed.
                 if self.closed: return
                 if mapping != [(r.id, r.revision, r.text) for r in self.records if r.active]: return
-                self.config.index_file.parent.mkdir(parents=True, exist_ok=True)
-                temporary = str(self.config.index_file) + '.tmp'
-                faiss.write_index(index, temporary)
-                os.replace(temporary, self.config.index_file)
-                self.index_snapshot = (index, mapping)
+                self.index_snapshot = (vectors, mapping)
                 self.index_dirty = False
         except Exception as exc:
             with self.lock:
@@ -440,11 +453,10 @@ class MemoryStore:
         if snapshot and self.embedder is not None and self.embed_lock.acquire(blocking=False):
             try:
                 vector = self._embed([query])
-                scores, positions = snapshot[0].search(vector, min(len(snapshot[1]), self.config.max_results * 3))
-                for score, position in zip(scores[0], positions[0]):
-                    if position >= 0:
-                        record_id, revision, _ = snapshot[1][position]
-                        semantic[(record_id, revision)] = float(score)
+                scores, positions = top_inner_products(snapshot[0], vector[0], min(len(snapshot[1]), self.config.max_results * 3))
+                for score, position in zip(scores, positions):
+                    record_id, revision, _ = snapshot[1][position]
+                    semantic[(record_id, revision)] = float(score)
             except Exception as exc: logger.warning('Semantic query failed; using lexical recall: %s', exc)
             finally: self.embed_lock.release()
         words = set(re.findall(r'\w+', query.casefold()))

@@ -73,7 +73,15 @@ def test_cpu_offload_and_external_provider_exclusions(tmp_path):
     assert next(row for row in result['components'] if row['id'] == 'tts')['high_mib'] == 0
 
 
-def test_asr_model_precision_and_batches_affect_estimate(tmp_path):
+def ctranslate2(monkeypatch, cuda):
+    from process.app_core.audio import asr
+    types = {'cpu': frozenset({'float32', 'int8', 'int8_float32'})}
+    if cuda: types['cuda'] = frozenset({'float32', 'float16', 'int8', 'int8_float32', 'int8_float16'})
+    monkeypatch.setattr(asr, 'supported_types', lambda: types)
+
+
+def test_asr_model_precision_and_batches_affect_estimate(tmp_path, monkeypatch):
+    ctranslate2(monkeypatch, cuda=True)
     c = config(tmp_path)
     c.raw['voice'] = {'asr_device': 'cuda', 'asr_model': 'small', 'asr_compute_type': 'int8_float16'}
     compact = estimate(c, gpu(), metadata())
@@ -81,7 +89,18 @@ def test_asr_model_precision_and_batches_affect_estimate(tmp_path):
     c.raw['voice']['asr_compute_type'] = 'float32'
     c.runtime.n_batch = c.runtime.n_ubatch = 2048
     large = estimate(c, gpu(), metadata())
-    assert large['high_mib'] > compact['high_mib']
+    asr = lambda result: next(row for row in result['components'] if row['id'] == 'asr')['high_mib']
+    assert large['high_mib'] > compact['high_mib'] and asr(large) > asr(compact) > 0
+
+
+def test_asr_estimate_uses_the_device_it_will_actually_run_on(tmp_path, monkeypatch):
+    ctranslate2(monkeypatch, cuda=False)
+    c = config(tmp_path)
+    c.raw['voice'] = {'asr_device': 'cuda', 'asr_model': 'small', 'asr_compute_type': 'int8_float16'}
+    result = estimate(c, gpu(), metadata())
+    row = lambda key: next(row for row in result['components'] if row['id'] == key)
+    assert row('asr')['high_mib'] == 0 and row('cuda')['high_mib'] == 0 and row('asr')['basis'] == 'CPU (int8)'
+    assert any('runs as cpu/int8' in warning for warning in result['warnings'])
 
 
 def test_unknown_metadata_suppresses_false_total_and_suggestion(tmp_path):

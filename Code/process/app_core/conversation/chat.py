@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Callable
 
 from .messages import ChatMessage, ModelResponse, conversation_sections
 from .output_filter import OutputFilter, clean_output
+from ..persistence.preserve import preserve_unreadable
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ class ChatService:
         return self.emotion_engine.observe_output(delta, final=final) if self.emotion_engine else None
 
     def _load_history(self):
+        self._unreadable_history = False
         if not self.history_file or not self.history_file.exists(): return []
         try:
             raw = json.loads(self.history_file.read_text(encoding="utf-8"))
@@ -50,15 +53,31 @@ class ChatService:
             return [ChatMessage(x["role"], x.get("content", ""), tool_call_id=x.get("tool_call_id"), timestamp=x.get('timestamp'),
                 source=x.get('source') if x.get('source') in {'discord','microphone','message'} else None,
                 conversation_id=str(x['conversation_id'])[:200] if x.get('conversation_id') else None) for x in raw if x.get("role") != "system"]
-        except (OSError, ValueError, KeyError):
-            logger.warning("Unable to load chat history; starting with an empty history")
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning("Unable to load chat history (%s); starting with an empty history", exc)
+            self._unreadable_history = True
+            self._preserve_unreadable_history()
             return []
+
+    def _preserve_unreadable_history(self):
+        """Keep an unreadable history aside before any save replaces it. Fails closed."""
+        try: backup = preserve_unreadable(self.history_file)
+        except OSError as exc:
+            logger.error('Could not back up unreadable %s (%s); chat history is not saved over it', self.history_file.name, exc)
+            return False
+        if backup: logger.warning('Kept the unreadable chat history as %s', backup.name)
+        self._unreadable_history = False
+        return True
 
     def _save_history(self):
         if not self.history_file: return
+        if self._unreadable_history and not self._preserve_unreadable_history(): return
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.history_file.with_suffix(self.history_file.suffix + '.tmp')
-        temporary.write_text(json.dumps([m.as_record() for m in self.history], indent=2), encoding="utf-8")
+        with temporary.open('w', encoding='utf-8') as stream:
+            stream.write(json.dumps([m.as_record() for m in self.history], indent=2))
+            stream.flush()
+            os.fsync(stream.fileno())
         temporary.replace(self.history_file)
 
     def respond(self, text: str, user_name: str = "User", *, max_iterations: int = 8, on_delta=None, on_reasoning=None, on_metrics=None, cancelled=lambda: False, response_history=None, record_user=True) -> ModelResponse:

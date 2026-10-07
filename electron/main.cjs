@@ -1,20 +1,26 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen, session, shell, Tray, Menu, nativeImage, systemPreferences } = require('electron');
 // Hardware acceleration is Electron's default; keep WebGL and GPU rasterization enabled.
 app.commandLine.appendSwitch('enable-gpu-rasterization');
+// Linux Wayland: the overlay needs X11 (placement, always-on-top, click-through) and Ozone is chosen before this file
+// runs, so a launch without a platform (a double-clicked AppImage, a terminal) relaunches once under XWayland.
+if(process.platform==='linux'&&process.env.WAYLAND_DISPLAY&&!app.commandLine.hasSwitch('ozone-platform')){app.relaunch({...(process.env.APPIMAGE?{execPath:process.env.APPIMAGE}:{}),args:[...process.argv.slice(1),'--ozone-platform=x11']});app.exit(0);return;}
 const path = require('path');
 const fs = require('fs');
 const YAML = require('yaml');
 let root = app.isPackaged?process.resourcesPath:path.resolve(__dirname, '..');
-let backendProcess,sovitsProcess,setupWindow,shutdownRequested=false;
-if(app.isPackaged&&!app.requestSingleInstanceLock())app.quit();
+let backendProcess,sovitsProcess,setupWindow,shutdownRequested=false,settingsDirty=false;
+// A second launch only wakes the running instance. app.quit() before ready still runs whenReady callbacks, which
+// would spawn a second backend (loading the model again) and GPT-SoVITS, so stop evaluating this file here.
+if(app.isPackaged&&!app.requestSingleInstanceLock()){app.quit();return;}
 app.on('second-instance',()=>{if(setupWindow&&!setupWindow.isDestroyed())setupWindow.focus();else if(control&&!control.isDestroyed())showControls();});
 const release=require('./release.cjs');
+const {shortcutBindings}=require('./shortcuts.cjs');
 function setupSender(event){if(!setupWindow||setupWindow.isDestroyed()||event.sender.id!==setupWindow.webContents.id)throw new Error('Setup window required');}
-ipcMain.handle('setup-hardware',async event=>{setupSender(event);const hw=await release.hardware();try{hw.gpus=(await app.getGPUInfo('basic')).gpuDevice?.map(device=>device.deviceString||`GPU vendor ${device.vendorId}, device ${device.deviceId}`)||[];hw.vulkan=hw.gpus.join('\n')+'\n'+hw.vulkan;}catch{}return hw;});
+ipcMain.handle('setup-hardware',async event=>{setupSender(event);const hw=await release.hardware();try{hw.gpus=(await app.getGPUInfo('basic')).gpuDevice?.map(device=>device.deviceString||`GPU vendor ${device.vendorId}, device ${device.deviceId}`)||[];}catch{hw.gpus=[];}return hw;});
 ipcMain.handle('setup-directory',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openDirectory','createDirectory']});return result.canceled?null:result.filePaths[0];});
 ipcMain.handle('setup-model',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openFile'],filters:[{name:'GGUF models',extensions:['gguf']}]});return result.canceled?null:result.filePaths[0];});
 ipcMain.handle('setup-sovits',async event=>{setupSender(event);const result=await dialog.showOpenDialog(setupWindow,{properties:['openFile']});return result.canceled?null:result.filePaths[0];});
-ipcMain.handle('setup-finish',(event,values)=>{setupSender(event);const directory=release.saveSetup(values.directory,values.settings,process.resourcesPath);fs.writeFileSync(path.join(app.getPath('userData'),'data-location.json'),JSON.stringify({directory}));app.relaunch();app.quit();return true;});
+ipcMain.handle('setup-finish',(event,values)=>{setupSender(event);const directory=release.saveSetup(values.directory,values.settings,process.resourcesPath,release.installRoot(app.getPath('exe')));fs.writeFileSync(path.join(app.getPath('userData'),'data-location.json'),JSON.stringify({directory}));app.relaunch();app.quit();return true;});
 const brandIcon=path.join(root,'assets','tray.png');
 let debug = false;
 let overlay, control, whiteboard, effects;
@@ -22,10 +28,19 @@ let neuralDataWindow;
 ipcMain.handle('neural-data-open',event=>{
  if(!control||control.isDestroyed()||event.sender.id!==control.webContents.id)throw new Error('Settings renderer required');
  if(neuralDataWindow&&!neuralDataWindow.isDestroyed()){neuralDataWindow.show();neuralDataWindow.focus();return true;}
- neuralDataWindow=new BrowserWindow({width:1000,height:800,title:'Expression training data',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
+ neuralDataWindow=new BrowserWindow({width:1000,height:800,title:'Expression training data',backgroundColor:'#101116',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
  protectNavigation(neuralDataWindow);neuralDataWindow.loadURL(page('neural-data'));return true;
 });
-const overlayPointer=require('./overlay_input.cjs').overlayInput(enabled=>{if(overlay&&!overlay.isDestroyed())overlay.setIgnoreMouseEvents(!enabled,{forward:true});});
+const {overlayInput,pointerForwarder}=require('./overlay_input.cjs');
+const overlayPointer=overlayInput(enabled=>{if(overlay&&!overlay.isDestroyed())overlay.setIgnoreMouseEvents(!enabled,{forward:true});});
+// Linux only: emulate click-through forwarding for the overlay and the dock/compact chat, and, as Electron does, only
+// while a window ignores the mouse; a window taking it gets real events (a stale buttons=0 move would end its drags).
+let controlIgnoring=false;
+// Electron forwards only to the topmost window; the overlay sits under the chat, whiteboard and setup windows.
+const coveredByWindow=point=>[!controlIgnoring&&control,whiteboard,setupWindow,neuralDataWindow].some(w=>{if(!w||w.isDestroyed()||!w.isVisible())return false;const b=w.getBounds();return point.x>=b.x&&point.y>=b.y&&point.x<b.x+b.width&&point.y<b.y+b.height;});
+const linuxPointer=process.platform==='linux'?pointerForwarder({cursor:()=>screen.getCursorScreenPoint(),bounds:w=>w.getContentBounds(),
+ targets:()=>[!overlayPointer.interactive&&!coveredByWindow(screen.getCursorScreenPoint())&&overlay,controlIgnoring&&!windowGesture&&control].filter(w=>w&&!w.isDestroyed()&&w.isVisible()),
+ send:(w,point)=>w.webContents.send('forwarded-pointer',point)}):null;
 let tray;
 let controlMode='full',fullControlBounds,compactControlBounds;
 let boardMode='full',boardBounds,controlTween,boardTween,collapsedControlBounds;
@@ -40,7 +55,33 @@ const {windowAction} = require('./window_actions.cjs');
 let boardScreen = 0, geometryTimer;
 let displaySignature = '', displayPublishing = false;
 const API = 'http://127.0.0.1:8765';
-const patchBoard = body => fetch(API + '/api/surfaces/whiteboard', {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).catch(() => {});
+// The backend requires the install's API token (Code/process/app_core/desktop/api_guard.py). Main adds it
+// to every request to the backend at the network layer, so renderer JavaScript never sees it.
+// Both secrets are fresh on every backend start. Packaged builds generate them here, hand them to the
+// backend they spawn (no files) and send the token only once it reports that it holds the port; in
+// development the backend writes them beside its config after it holds the port, and main re-reads them
+// whenever the files change.
+let secretDirectory = '', ownSecrets = null;
+const secretCache = {};
+function backendSecret(name) {
+  if (ownSecrets) return ownSecrets.listening ? ownSecrets[name] : '';
+  if (!secretDirectory) return '';
+  const file = path.join(secretDirectory, name), cached = secretCache[name] || {mtime: 0, value: ''};
+  try { const stat = fs.statSync(file); if (stat.mtimeMs !== cached.mtime) secretCache[name] = {mtime: stat.mtimeMs, value: fs.readFileSync(file, 'ascii').trim()}; }
+  catch { secretCache[name] = {mtime: 0, value: ''}; }
+  return secretCache[name].value;
+}
+const apiToken = () => backendSecret('api_token');
+function injectApiToken() {
+  // Only 127.0.0.1: 'localhost' may resolve to ::1, where another account could listen.
+  session.defaultSession.webRequest.onBeforeSendHeaders({urls: ['http://127.0.0.1:8765/*', 'ws://127.0.0.1:8765/*']}, (details, callback) => {
+    const token = apiToken();
+    if (token && new URL(details.url).host === '127.0.0.1:8765') details.requestHeaders.Authorization = 'Bearer ' + token;
+    callback({requestHeaders: details.requestHeaders});
+  });
+}
+const backendFetch = (route, init = {}) => fetch(API + route, {...init, headers: {...init.headers, Authorization: 'Bearer ' + apiToken()}});
+const patchBoard = body => backendFetch('/api/surfaces/whiteboard', {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}).catch(() => {});
 const dev = process.env.RIKO_DEV === '1';
 function page(name) { return dev ? `http://localhost:5173/#/${name}` : `file://${path.join(__dirname, 'dist', 'index.html')}#/${name}`; }
 function displayList() {
@@ -53,7 +94,7 @@ async function publishDisplays() {
   if (displayPublishing || signature === displaySignature) return;
   displayPublishing = true;
   try {
-    const response = await fetch(API + '/api/displays', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: signature});
+    const response = await backendFetch('/api/displays', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: signature});
     if (response.ok) displaySignature = signature;
   } catch { /* Retry on the next backend snapshot/reconnection. */ }
   finally {displayPublishing = false;}
@@ -96,6 +137,9 @@ function createWindows(characterName='') {
   if(process.platform==='win32')control.hookWindowMessage(0x0202,()=>{if(windowGesture?.window===control)endWindowGesture();});
   control.webContents.once('did-finish-load',()=>{if(!debug){const a=screen.getPrimaryDisplay().workArea;setControlMode('collapsed',{x:a.x+a.width-80,y:a.y+a.height-70},true);}});
   control.on('close', event => {if (!app.isQuitting) {event.preventDefault();setControlMode(controlMode==='full'?'compact':'collapsed');}});
+  // Electron cancels a vetoed unload silently. before-quit already asked about unsaved Settings; a reload asks here.
+  control.webContents.on('will-prevent-unload',event=>{if(app.isQuitting||dialog.showMessageBoxSync(control,{type:'question',buttons:['Discard changes','Keep editing'],defaultId:1,cancelId:1,message:'Discard unsaved settings changes?'})===0){settingsDirty=false;event.preventDefault();}});
+  control.webContents.on('render-process-gone',()=>{settingsDirty=false;});
   control.on('hide',()=>{if(controlMode==='compact')compactControlBounds=control.getBounds();});
   control.on('minimize',()=>{if(app.isQuitting)return;control.setFocusable(false);control.restore();setControlMode('collapsed');});
   whiteboard = new BrowserWindow({width: 900, height: 700, minWidth: 320, minHeight: 240, show: false, frame:false, transparent:true, backgroundColor:'#00000000', skipTaskbar:true, alwaysOnTop:true, title: characterName?characterName+' — Whiteboard':'Whiteboard', webPreferences: {preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false}});
@@ -134,7 +178,7 @@ function setControlMode(mode,anchor,instant=false){
   if(control.isMaximized())control.unmaximize();
   const safeAnchor=anchor&&Number.isFinite(anchor.x)&&Number.isFinite(anchor.y)?anchor:undefined;
   const target=chatBounds(mode,current,area,safeAnchor,mode==='full'?fullControlBounds:mode==='collapsed'?collapsedControlBounds:compactControlBounds);
-  controlMode=mode;control.setMinimumSize(88,88);control.setResizable(mode==='full');control.setAspectRatio(0);control.setFocusable(mode!=='collapsed');control.setAlwaysOnTop(true);control.setIgnoreMouseEvents(mode!=='full',{forward:true});
+  controlMode=mode;control.setMinimumSize(88,88);control.setResizable(mode==='full');control.setAspectRatio(0);control.setFocusable(mode!=='collapsed');control.setAlwaysOnTop(true);control.setIgnoreMouseEvents(controlIgnoring=mode!=='full',{forward:true});
    applyWindowMaterial(control,mode,fullControlBlur);
   control.webContents.send('window-state',{maximized:false,mode,dockWidth:mode==='collapsed'?target.width:collapsedControlBounds?.width||88});tweenBounds(control,target,'chat',instant);
  }
@@ -152,11 +196,21 @@ function setBoardMode(mode,instant=false){
  whiteboard.setAlwaysOnTop(true);whiteboard.show();whiteboard.focus();
 }
 function showControls(view,mode=controlMode,anchor){if(view&&view!=='chat')mode='full';else if(mode==='collapsed')mode='compact';setControlMode(mode,anchor);if(control.isMinimized())control.restore();control.show();control.focus();if(view)control.webContents.send('navigate',view);}
+// macOS hands a process without microphone access silent buffers, not an error, so say so once (until access is granted).
+function microphoneNotice(blocked){
+  const marker=path.join(app.getPath('userData'),'microphone-blocked-notice');
+  if(!blocked){fs.rmSync(marker,{force:true});return;}
+  if(fs.existsSync(marker))return;
+  try{fs.writeFileSync(marker,'');}catch{}
+  dialog.showMessageBox({type:'info',buttons:['Open Settings','Not now'],defaultId:0,cancelId:1,message:'Riko cannot hear you',
+    detail:'Microphone access for Riko is off, so voice input records silence. Turn it on in System Settings → Privacy & Security → Microphone.'})
+    .then(({response})=>{if(response===0)shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone');}).catch(()=>{});
+}
 function createTray(characterName){
   const icon=nativeImage.createFromPath(brandIcon);
   if(icon.isEmpty())throw new Error('Tray icon is missing or invalid: assets/tray.png');
   tray=new Tray(icon.resize({width:24,height:24}));tray.setToolTip(characterName||'Companion');
-  tray.setContextMenu(Menu.buildFromTemplate([{label:'Open chat',click:()=>showControls('chat')},{label:'Start Discord client',click:async()=>{try{const response=await fetch(API+'/api/discord/start',{method:'POST'});if(!response.ok){let message='Discord could not be started';try{const body=await response.json();if(typeof body.detail==='string')message=body.detail;}catch{}dialog.showErrorBox('Discord',message);}}catch{dialog.showErrorBox('Discord','The Python backend is not available. Start it before launching Discord.');}}},{label:'Settings',click:()=>showControls('settings')},{label:'Appearance',click:()=>showControls('appearance')},{label:'Whiteboard',click:()=>{patchBoard({visible:true});setBoardMode('full');}},{type:'separator'},{label:'Quit',click:()=>app.quit()}]));
+  tray.setContextMenu(Menu.buildFromTemplate([{label:'Open chat',click:()=>showControls('chat')},{label:'Start Discord client',click:async()=>{try{const response=await backendFetch('/api/discord/start',{method:'POST'});if(!response.ok){let message='Discord could not be started';try{const body=await response.json();if(typeof body.detail==='string')message=body.detail;}catch{}dialog.showErrorBox('Discord',message);}}catch{dialog.showErrorBox('Discord','The Python backend is not available. Start it before launching Discord.');}}},{label:'Settings',click:()=>showControls('settings')},{label:'Appearance',click:()=>showControls('appearance')},{label:'Whiteboard',click:()=>{patchBoard({visible:true});setBoardMode('full');}},{type:'separator'},{label:'Quit',click:()=>app.quit()}]));
   tray.on('double-click',()=>showControls('chat'));
 }
 app.whenReady().then(async () => {
@@ -164,36 +218,44 @@ app.whenReady().then(async () => {
     if(app.isPackaged){
       const locator=path.join(app.getPath('userData'),'data-location.json');
       if(!fs.existsSync(locator)){
-        setupWindow=new BrowserWindow({width:1000,height:850,webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
+        // Standalone pages paint no canvas (morph.css keeps html/body transparent), so the window supplies style.css's --bg.
+        setupWindow=new BrowserWindow({width:1000,height:850,backgroundColor:'#101116',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false}});
         protectNavigation(setupWindow);await setupWindow.loadURL(page('setup'));return;
       }
       root=JSON.parse(fs.readFileSync(locator,'utf8')).directory;
       process.env.RIKO_CONFIG=path.join(root,'character_config.yaml');
-      backendProcess=release.startBackend(root,process.resourcesPath);
+      const crypto=require('crypto');
+      ownSecrets={api_token:crypto.randomBytes(32).toString('base64url'),confirm_key:crypto.randomBytes(32).toString('base64url'),listening:false};
+      // macOS attributes the backend's microphone use to this app, so it asks now; the answer does not hold up the model load.
+      release.askMicrophone(systemPreferences).then(state=>microphoneNotice(state==='blocked')).catch(()=>{});
+      // Nothing carries the token until the backend says it holds the port, and nothing does after it exits.
+      backendProcess=release.startBackend(root,process.resourcesPath,ownSecrets,()=>{ownSecrets.listening=true;publishProcesses(true);});
       backendProcess.on('error',error=>dialog.showErrorBox('Backend failed to launch',error.message));
-      backendProcess.on('exit',code=>{if(!app.isQuitting&&code)dialog.showErrorBox('Backend stopped','Review logs/backend-launch.log in your data folder. Open Settings to correct the model or backend configuration.');});
+      backendProcess.on('exit',code=>{ownSecrets.listening=false;if(!app.isQuitting&&code)dialog.showErrorBox('Backend stopped','Review logs/backend-launch.log in your data folder. Open Settings to correct the model or backend configuration.');});
     }
-    const configPath = path.resolve(root, process.env.RIKO_CONFIG || 'character_config.yaml');
+    // Resolve the config as run_server does (relative to RIKO_DATA_DIR in development), so main reads the
+    // secrets the backend wrote beside it.
+    const configPath = path.resolve(!app.isPackaged && process.env.RIKO_DATA_DIR ? process.env.RIKO_DATA_DIR : root, process.env.RIKO_CONFIG || 'character_config.yaml');
+    // In development the backend writes its secrets beside the config it loads; inject before any window loads.
+    secretDirectory = path.join(path.dirname(configPath), 'persistent_memories');
+    injectApiToken();
     const config = YAML.parse(fs.readFileSync(configPath, 'utf8')) || {};
     if(app.isPackaged){
       try{sovitsProcess=release.startSovits(config.sovits_ping_config);sovitsProcess?.on('error',error=>dialog.showErrorBox('GPT-SoVITS could not start',error.message));}
       catch(error){dialog.showErrorBox('GPT-SoVITS could not start',error.message);}
     }
     debug = config.desktop?.debug === true;
-    prepareAvatarAssets(); createWindows(config.presets?.default?.name || '');
+    prepareAvatarAssets(); createWindows(config.presets?.default?.name || ''); linuxPointer?.start();
     createTray(config.presets?.default?.name || '');
     for (const name of ['display-added', 'display-removed', 'display-metrics-changed']) {
       screen.on(name, () => {displaySignature = ''; publishDisplays();});
     }
     if (debug) control.show();
-    const shortcuts=config.desktop?.shortcuts||{};
     const actions={popup:()=>showControls(),quit:()=>app.quit(),whiteboard:()=>patchBoard({visible:!whiteboard.isVisible()}),
       settings:()=>showControls('settings'),
-      mic:()=>fetch(API+'/api/mic/toggle',{method:'POST'}).catch(()=>{}),audio:()=>fetch(API+'/api/audio/toggle',{method:'POST'}).catch(()=>{}),sleep:()=>fetch(API+'/api/sleep/toggle',{method:'POST'}).catch(()=>{})};
-    const defaults={popup:'CommandOrControl+Shift+Space',quit:'CommandOrControl+Shift+Q',whiteboard:'CommandOrControl+Shift+W',settings:'CommandOrControl+Shift+,'};
-    for(const [name,action] of Object.entries(actions)){
-      const accelerator=shortcuts[name]??defaults[name];
-      if(accelerator){try{if(!globalShortcut.register(accelerator,action))console.warn('Shortcut unavailable:',name,accelerator);}catch(error){console.warn('Invalid shortcut:',name,error.message);}}
+      mic:()=>backendFetch('/api/mic/toggle',{method:'POST'}).catch(()=>{}),audio:()=>backendFetch('/api/audio/toggle',{method:'POST'}).catch(()=>{}),sleep:()=>backendFetch('/api/sleep/toggle',{method:'POST'}).catch(()=>{})};
+    for(const [name,accelerator] of shortcutBindings(config.desktop?.shortcuts,Object.keys(actions))){
+      try{if(!globalShortcut.register(accelerator,actions[name]))console.warn('Shortcut unavailable:',name,accelerator);}catch(error){console.warn('Invalid shortcut:',name,error.message);}
     }
   } catch (error) {
     dialog.showErrorBox('Desktop startup failed', error.stack || error.message);
@@ -205,7 +267,7 @@ function publishProcesses(force=false,empty=false){
   if(!app.isReady())return;
   const body=JSON.stringify({processes:empty?[]:app.getAppMetrics().map(item=>({pid:item.pid,kind:['Browser','GPU','Renderer','Utility','Zygote','Sandbox helper'].includes(item.type)?item.type:'Utility'}))});
   if(!force&&body===processSignature)return;processSignature=body;
-  processUpdates=processUpdates.then(()=>fetch(API+'/api/resources/electron',{method:'POST',headers:{'Content-Type':'application/json'},body})).catch(()=>{processSignature='';});
+  processUpdates=processUpdates.then(()=>backendFetch('/api/resources/electron',{method:'POST',headers:{'Content-Type':'application/json'},body})).catch(()=>{processSignature='';});
 }
 app.whenReady().then(()=>publishProcesses());
 app.on('web-contents-created',(_event,contents)=>{contents.on('did-finish-load',()=>publishProcesses());contents.on('destroyed',()=>publishProcesses());contents.on('render-process-gone',()=>publishProcesses());});
@@ -213,13 +275,15 @@ app.on('gpu-info-update',()=>publishProcesses());
 app.on('child-process-gone',()=>publishProcesses());
 ipcMain.on('sync-processes',event=>{if([control,overlay,whiteboard,effects].some(window=>window&&!window.isDestroyed()&&window.webContents.id===event.sender.id))publishProcesses(true);});
 app.on('will-quit', () => {globalShortcut.unregisterAll();publishProcesses(true,true);});
-app.on('before-quit', event => {app.isQuitting = true;if(backendProcess&&!shutdownRequested){event.preventDefault();shutdownRequested=true;release.stopBackend(backendProcess).finally(()=>app.quit());}if(sovitsProcess)sovitsProcess.kill();endWindowGesture(); clearTimeout(geometryTimer);clearTimeout(controlTween);clearTimeout(boardTween);});
+// Ask before anything stops: once quitting, the backend is stopped first and unsaved Settings are discarded.
+app.on('before-quit', event => {if(!app.isQuitting&&settingsDirty&&control&&!control.isDestroyed()){setControlMode('full',undefined,true);if(dialog.showMessageBoxSync(control,{type:'question',buttons:['Quit and discard','Keep editing'],defaultId:1,cancelId:1,message:'Quit and discard unsaved settings changes?'})!==0){event.preventDefault();return;}}app.isQuitting = true;if(backendProcess&&!shutdownRequested){event.preventDefault();shutdownRequested=true;release.stopBackend(backendProcess).finally(()=>app.quit());}if(sovitsProcess)sovitsProcess.kill();linuxPointer?.stop();endWindowGesture(); clearTimeout(geometryTimer);clearTimeout(controlTween);clearTimeout(boardTween);});
+ipcMain.on('settings-dirty',(event,dirty)=>{if(control&&!control.isDestroyed()&&event.sender.id===control.webContents.id)settingsDirty=dirty===true;});
 ipcMain.on('show-control', event => {if([overlay,control,whiteboard].some(w=>w&&!w.isDestroyed()&&w.webContents.id===event.sender.id))showControls();});
 function chromeWindow(event){const window=[control,whiteboard].find(w=>w&&!w.isDestroyed()&&w.webContents.id===event.sender.id);if(!window)throw new Error('Control or whiteboard renderer required');return window;}
 ipcMain.handle('window-state',event=>{const w=chromeWindow(event);return {maximized:w.isMaximized(),mode:w===control?controlMode:boardMode,dockWidth:collapsedControlBounds?.width||88};});
 ipcMain.handle('window-action',(event,action,anchor,instant)=>{const w=chromeWindow(event);if(['close','minimize'].includes(action)){if(w===control)setControlMode(controlMode==='full'?'compact':'collapsed',anchor,instant===true);else setBoardMode('collapsed',instant===true);return {mode:w===control?controlMode:boardMode};}if(w===control&&action==='maximize'&&controlMode!=='full')setControlMode('full',anchor,instant===true);return windowAction(w,action);});
 ipcMain.handle('chat-mode',(event,mode,anchor,instant)=>{const w=chromeWindow(event);if(w===control)setControlMode(mode,anchor,instant===true);else setBoardMode(mode,instant===true);return {mode:w===control?controlMode:boardMode};});
-ipcMain.on('compact-interactive',(event,enabled)=>{if(controlMode!=='full'&&event.sender.id===control.webContents.id&&!windowGesture)control.setIgnoreMouseEvents(!enabled,{forward:true});});
+ipcMain.on('compact-interactive',(event,enabled)=>{if(controlMode!=='full'&&event.sender.id===control.webContents.id&&!windowGesture)control.setIgnoreMouseEvents(controlIgnoring=!enabled,{forward:true});});
 ipcMain.on('window-gesture',(event,value)=>{
  const w=[control,whiteboard].find(w=>w&&!w.isDestroyed()&&w.webContents.id===event.sender.id);
  if(!w||!value||typeof value.id!=='string'||value.id.length>64)return;
@@ -227,7 +291,7 @@ ipcMain.on('window-gesture',(event,value)=>{
  if(value.phase!=='begin'||!['move','resize'].includes(value.kind)||(value.kind==='resize'&&(w!==control||controlMode==='full')))return;
  endWindowGesture();clearTimeout(w===control?controlTween:boardTween);w.webContents.send('window-state',{transitioning:false});
  const g={id:value.id,window:w,kind:value.kind,mode:controlMode,bounds:w.getBounds(),cursor:screen.getCursorScreenPoint(),began:Date.now()};
- windowGesture=g;w.setIgnoreMouseEvents(false);
+ windowGesture=g;w.setIgnoreMouseEvents(false);if(w===control)controlIgnoring=false;
  function frame(){
   if(windowGesture!==g)return;
   if(w.isDestroyed()||Date.now()-g.began>60000){endWindowGesture();return;}
@@ -257,6 +321,23 @@ ipcMain.handle('capture-whiteboard', async (event, rect) => {
   return image.toPNG();
 });
 ipcMain.handle('displays', () => displayList());
+// Security-sensitive changes (native library, programs Riko starts, unattended tools, Discord access) need
+// the user's approval here. The signature uses the confirmation key, which never leaves main and the backend,
+// over the exact change the backend asked to confirm, so a compromised page cannot approve it silently.
+ipcMain.handle('confirm-security-change', async (event, challenge) => {
+  if (!control || control.isDestroyed() || event.sender.id !== control.webContents.id) throw new Error('Settings window required');
+  let change;
+  try { change = JSON.parse(challenge); } catch { throw new Error('Invalid confirmation request'); }
+  const titles = {settings: 'Change security-sensitive settings?', tool_approvals: 'Let these tools run without asking first?', discord_access: 'Change who can use Riko from Discord?'};
+  // Show control, invisible and direction-changing characters as escapes, so the text shown is what gets signed.
+  const visible = text => String(text).replace(/[\p{C}\p{Zl}\p{Zp}]/gu, c => `\\u{${c.codePointAt(0).toString(16)}}`);
+  const lines = Object.entries(change.changes || {}).map(([key, value]) => `${visible(key)}: ${visible(JSON.stringify(value))}`);
+  const {response} = await dialog.showMessageBox(control, {type: 'warning', buttons: ['Cancel', 'Allow'], defaultId: 0, cancelId: 0, noLink: true,
+    message: titles[change.action] || 'Confirm this change?', detail: lines.join('\n') + '\n\nOnly allow this if you made this change yourself.'});
+  const key = backendSecret('confirm_key');
+  if (response !== 1 || !key) return null;
+  return require('crypto').createHmac('sha256', key).update(challenge).digest('hex');
+});
 ipcMain.handle('pick-path', async (event, options={}) => {
   if(!control||event.sender.id!==control.webContents.id)throw new Error('Path selection is limited to controls');
   const result=await dialog.showOpenDialog(control,{title:options.directory?'Choose a folder':'Choose a file',
