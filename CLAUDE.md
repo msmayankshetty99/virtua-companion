@@ -44,7 +44,7 @@ python -u Code/task_mcp_server.py --store persistent_memories/tasks.sqlite3   # 
 
 Test caveats:
 - Use `HF_HUB_OFFLINE=1`: otherwise `tests/test_emotion.py` downloads Julia-1 (unpinned) and imports code from it.
-- `tests/test_settings_store.py::test_current_character_configuration_has_valid_settings` validates the private, gitignored `character_config.yaml` and skips when it is absent (a fresh clone). The full suite passes with no failures on macOS and Linux (the windows-2022 CI leg has not had a run yet); `.github/workflows/ci.yml` runs it on every push and pull request (ubuntu, windows, macOS, with the hash-locked deps and `--timeout=300`, which needs pytest-timeout from the lock or the `[test]` extra).
+- `tests/test_settings_store.py::test_current_character_configuration_has_valid_settings` validates the private, gitignored `character_config.yaml` and skips when it is absent (a fresh clone). The full suite passes with no failures; `.github/workflows/ci.yml` runs it on every push and pull request (ubuntu, windows, macOS, with the hash-locked deps and `--timeout=300`, which needs pytest-timeout from the lock or the `[test]` extra).
 - Some tests use cwd-relative paths (`Path('Code')`, `Path('.')`), and `electron/src/formatted_text.test.mjs` / `polished_ui.test.mjs` start Vite SSR servers, so keep the working directories above.
 - Every GPU and audio-device path is mocked except `tests/test_native_smoke.py` (marker `native`, skipped unless its env vars are set); a green default suite says nothing about CUDA, Metal or ROCm behaviour.
 
