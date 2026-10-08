@@ -6,14 +6,23 @@ import math
 import threading
 import time
 import uuid
-import os
 import re
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
+
+from .atomic import atomic_write
+from .preserve import preserve_unreadable
 
 logger = logging.getLogger(__name__)
 MEMORY_TYPES = ("episodic", "factual", "semantic", "preference", "relationship", "procedural")
+# The store is a list of memories (version 1), or {"version": N, "records": [...]}. Every build before this one reads only
+# the list, so version 1 is written in the layout it was read in, and the wrapper is written only once a store has
+# been wrapped or a version bump needs it. Bump the version only for a change older builds cannot read safely (they
+# refuse a newer store, untouched), with the step that upgrades the one before it. Added fields need no bump: unknown
+# keys are kept and written back unchanged, so a downgrade keeps them.
+STORE_VERSION = 1
+STORE_MIGRATIONS = {}  # {version: function(records at that version) -> records at version + 1}
 # Per captured memory: the recent dialogue it formed in, and a cap on every string and list in that context.
 FORMATION_HISTORY_MESSAGES, FORMATION_TEXT_CHARS, FORMATION_LIST_ITEMS = 12, 1000, 20
 
@@ -68,6 +77,62 @@ class MemoryRecord:
     user_fields: list[str] = field(default_factory=list)
     formation_context: dict = field(default_factory=dict)
     reflection_kind: str = ""
+
+
+def _unit(value):
+    number = float(value) if isinstance(value, str) else value
+    if type(number) not in (int, float) or not math.isfinite(number): raise ValueError('a number from 0 to 1')
+    return min(1.0, max(0.0, float(number)))
+
+
+def _whole(minimum):
+    def check(value):
+        if type(value) is not int or value < minimum: raise ValueError(f'a whole number of at least {minimum}')
+        return value
+    return check
+
+
+def _flag(value):
+    if type(value) is bool: return value
+    if isinstance(value, str) and value.strip().casefold() in {'true', 'false'}: return value.strip().casefold() == 'true'
+    if type(value) is int and value in (0, 1): return bool(value)
+    raise ValueError('true or false')
+
+
+def _kind(expected, label):
+    def check(value):
+        if not isinstance(value, expected): raise ValueError(label)
+        return value
+    return check
+
+
+def _choice(*options):
+    def check(value):
+        if not isinstance(value, str) or value not in options: raise ValueError(' or '.join(options))
+        return value
+    return check
+
+
+def _strings(value):
+    if isinstance(value, str): value = [value]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value): raise ValueError('a list of strings')
+    return value
+
+
+def _revisions(value):
+    if not isinstance(value, dict) or not all(type(item) is int for item in value.values()): raise ValueError('an object of revision numbers')
+    return value
+
+
+# Every MemoryRecord field but text and id (whose damage is structural): a stored value either passes, is read
+# losslessly ('0.8' as 0.8, 1.5 clamped to 1), or the field takes its default; the loader logs each change.
+FIELD_CHECKS = {'memory_type': _kind(str, 'text'), 'importance': _unit, 'confidence': _unit, 'tags': _strings,
+    'source': _kind(str, 'text'), 'created_at': _kind(str, 'a date/time string'), 'last_accessed': _kind(str, 'a date/time string'),
+    'access_count': _whole(0), 'revision': _whole(1), 'active': _flag,
+    'classification_status': _choice('pending', 'complete', 'error'), 'reflection_status': _choice('pending', 'complete', 'skipped', 'error'),
+    'processing_error': _kind(str, 'text'), 'derived': _flag, 'source_ids': _strings, 'source_revisions': _revisions,
+    'user_fields': _strings, 'formation_context': _kind(dict, 'an object'), 'reflection_kind': _kind(str, 'text')}
+RECORD_FIELDS = frozenset(item.name for item in fields(MemoryRecord))
 
 
 class JuliaMemoryDecider:
@@ -168,26 +233,60 @@ class MemoryStore:
         self.worker = self.workers[0]
 
     def _load_records(self):
-        if not self.config.store_file.exists(): return []
+        """Read the store, failing closed (raising, never writing) only when its structure cannot be trusted.
+
+        A field with a wrong value is read losslessly where possible or reset to its default, with a warning, and the
+        file as it was is kept aside before the first save. Keys this build does not know are kept per record (and
+        at the top level) and written back unchanged.
+        """
+        self.extra_fields, self.extra_store_fields, self.repaired_store, self.wrapped_store = {}, {}, False, False
+        path = self.config.store_file
+        if not path.exists(): return []
         try:
-            raw = json.loads(self.config.store_file.read_text(encoding="utf-8"))
-            if not isinstance(raw, list): raise ValueError("Expected memory list")
-            records = [MemoryRecord(**item) for item in raw]
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list): version, items = 1, raw  # the original, unversioned layout
+            elif isinstance(raw, dict) and isinstance(raw.get('records'), list) and type(raw.get('version')) is int and raw['version'] >= 1:
+                version, items, self.wrapped_store = raw['version'], raw['records'], True
+                self.extra_store_fields = {key: value for key, value in raw.items() if key not in {'version', 'records'}}
+            else: raise ValueError('Expected {"version": N, "records": [...]} or a list of memories')
+            if version > STORE_VERSION: raise ValueError(f'It was written by a newer Riko (store version {version}; this one reads up to {STORE_VERSION})')
+            for step in range(version, STORE_VERSION): items = STORE_MIGRATIONS[step](items)
+            records, repairs = [], []
+            for number, item in enumerate(items, 1):
+                if not isinstance(item, dict) or not isinstance(item.get('text'), str): raise ValueError(f'Memory {number} is not an object with text')
+                if 'id' in item and (not isinstance(item['id'], str) or not item['id']): raise ValueError(f'Memory {number} has an invalid id')
+                values, changed = {key: item[key] for key in ('text', 'id') if key in item}, []
+                for name, check in FIELD_CHECKS.items():
+                    if name not in item: continue
+                    try:
+                        values[name] = check(item[name])
+                        if values[name] != item[name]: changed.append((name, 'read as'))
+                    except (TypeError, ValueError, OverflowError) as exc: changed.append((name, f'is not {exc}; reset to'))
+                record = MemoryRecord(**values)
+                repairs += [f'memory {record.id}: {name} {item[name]!r:.80} {how} {getattr(record, name)!r:.80}' for name, how in changed]
+                if extra := {key: value for key, value in item.items() if key not in RECORD_FIELDS}: self.extra_fields[record.id] = extra
+                records.append(record)
             if len({record.id for record in records}) != len(records): raise ValueError("Duplicate memory IDs")
-            return records
         except Exception as exc:
             # Never replace a corrupt/incompatible store with defaults or an empty file.
-            raise RuntimeError(f"Unable to read memory store {self.config.store_file}: {exc}") from exc
+            raise RuntimeError(f"Unable to read memory store {path}: {exc}") from exc
+        for repair in repairs: logger.warning('Memory store %s: %s', path.name, repair)
+        self.repaired_store = bool(repairs) or version < STORE_VERSION  # a migrated store is also kept once as it was
+        if repairs:
+            self.pipeline_error = f'{len(repairs)} invalid memory field(s) were reset (see the log); the next save keeps the file as it was as {path.name}.unreadable-<time>'
+        return records
 
     def _save(self):
         with self.lock:
-            self.config.store_file.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.config.store_file.with_suffix(self.config.store_file.suffix + '.tmp')
-            with temporary.open('w', encoding='utf-8') as stream:
-                json.dump([asdict(record) for record in self.records], stream, indent=2, ensure_ascii=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.config.store_file)
+            if self.repaired_store:
+                # Keep the file as it was before repaired or migrated values replace it, by copy only: on a full disk a
+                # move would leave no store at all once the write fails. Raises OSError if it cannot be kept.
+                backup = preserve_unreadable(self.config.store_file, move=False)
+                if backup: logger.warning('Kept the memory store as it was before repairs or migration as %s', backup.name)
+            records = [{**asdict(record), **self.extra_fields.get(record.id, {})} for record in self.records]
+            store = {'version': STORE_VERSION, 'records': records, **self.extra_store_fields} if self.wrapped_store or STORE_VERSION > 1 else records
+            atomic_write(self.config.store_file, json.dumps(store, indent=2, ensure_ascii=False))
+            self.repaired_store = False
 
     def _find(self, record_id):
         return next((record for record in self.records if record.id == record_id), None)
@@ -273,6 +372,7 @@ class MemoryStore:
                 if more <= removed: break
                 removed |= more
             self.records = [r for r in self.records if r.id not in removed]
+            for record_id in removed: self.extra_fields.pop(record_id, None)
             self._save()
             self.index_dirty = True
             self.condition.notify_all()
@@ -487,8 +587,9 @@ class MemoryStore:
             terms = set(re.findall(r'\w+', (record.text + ' ' + ' '.join(record.tags)).casefold()))
             overlap = len(words & terms) / max(1, len(words))
             similarity = max(0, semantic.get((record.id, record.revision), 0))
+            # A bad or pre-1970 date (OSError on Windows) costs only the recency bonus, never the turn.
             try: age = max(0, time.time() - datetime.fromisoformat(record.created_at).timestamp())
-            except ValueError: age = 0
+            except (TypeError, ValueError, OverflowError, OSError): age = 0
             return overlap * .55 + similarity * .3 + record.importance * .1 + .05 / (1 + age / 86400)
         selected, tokens = [], 0
         for record in sorted(records, key=rank, reverse=True):

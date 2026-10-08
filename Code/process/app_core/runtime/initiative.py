@@ -12,6 +12,7 @@ from .workers import DaemonExecutor
 
 from ..events.bus import event_bus
 from ..conversation.messages import ChatMessage, conversation_sections
+from ..persistence.atomic import atomic_write
 
 
 DEFAULTS = {'enabled': False, 'observe_idle': False, 'observe_active_app': False,
@@ -168,10 +169,7 @@ class Initiative:
     def update(self, settings):
         with self.lock:
             settings = self.validate({**self.settings, **settings})
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix('.tmp')
-            temporary.write_text(json.dumps(settings, indent=2), encoding='utf-8')
-            os.replace(temporary, self.path)
+            atomic_write(self.path, json.dumps(settings, indent=2))
             self.settings = settings
             self.version += 1
             self.environment = {}

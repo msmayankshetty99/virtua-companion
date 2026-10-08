@@ -12,6 +12,7 @@ import tempfile
 import threading
 
 from .config import load_config
+from ..persistence.atomic import atomic_write
 
 LOCK = threading.RLock()
 OBSOLETE = {'avatar.camera.distance', 'avatar.expression_engine', 'avatar.view', 'desktop.shortcuts.effects',
@@ -437,10 +438,7 @@ class SettingsStore:
                 os.replace(temporary, self.path)
                 # Live initiative preferences share these budgets. Preserve all
                 # other preferences while saving model/runtime budgets together.
-                if saved_preferences is not None:
-                    pending = preferences.with_suffix('.settings.tmp')
-                    pending.write_text(json.dumps(saved_preferences, indent=2), encoding='utf-8')
-                    pending.replace(preferences)
+                if saved_preferences is not None: atomic_write(preferences, json.dumps(saved_preferences, indent=2))
             finally: Path(temporary).unlink(missing_ok=True)
             return {**self.snapshot(), 'saved': True, 'restart_required': any(not key.startswith('avatar.') and key not in {'runtime.pause_background_on_live', 'emotion.probe.interval_tokens'} for key in changes)}
 

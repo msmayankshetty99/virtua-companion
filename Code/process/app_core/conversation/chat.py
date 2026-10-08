@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 from pathlib import Path
 from typing import Callable
 
 from .messages import ChatMessage, ModelResponse, conversation_sections
 from .output_filter import OutputFilter, clean_output
+from ..persistence.atomic import atomic_write
 from ..persistence.preserve import preserve_unreadable
 
 logger = logging.getLogger(__name__)
@@ -71,15 +71,18 @@ class ChatService:
         return True
 
     def _save_history(self):
-        if not self.history_file: return
-        if self._unreadable_history and not self._preserve_unreadable_history(): return
-        self.history_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.history_file.with_suffix(self.history_file.suffix + '.tmp')
-        with temporary.open('w', encoding='utf-8') as stream:
-            stream.write(json.dumps([m.as_record() for m in self.history], indent=2))
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(self.history_file)
+        """Rewrite the whole history file; return whether it now holds the history.
+
+        A write that fails is logged, never raised: it runs after the reply was shown or spoken, which must not turn
+        into an error, and the next save rewrites the whole file. An unreadable file is still never saved over.
+        """
+        if not self.history_file: return True
+        if self._unreadable_history and not self._preserve_unreadable_history(): return False
+        try: atomic_write(self.history_file, json.dumps([m.as_record() for m in self.history], indent=2))
+        except OSError as exc:
+            logger.error('Could not save chat history to %s (%s); the next save retries', self.history_file.name, exc)
+            return False
+        return True
 
     def respond(self, text: str, user_name: str = "User", *, max_iterations: int = 8, on_delta=None, on_reasoning=None, on_metrics=None, cancelled=lambda: False, response_history=None, record_user=True) -> ModelResponse:
         from ..runtime.cancellation import TurnCancelled

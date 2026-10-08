@@ -4,12 +4,12 @@ from ..runtime.workers import DaemonExecutor
 from hashlib import sha256
 import json
 import logging
-import os
 import threading
 import time
 
 from ..events.bus import event_bus
 from ..events.outbox import Outbox
+from ..persistence.atomic import atomic_write
 from .wake_capture import WakeCapture, prepare_audio
 
 
@@ -185,11 +185,8 @@ class WakeWord:
             if self.recording is not None or (self.job and not self.job.done()):
                 raise ValueError('Wait until recording has finished')
             if len(self.samples) < 6: raise ValueError('Record all six samples first')
-            self.directory.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix('.tmp')
-            temporary.write_text(json.dumps({'key': self.path.stem, 'embeddings': self.samples,
-                                            'model_type': 'resnet_50_arc', 'threshold': self.threshold}), encoding='utf8')
-            os.replace(temporary, self.path)
+            atomic_write(self.path, json.dumps({'key': self.path.stem, 'embeddings': self.samples,
+                                                'model_type': 'resnet_50_arc', 'threshold': self.threshold}))
             self.embeddings = list(self.samples)
             self.calibrating = False
             self.deadline = 0
@@ -204,9 +201,7 @@ class WakeWord:
             if self.path and self.embeddings:
                 data = json.loads(self.path.read_text(encoding='utf8'))
                 data['threshold'] = threshold
-                temporary = self.path.with_suffix('.tmp')
-                temporary.write_text(json.dumps(data), encoding='utf8')
-                os.replace(temporary, self.path)
+                atomic_write(self.path, json.dumps(data))
         self.publish()
 
     def set_testing(self, enabled):

@@ -7,6 +7,8 @@ from pathlib import Path
 import struct
 import threading
 
+from ..persistence.atomic import atomic_write
+
 BONES = {'hips', 'spine', 'chest', 'upperChest', 'neck', 'head', 'leftEye', 'rightEye', 'jaw'}
 for side in ('left', 'right'):
     BONES.update(side + name for name in ('UpperLeg', 'LowerLeg', 'Foot', 'Toes', 'Shoulder', 'UpperArm', 'LowerArm', 'Hand'))
@@ -176,7 +178,4 @@ class AnimationLibrary:
             return deepcopy(updated)
 
     def _save(self):
-        self.directory.mkdir(parents=True, exist_ok=True)
-        temporary = self.manifest.with_suffix('.json.tmp')
-        temporary.write_text(json.dumps({'version': 1, 'entries': list(self.entries.values())}, indent=2), encoding='utf-8')
-        temporary.replace(self.manifest)
+        atomic_write(self.manifest, json.dumps({'version': 1, 'entries': list(self.entries.values())}, indent=2))

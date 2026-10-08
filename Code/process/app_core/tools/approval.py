@@ -3,11 +3,11 @@ from copy import deepcopy
 from contextvars import ContextVar
 import json
 import logging
-import os
 import threading
 import time
 import uuid
 from ..events.bus import event_bus
+from ..persistence.atomic import atomic_write
 from ..persistence.preserve import preserve_unreadable
 
 approval_turn = ContextVar('approval_turn', default=None)
@@ -50,13 +50,7 @@ class ToolApprovals:
                 base = {name: True for name in names}
             else: base = self.policy
             updated = {**base, **policy}
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix('.tmp')
-            with temporary.open('w', encoding='utf-8') as stream:
-                stream.write(json.dumps(updated, indent=2))
-                stream.flush()
-                os.fsync(stream.fileno())
-            temporary.replace(self.path)
+            atomic_write(self.path, json.dumps(updated, indent=2))
             self.policy, self.error = updated, ''
         event_bus.publish('tool.approval_policy')
         return self.snapshot()

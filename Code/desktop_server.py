@@ -25,6 +25,7 @@ from process.app_core.runtime.initiative import Initiative
 from process.app_core.persistence.tasks import TaskConflict
 from process.app_core.events.stream import stream_events
 from process.app_core.persistence.conversation_store import ConversationStore
+from process.app_core.persistence.atomic import atomic_write
 from process.app_core.runtime.lifecycle import close_bounded, run_bounded
 from process.app_core.desktop.media import resolve_media
 from fastapi.responses import FileResponse
@@ -725,16 +726,17 @@ def displays(request: list[Display]):
     state._emit('displays', values)
     return {'accepted': True}
 
+
+desktop_settings_write = threading.Lock()  # avatar geometry PATCHes still write in order
+
 @app.patch('/api/surfaces/avatar')
 def avatar_surface(request: dict[str, StrictInt]):
     try: state.update_geometry('avatar', **request)
     except ValueError as exc: raise HTTPException(400, str(exc))
-    path = config.root / 'persistent_memories' / 'desktop_settings.json'
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.tmp')
-    with state._lock:
-        temporary.write_text(json.dumps({'avatar_geometry': state.avatar_geometry}), encoding='utf-8')
-        temporary.replace(path)
+    # Write outside DesktopState's lock (bus listeners and turns take it): a durable write can take a while.
+    with desktop_settings_write:
+        with state._lock: payload = json.dumps({'avatar_geometry': state.avatar_geometry})
+        atomic_write(config.root / 'persistent_memories' / 'desktop_settings.json', payload)
     return snapshot()
 
 @app.get('/api/tasks/{task_id}')
