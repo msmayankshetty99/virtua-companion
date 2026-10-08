@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from ...audio.tts_http import synthesize_wav
-from ...runtime.cancellation import TurnCancelled
+from ...kernel.cancellation import TurnCancelled
 
 MAX_AUDIO_SECONDS = 60
 MAX_PCM_BYTES = 16000 * 2 * MAX_AUDIO_SECONDS

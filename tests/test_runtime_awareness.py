@@ -9,7 +9,7 @@ from process.app_core.conversation.chat import ChatService
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import RuntimeEvent
 from process.app_core.runtime.interjections import Interjections
-from process.app_core.conversation.messages import ChatMessage, ModelResponse, ToolCall
+from process.app_core.kernel.messages import ChatMessage, ModelResponse, ToolCall
 from process.app_core.runtime.session import SessionManager
 from process.app_core.tools.registry import ToolRegistry
 from process.app_core.audio.voice_input import VoiceInput

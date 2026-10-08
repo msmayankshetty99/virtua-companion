@@ -10,7 +10,7 @@ import pytest
 import run_server
 from process.app_core.configuration.debug_logging import SafeFormatter, configure_logging
 
-LOGGERS = ('', 'process.app_core', 'desktop_server', 'process.app_core.inference.metrics')  # '' is the root logger
+LOGGERS = ('', 'process.app_core', 'desktop_server', 'process.app_core.kernel.metrics')  # '' is the root logger
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +41,7 @@ def test_desktop_debug_sets_application_levels_only(tmp_path, debug):
 def test_explicit_level_wins_and_unknown_levels_fall_back_to_info(tmp_path):
     configure_logging(config(tmp_path, debug=True, level='warning', inference_timings=False))
     assert logging.getLogger('process.app_core').level == logging.WARNING
-    assert logging.getLogger('process.app_core.inference.metrics').level == logging.WARNING
+    assert logging.getLogger('process.app_core.kernel.metrics').level == logging.WARNING
     configure_logging(config(tmp_path, level='verbose'))
     assert logging.getLogger('desktop_server').level == logging.INFO
 

@@ -1,19 +1,18 @@
 """Backend entry point: standalone in development, Electron-owned in releases."""
 from pathlib import Path
-import asyncio
 import os
 import logging
 import sys
-
-import uvicorn
-
-from process.app_core.configuration.config import load_config
 
 # Imported lazily or dynamically, so a module or data file the frozen build misses would otherwise fail only on a
 # user's machine (tools/release/build.py collects them).
 RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'faster_whisper', 'ctranslate2', 'silero_vad',
     'onnxruntime', 'sounddevice', 'soundfile', 'scipy.signal', 'ruamel.yaml', 'pypdf', 'openai', 'huggingface_hub', 'discord',
-    'discord_bot')
+    'discord_bot', 'uvicorn')
+# kernel/, which code imports partly inside functions (chat's metrics, the background budgets): the release check imports
+# each by name, as it loads every name of the lazy process.app_core facade. tests/test_release_build.py keeps it equal to kernel/.
+KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('background_budget', 'cancellation', 'lifecycle', 'messages',
+    'metrics', 'output_filter', 'streaming', 'torch_device', 'workers'))
 # Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
 DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
 
@@ -24,16 +23,32 @@ def is_driver(name):
     return name.lower() == 'nvcuda.dll' or bool(re.fullmatch(r'libcuda\.(dylib|so(\.\d+)*)', name))
 
 
-class Server(uvicorn.Server):
-    """uvicorn, except that the active turn ends before requests drain: a reply still generating would hold its
-    request for the whole drain, and Electron allows the entire shutdown 15 s (electron/release.cjs)."""
-    def __init__(self, config, stop_turn):
-        super().__init__(config)
-        self.stop_turn = stop_turn
+def server_class():
+    import asyncio
+    import uvicorn
 
-    async def shutdown(self, sockets=None):
-        await asyncio.to_thread(self.stop_turn)
-        await super().shutdown(sockets=sockets)
+    class Server(uvicorn.Server):
+        """uvicorn, except that the active turn ends before requests drain: a reply still generating would hold its
+        request for the whole drain, and Electron allows the entire shutdown 15 s (electron/release.cjs)."""
+        def __init__(self, config, stop_turn):
+            super().__init__(config)
+            self.stop_turn = stop_turn
+
+        async def shutdown(self, sockets=None):
+            await asyncio.to_thread(self.stop_turn)
+            await super().shutdown(sockets=sockets)
+    return Server
+
+
+def __getattr__(name):
+    """uvicorn, Server and load_config load on first use and stay: frozen, every built-in tool call and the Discord client
+    re-execute this binary (--tool-worker, --discord-worker), and main() dispatches those before any of them loads."""
+    if name == 'uvicorn': import uvicorn as value
+    elif name == 'Server': value = server_class()
+    elif name == 'load_config': from process.app_core.configuration.config import load_config as value
+    else: raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    globals()[name] = value
+    return value
 
 
 def loaded_libraries(names):
@@ -91,7 +106,9 @@ def release_check(library=None):
             if directory: directory.close()
         problems = native_bundle_problems(library, loaded_libraries({file.name for file in library.parent.iterdir()} | DRIVER_LIBRARIES))
         if problems: raise SystemExit('The native bundle is not self-contained:\n  ' + '\n  '.join(problems))
-    for module in RELEASE_MODULES: importlib.import_module(module)
+    for module in RELEASE_MODULES + KERNEL_MODULES: importlib.import_module(module)
+    core = importlib.import_module('process.app_core')
+    for name in core.__all__: getattr(core, name)
     from eff_word_net.audio_processing import Resnet50_Arc_loss
     from silero_vad import load_silero_vad
     Resnet50_Arc_loss(); load_silero_vad()  # wake words and voice activity: both models are package data files
@@ -133,8 +150,9 @@ def main():
         import runpy
         runpy.run_module('discord_bot', run_name='__main__')
         return
+    this = sys.modules[__name__]  # uvicorn, Server and load_config resolve through __getattr__ (and tests replace them there)
     os.chdir(Path(os.environ.get('RIKO_DATA_DIR', Path(__file__).resolve().parents[1])))
-    config = load_config()
+    config = this.load_config()
     from process.app_core.configuration.debug_logging import configure_logging
     configure_logging(config)
     # Debug our application, not WebSocket frames. Uvicorn DEBUG dumps every
@@ -161,7 +179,7 @@ def main():
     listener.listen(2048)
     desktop_server.api_secrets()
     if os.environ.get('RIKO_MANAGED') == '1': print('RIKO_BACKEND_LISTENING', flush=True)  # see electron/release.cjs
-    server = Server(uvicorn.Config(desktop_server.app, host="127.0.0.1", port=8765,
+    server = this.Server(this.uvicorn.Config(desktop_server.app, host="127.0.0.1", port=8765,
                 log_level="info", timeout_graceful_shutdown=2), desktop_server.stop_turn)
     if os.environ.get('RIKO_MANAGED') == '1':
         import faulthandler

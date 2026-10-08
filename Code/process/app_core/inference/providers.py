@@ -8,8 +8,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 from typing import Iterable, Sequence
 
-from ..conversation.messages import ChatMessage, ModelResponse, ToolCall
-from ..conversation.streaming import WordDeltas
+from ..kernel.messages import ChatMessage, ModelResponse, ToolCall
+from ..kernel.streaming import WordDeltas
 from .responses import response_input, response_tools, template_messages
 
 
@@ -193,7 +193,7 @@ def cancellable_stream(start, cancelled=None):
     its socket down on cancellation, which wakes the blocked read (closing alone may not). It is per request on
     purpose: initiative and reflection share this provider, so a provider-wide cancel would stop them too.
     Any failure once cancelled is BackgroundPreempted, as from the llama.cpp providers."""
-    from .llama_context import BackgroundPreempted
+    from ..kernel.cancellation import BackgroundPreempted
     cancelled = cancelled or (lambda: False)
     opened, done, abandoned, closing = Future(), threading.Event(), threading.Event(), threading.Lock()
     def guard():

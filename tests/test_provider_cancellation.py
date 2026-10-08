@@ -8,8 +8,8 @@ import time
 import pytest
 
 from process.app_core.configuration.config import RuntimeConfig
-from process.app_core.conversation.messages import ChatMessage
-from process.app_core.inference.llama_context import BackgroundPreempted
+from process.app_core.kernel.messages import ChatMessage
+from process.app_core.kernel.cancellation import BackgroundPreempted
 from process.app_core.inference.providers import OpenAIProvider
 
 

@@ -16,18 +16,25 @@ import math
 import time
 from pathlib import Path
 from concurrent.futures import TimeoutError, wait
-from ..runtime.workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 from dataclasses import dataclass
 from typing import Any
 from typing import get_type_hints, get_args, get_origin
 import types
 
-from ..conversation.messages import ToolResult
+from ..kernel.messages import ToolResult
 
 logger = logging.getLogger(__name__)
 
 
 class ToolCancelled(RuntimeError): pass
+
+
+class ToolActivity:
+    """What ToolRegistry reports while tools run and load; DesktopState implements it for the UI. This one records nothing."""
+    def tool_started(self, name, arguments): return None  # an id tool_finished receives back
+    def tool_finished(self, name, result, error=False, activity_id=None): pass
+    def notify(self, source, text, level='info'): pass
 
 
 def _schema_for(annotation):
@@ -196,11 +203,12 @@ class HTTPMCPClient:
 
 
 class ToolRegistry:
-    def __init__(self, *, timeout_seconds=30.0, require_approval=False):
+    def __init__(self, *, timeout_seconds=30.0, require_approval=False, activity=None):
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0: raise ValueError('Tool timeout must be positive and finite')
         self.tools: dict[str, RegisteredTool] = {}
         self.timeout_seconds = timeout_seconds
         self.require_approval = require_approval
+        self.activity = activity if activity is not None else ToolActivity()
         self.clients = []
         self.executor = DaemonExecutor(max_workers=4, thread_name_prefix='tool')
         self._running = {}
@@ -278,8 +286,7 @@ class ToolRegistry:
             with self._execution_lock: self._processes.pop(process, None)
 
     def execute(self, name: str, arguments: dict[str, Any], call_id: str | None = None, *, cancelled=lambda: False) -> ToolResult:
-        from ..desktop.state import get_desktop_state
-        desktop_state = get_desktop_state()
+        activity = self.activity
         tool = self.tools.get(name)
         if not tool: return ToolResult(call_id or str(uuid.uuid4()), name, f"Unknown tool: {name}", True)
         if self._closed or cancelled(): return ToolResult(call_id or str(uuid.uuid4()), name, 'Tool registry closed or call cancelled', True)
@@ -314,7 +321,7 @@ class ToolRegistry:
                 else self.executor.submit(tool.client.call, tool.name, arguments, stop.is_set) if isinstance(tool.client, StdioMCPClient)
                 else self.executor.submit(tool.handler, arguments))
             self._running[name] = future
-        activity_id = desktop_state.tool_started(name, arguments)
+        activity_id = activity.tool_started(name, arguments)
         try:
             # Isolated workers enforce their own hard deadline, including teardown. Waiting in slices lets Stop end
             # the call now: the turn holds the turn lock meanwhile, so every new message would be refused as busy.
@@ -327,7 +334,7 @@ class ToolRegistry:
             if tool.remote and isinstance(result, dict):
                 result = result.get('structuredContent', result.get('content', result))
                 if isinstance(result, list): result = '\n'.join(item.get('text', '') for item in result if isinstance(item, dict) and item.get('type') == 'text')
-            desktop_state.tool_finished(name, result, error, activity_id=activity_id)
+            activity.tool_finished(name, result, error, activity_id=activity_id)
             if corrections: result = {'result':result,'effective_arguments':arguments,'input_corrections':corrections}
             return ToolResult(call_id or str(uuid.uuid4()), name, result, error)
         except ToolCancelled:
@@ -341,23 +348,23 @@ class ToolRegistry:
             message = ('Tool cancelled because its turn was stopped; ' + ('its worker was terminated.' if tool.isolated
                 else 'the MCP server was asked to stop it.' if stoppable else 'it may still finish and cause side effects. Retries are blocked until it finishes.')
                 + ' Prior side effects are not rolled back.')
-            desktop_state.tool_finished(name, message, True, activity_id=activity_id)
+            activity.tool_finished(name, message, True, activity_id=activity_id)
             return ToolResult(call_id or str(uuid.uuid4()), name, message, True)
         except TimeoutError:
             if isinstance(tool.client, StdioMCPClient): tool.client.close()
             message = ('Tool timed out; isolated worker terminated. Prior side effects are not rolled back.' if tool.isolated or isinstance(tool.client, StdioMCPClient)
                        else 'Tool timed out; its worker may still finish and cause side effects. Retries are blocked until it finishes.')
-            desktop_state.tool_finished(name, message, True, activity_id=activity_id)
+            activity.tool_finished(name, message, True, activity_id=activity_id)
             return ToolResult(call_id or str(uuid.uuid4()), name, message, True)
         except Exception as exc:
             logger.exception("Tool %s failed", name)
-            desktop_state.tool_finished(name, str(exc), True, activity_id=activity_id)
+            activity.tool_finished(name, str(exc), True, activity_id=activity_id)
             return ToolResult(call_id or str(uuid.uuid4()), name, str(exc), True)
 
     @classmethod
-    def from_config(cls, config):
+    def from_config(cls, config, activity=None):
         raw = json.loads(config.tools.mcp_config.read_text(encoding='utf-8')) if config.tools.mcp_config and config.tools.mcp_config.exists() else {}
-        registry = cls(timeout_seconds=config.tools.timeout_seconds, require_approval=config.tools.require_approval)
+        registry = cls(timeout_seconds=config.tools.timeout_seconds, require_approval=config.tools.require_approval, activity=activity)
         from .approval import ToolApprovals
         registry.approvals = ToolApprovals(config.root / 'persistent_memories' / 'tool_approvals.json', config.tools.require_approval)
         try:
@@ -373,8 +380,7 @@ class ToolRegistry:
                 except Exception as exc:
                     if client: client.close()
                     logger.warning('Could not load MCP server %s: %s', name, exc)
-                    from ..desktop.state import get_desktop_state
-                    get_desktop_state().notify('tools', f'MCP server {name} was not loaded: {exc}', 'error')
+                    registry.activity.notify('tools', f'MCP server {name} was not loaded: {exc}', 'error')
             return registry
         except BaseException:
             registry.close()

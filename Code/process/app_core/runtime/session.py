@@ -11,11 +11,11 @@ from ..events.bus import event_bus
 from .actions import ActionController
 from ..audio.speech import SpeechQueue
 from ..audio.speech_chunks import SpeechChunks
-from .cancellation import TurnCancelled
+from ..kernel.cancellation import TurnCancelled
 from .interjections import Interjections
-from ..conversation.messages import ChatMessage
+from ..kernel.messages import ChatMessage
 from ..audio.wake_word import WakeWord
-from .lifecycle import close_bounded
+from ..kernel.lifecycle import close_bounded
 from ..audio.wake_feedback import WakeFeedback
 
 logger = logging.getLogger(__name__)

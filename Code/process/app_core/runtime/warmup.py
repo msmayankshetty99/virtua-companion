@@ -4,7 +4,7 @@ import threading
 import time
 
 from ..events.bus import event_bus
-from .workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 
 
 def warm_components(jobs, timeout):

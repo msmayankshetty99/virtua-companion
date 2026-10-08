@@ -7,7 +7,7 @@ from collections import deque
 from pathlib import Path
 from typing import Callable
 
-from ..runtime.torch_device import validate as validate_device
+from ..kernel.torch_device import validate as validate_device
 from .models import EMOTIONS, EmotionEvent, EmotionState
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ def load_julia(julia, source, device, **options):
     Julia's FastEngine moves inputs to the device only for CUDA, so on MPS every predict fails
     ('Passed CPU tensor to MPS op'): run it on CPU there until upstream supports MPS.
     """
-    from ..runtime.torch_device import preserve_torch_globals, resolve
+    from ..kernel.torch_device import preserve_torch_globals, resolve
     target = resolve(device)
     if target == 'mps': logger.info('Julia 1 does not support MPS yet; using CPU'); target = 'cpu'
     with preserve_torch_globals():

@@ -11,7 +11,7 @@ import pytest
 
 from process.app_core.configuration.config import MemoryConfig
 from process.app_core.conversation.chat import ChatService
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import event_bus
 from process.app_core.integrations.discord.preferences import Preferences

@@ -195,7 +195,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError('emotion.probe requires emotion.enabled and runtime.provider: llama_cpp with a probe-enabled native library')
     if probe_config.enabled and not runtime.native_library:
         raise ValueError('emotion.probe requires runtime.native_library pointing to the in-process probe DLL')
-    from ..inference.background_budget import validate_budget
+    from ..kernel.background_budget import validate_budget
     from ..runtime.initiative import DEFAULTS as INITIATIVE_DEFAULTS
     initiative_raw = {**INITIATIVE_DEFAULTS, **raw.get('initiative', {})}
     validate_budget(initiative_raw['context_window_tokens'], initiative_raw['max_output_tokens'], 'initiative')

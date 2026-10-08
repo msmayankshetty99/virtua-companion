@@ -337,7 +337,7 @@ def test_setup_mode_keeps_settings_accessible_with_cors(backend,monkeypatch):
 
 def test_history_api_is_paginated_without_replaying_events(backend,monkeypatch):
     from process.app_core.persistence.conversation_store import ConversationStore
-    from process.app_core.conversation.messages import ChatMessage
+    from process.app_core.kernel.messages import ChatMessage
     store=ConversationStore(backend.config.root/'history.sqlite3',legacy=[ChatMessage('user',str(i)) for i in range(10)])
     monkeypatch.setattr(backend,'conversation_store',store)
     client=client_for(backend)

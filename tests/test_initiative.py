@@ -6,7 +6,7 @@ from process.app_core.conversation.chat import ChatService
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import event_bus
 from process.app_core.runtime.initiative import Initiative, DEFAULTS, InitiativeDecisionError, parse_decision
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 
 
@@ -175,7 +175,7 @@ def test_corrupt_optional_settings_fail_closed_without_overwriting(tmp_path, mon
 def test_idle_check_requests_tasks_through_read_only_tool(tmp_path, monkeypatch):
     from process.app_core.persistence.tasks import TaskStore, TaskMCP
     from process.app_core.tools.registry import ToolRegistry
-    from process.app_core.conversation.messages import ToolCall
+    from process.app_core.kernel.messages import ToolCall
     initiative = engine(tmp_path, monkeypatch)
     store = TaskStore(tmp_path / 'tasks.sqlite3')
     store.create('Write private report')

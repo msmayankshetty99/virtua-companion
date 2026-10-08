@@ -20,13 +20,13 @@ from process.app_core.factory import create_chat_service
 from process.app_core.desktop.state import get_desktop_state
 from process.app_core.events.bus import event_bus
 from process.app_core.runtime.session import SessionManager
-from process.app_core.runtime.cancellation import TurnCancelled
+from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.initiative import Initiative
 from process.app_core.persistence.tasks import TaskConflict
 from process.app_core.events.stream import stream_events
 from process.app_core.persistence.conversation_store import ConversationStore
 from process.app_core.persistence.atomic import atomic_write
-from process.app_core.runtime.lifecycle import close_bounded, run_bounded
+from process.app_core.kernel.lifecycle import close_bounded, run_bounded
 from process.app_core.desktop.media import resolve_media
 from fastapi.responses import FileResponse
 
@@ -282,7 +282,7 @@ def neural_replay(key:str):
         if getattr(probe,'replaying',False): raise HTTPException(409,'Example replay is already running')
         probe.replaying=True
     def replay():
-        from process.app_core.conversation.messages import ChatMessage
+        from process.app_core.kernel.messages import ChatMessage
         from uuid import uuid4
         import time
         try:

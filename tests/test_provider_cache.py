@@ -4,9 +4,9 @@ import threading
 import pytest
 
 from process.app_core.configuration.config import RuntimeConfig
-from process.app_core.conversation.messages import ChatMessage
+from process.app_core.kernel.messages import ChatMessage
 from process.app_core.inference.providers import OpenAIProvider
-from process.app_core.conversation.streaming import WordDeltas
+from process.app_core.kernel.streaming import WordDeltas
 
 
 def provider(create):

@@ -3,9 +3,9 @@ import logging
 import queue
 import threading
 import time
-from ..runtime.workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 
-from ..runtime.cancellation import TurnCancelled
+from ..kernel.cancellation import TurnCancelled
 from ..events.bus import event_bus
 from .asr import create_whisper
 from .voice_segments import VoiceSegments

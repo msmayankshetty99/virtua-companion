@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from process.app_core.runtime.cancellation import TurnCancelled
+from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.events.bus import RuntimeEvent
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 from process.app_core.desktop.state import DesktopState
 

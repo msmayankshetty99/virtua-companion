@@ -1,6 +1,6 @@
 """Few-shot EfficientWord-Net enrollment; no ASR runs while waiting for wake."""
 from collections import deque
-from ..runtime.workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 from hashlib import sha256
 import json
 import logging

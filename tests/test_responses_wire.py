@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from process.app_core.conversation.messages import ChatMessage, ToolCall
+from process.app_core.kernel.messages import ChatMessage, ToolCall
 from process.app_core.inference.responses import response_input, response_tools, template_messages, assemble_responses, sse_events
 from process.app_core.inference.llama_context import LlamaContextProvider
 

@@ -18,7 +18,7 @@ import time
 
 from .llama_context import LlamaContextProvider, context_capacity, native_arguments
 from .llama_runtime import check_native_build, resolve_model, validate_runtime
-from ..runtime.lifecycle import close_bounded
+from ..kernel.lifecycle import close_bounded
 
 logger = logging.getLogger(__name__)
 OUTPUT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
@@ -263,7 +263,7 @@ class NativeClient:
 
 def training_context(model):
     """The GGUF's {arch}.context_length: llama.cpp caps every slot's context there. None when unreadable."""
-    from ..resources.vram_estimate import read_gguf
+    from .gguf import read_gguf
     try: meta = read_gguf(model)
     except (OSError, ValueError, UnicodeDecodeError): return None
     value = meta.get(str(meta.get('general.architecture', '')) + '.context_length')

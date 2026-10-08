@@ -11,10 +11,10 @@ import pytest
 from process.app_core.persistence.conversation_store import ConversationStore
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import RuntimeEvent
-from process.app_core.runtime.lifecycle import close_bounded
-from process.app_core.conversation.messages import ChatMessage
+from process.app_core.kernel.lifecycle import close_bounded
+from process.app_core.kernel.messages import ChatMessage
 from process.app_core.tools.registry import RegisteredTool, ToolRegistry
-from process.app_core.runtime.workers import DaemonExecutor
+from process.app_core.kernel.workers import DaemonExecutor
 
 
 def test_archive_pages_sessions_and_interrupted_text_survive_restart(tmp_path):
@@ -102,7 +102,7 @@ def test_daemon_worker_shutdown_cancels_queued_jobs():
 
 def test_hung_worker_does_not_keep_python_process_alive():
     script='''import time, threading
-from process.app_core.runtime.workers import DaemonExecutor
+from process.app_core.kernel.workers import DaemonExecutor
 started=threading.Event()
 def stuck():
  started.set()
@@ -130,7 +130,7 @@ def test_factory_rolls_back_resources_after_partial_construction_failure(tmp_pat
     from process.app_core.configuration.config import AppConfig
     closed=[]
     monkeypatch.setattr(factory,'create_provider',lambda config:SimpleNamespace(close=lambda:closed.append('provider')))
-    monkeypatch.setattr(factory.ToolRegistry,'from_config',lambda config:SimpleNamespace(
+    monkeypatch.setattr(factory.ToolRegistry,'from_config',lambda config, activity=None:SimpleNamespace(
         register_mcp=lambda client:None, close=lambda:closed.append('registry')))
     def fail(*args,**kwargs): raise RuntimeError('memory failure')
     monkeypatch.setattr(factory,'MemoryStore',fail)

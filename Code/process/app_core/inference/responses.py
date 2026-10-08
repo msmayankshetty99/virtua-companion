@@ -2,8 +2,8 @@
 import json
 from dataclasses import replace
 
-from ..conversation.messages import ChatMessage, ModelResponse, ToolCall
-from ..conversation.streaming import WordDeltas
+from ..kernel.messages import ChatMessage, ModelResponse, ToolCall
+from ..kernel.streaming import WordDeltas
 
 
 def response_input(messages):

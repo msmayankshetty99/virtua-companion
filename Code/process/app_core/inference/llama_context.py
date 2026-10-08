@@ -9,11 +9,9 @@ import hashlib
 import uuid
 import math
 
+from ..kernel.cancellation import BackgroundPreempted  # defined here before kernel/: old imports from this module still work
 from .llama_runtime import flash_attention, validate_slots
 logger = logging.getLogger(__name__)
-
-
-class BackgroundPreempted(RuntimeError): pass
 
 
 class SlotScheduler:
@@ -250,7 +248,7 @@ class LlamaContextProvider(InferenceLane):
                                         and isinstance(features, list) and len(features) == 256
                                         and all(type(n) in (int, float) and math.isfinite(n) for n in features)):
                                         import torch
-                                        from ..conversation.output_filter import clean_output
+                                        from ..kernel.output_filter import clean_output
                                         self.probe.capture(torch.tensor(features, device='cpu'), f'user: {last_user}\nassistant: {clean_output(visible)}', group,
                                              cancelled=lambda: stop.is_set() or cancelled() or self.closed or self.probe.active_group != group,
                                              replay=bool(options.get('probe_replay')),input_text=last_user,offset=len(clean_output(visible)))

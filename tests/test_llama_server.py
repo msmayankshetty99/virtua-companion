@@ -9,8 +9,8 @@ import pytest
 
 from process.app_core.configuration.config import RuntimeConfig, load_config
 from process.app_core.configuration.settings_store import SettingsStore, field
-from process.app_core.conversation.messages import ChatMessage
-from process.app_core.inference.llama_context import BackgroundPreempted
+from process.app_core.kernel.messages import ChatMessage
+from process.app_core.kernel.cancellation import BackgroundPreempted
 from process.app_core.inference import llama_server
 from process.app_core.inference.llama_runtime import server_address
 from process.app_core.inference.llama_server import LlamaServerProvider

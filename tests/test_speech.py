@@ -77,7 +77,7 @@ def test_missing_sovits_keeps_chat_alive_and_next_reply_recovers(tmp_path, monke
     from process.app_core.conversation.chat import ChatService
     from process.app_core.desktop.state import DesktopState
     from process.app_core.events.bus import event_bus
-    from process.app_core.conversation.messages import ChatMessage, ModelResponse
+    from process.app_core.kernel.messages import ChatMessage, ModelResponse
     from process.app_core.runtime.session import SessionManager
     from process.app_core.runtime.warmup import warm_components
 

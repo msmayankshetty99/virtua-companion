@@ -59,7 +59,8 @@ def test_native_smoke_builds_the_release_bridge_for_metal_and_loads_a_pinned_mod
     triggers = smoke['on']
     assert {'schedule', 'workflow_dispatch'} <= set(triggers)
     for event in ('push', 'pull_request'):
-        assert {'tools/llama_cpp/**', 'Code/process/app_core/inference/**', 'Code/process/app_core/emotion/**', 'tools/release/**'} <= set(triggers[event]['paths'])
+        assert {'tools/llama_cpp/**', 'Code/process/app_core/inference/**', 'Code/process/app_core/kernel/**', 'Code/process/app_core/emotion/**',
+            'tools/release/**'} <= set(triggers[event]['paths'])
     job = smoke['jobs']['metal']
     assert job['runs-on'] == 'macos-15' and job['timeout-minutes']  # Apple silicon
     by_name = steps(job)

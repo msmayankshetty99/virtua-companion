@@ -12,7 +12,7 @@ from .persistence.tasks import TaskStore, TaskMCP, TASK_RULES
 from .desktop.media import resolve_media
 from .desktop.effects import EffectLibrary
 from contextlib import ExitStack
-from .runtime.lifecycle import close_bounded
+from .kernel.lifecycle import close_bounded
 
 
 def create_chat_service(config: AppConfig) -> ChatService:
@@ -75,7 +75,7 @@ def _build_chat_service(config, cleanup):
     if config.runtime.warmup and hasattr(provider, 'warmup'): provider.warmup()
     task_path = config.raw.get('tasks', {}).get('store_file', 'persistent_memories/tasks.sqlite3')
     task_store = TaskStore(config.root / task_path)
-    registry = own(ToolRegistry.from_config(config))
+    registry = own(ToolRegistry.from_config(config, activity=get_desktop_state()))
     from .tools.choices import ChoiceResolver
     registry.choice_resolver = ChoiceResolver(emotion_engine.choose_tool_input if emotion_engine else None,
         enabled=config.tools.best_fit_inputs, timeout=config.tools.best_fit_timeout_seconds,

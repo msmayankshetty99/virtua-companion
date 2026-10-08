@@ -10,12 +10,12 @@ import pytest
 import torch
 
 from process.app_core.conversation.chat import ChatService
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.desktop.state import DesktopState
 from process.app_core.emotion.julia import JuliaEmotionEngine
 from process.app_core.emotion.probe import EmotionProbe, ProbeConfig, build_network
 from process.app_core.events.bus import EventBus, RuntimeEvent, event_bus
-from process.app_core.runtime.cancellation import TurnCancelled
+from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
 from process.app_core.tools.approval import ToolApprovals
 

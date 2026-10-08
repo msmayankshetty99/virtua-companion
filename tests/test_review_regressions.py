@@ -12,7 +12,7 @@ from process.app_core.desktop.state import DesktopState
 from process.app_core.desktop.tools import iter_tools
 from process.app_core.events.stream import stream_events
 from process.app_core.events.bus import EventBus
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.tools.registry import RegisteredTool, ToolRegistry
 
 

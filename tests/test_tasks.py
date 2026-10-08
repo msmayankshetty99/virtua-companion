@@ -9,7 +9,7 @@ from process.app_core.persistence.tasks import TaskStore, TaskMCP, TaskConflict
 from process.app_core.tools import registry as tool_registry
 from process.app_core.tools.registry import ToolRegistry, StdioMCPClient
 from process.app_core.conversation.chat import ChatService
-from process.app_core.conversation.messages import ChatMessage, ModelResponse, ToolCall
+from process.app_core.kernel.messages import ChatMessage, ModelResponse, ToolCall
 
 
 def test_tasks_survive_restart_and_preserve_provenance(tmp_path):
@@ -177,12 +177,13 @@ for line in sys.stdin:
 
 def test_unloadable_mcp_server_is_reported_to_the_desktop(tmp_path):
     from types import SimpleNamespace
-    from process.app_core.desktop.state import get_desktop_state
+    from process.app_core.desktop.state import DesktopState
     (tmp_path / 'mcp.json').write_text('{"mcpServers": {"broken": {"command": "riko-missing-mcp"}}}', encoding='utf-8')
     config = SimpleNamespace(root=tmp_path, tools=SimpleNamespace(mcp_config=tmp_path / 'mcp.json', timeout_seconds=5, require_approval=True))
-    registry = ToolRegistry.from_config(config)
+    state = DesktopState()  # what the factory injects: the registry itself no longer reaches for the desktop singleton
+    registry = ToolRegistry.from_config(config, activity=state)
     try:
-        notice = get_desktop_state().notifications[0]
+        notice = state.notifications[0]
         assert notice['source'] == 'tools' and notice['level'] == 'error' and 'broken' in notice['text'] and 'riko-missing-mcp' in notice['text']
     finally: registry.close()
 

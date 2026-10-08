@@ -289,7 +289,22 @@ def test_pyinstaller_sees_the_app_package_when_its_spec_collects_submodules():
     found = subprocess.run([sys.executable, '-c', "from PyInstaller.utils.hooks import collect_submodules; print('\\n'.join(collect_submodules('process')))"],
         cwd=root, env=release.freeze_environment({key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}),
         capture_output=True, text=True, timeout=300).stdout.split()
-    assert {'process.app_core.tools.worker', 'process.app_core.tools.builtin.scientific_calculator', 'process.app_core.tools.builtin.todo_list'} <= set(found)
+    assert {'process.app_core.tools.worker', 'process.app_core.tools.builtin.scientific_calculator', 'process.app_core.tools.builtin.todo_list',
+        *run_server.KERNEL_MODULES} <= set(found)
+
+
+def test_release_check_covers_every_kernel_module_and_the_lazily_imported_server():
+    # Code imports some kernel/ modules only inside functions, and run_server imports uvicorn only after dispatching the
+    # worker modes, so the frozen check imports them by name.
+    kernel = Path(__file__).resolve().parents[1] / 'Code/process/app_core/kernel'
+    assert set(run_server.KERNEL_MODULES) == {f'process.app_core.kernel.{path.stem}' for path in kernel.glob('*.py') if path.stem != '__init__'}
+    assert 'uvicorn' in run_server.RELEASE_MODULES
+    # What each frozen worker call no longer pays for: neither the import nor main()'s dispatch loads them (workers stubbed).
+    for flag in ('', '--tool-worker', '--discord-worker'):
+        probe = ("import runpy, sys, run_server\n" + (f"runpy.run_module = lambda *a, **k: None\nsys.argv = ['run_server.py', '{flag}']\nrun_server.main()\n" if flag else '')
+            + "print(sorted({'uvicorn', 'process.app_core.configuration.config'} & set(sys.modules)))")
+        loaded = subprocess.run([sys.executable, '-c', probe], cwd=kernel.parents[2], capture_output=True, text=True, timeout=120)
+        assert loaded.stdout.strip() == '[]', (flag, loaded.stdout + loaded.stderr)
 
 
 def test_release_check_runs_per_shipped_bundle_on_the_stage_and_inside_the_signed_mac_app(tmp_path, monkeypatch):

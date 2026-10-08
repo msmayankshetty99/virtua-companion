@@ -6,8 +6,9 @@ import pytest
 
 from process.app_core.configuration.config import RuntimeConfig, MemoryConfig
 from process.app_core.inference.llama_native import InProcessLlamaProvider
-from process.app_core.inference.llama_context import SlotScheduler, native_arguments, BackgroundPreempted
-from process.app_core.conversation.messages import ChatMessage
+from process.app_core.inference.llama_context import SlotScheduler, native_arguments
+from process.app_core.kernel.cancellation import BackgroundPreempted
+from process.app_core.kernel.messages import ChatMessage
 
 
 def test_live_slot_is_never_used_by_background():

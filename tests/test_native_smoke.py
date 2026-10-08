@@ -71,8 +71,8 @@ def probe_samples(provider, slot):
 
 def test_provider_loads_streams_counts_cancels_and_closes(provider):
     import run_server
-    from process.app_core.conversation.messages import ChatMessage
-    from process.app_core.inference.llama_context import BackgroundPreempted
+    from process.app_core.kernel.messages import ChatMessage
+    from process.app_core.kernel.cancellation import BackgroundPreempted
     provider.warmup()  # loads the GGUF, checks /slots, and answers one token on every slot, as the backend does at startup
     notes = provider.native.notes
     offload = re.search(r'offloaded (\d+)/(\d+) layers', notes)
@@ -103,7 +103,7 @@ def test_provider_loads_streams_counts_cancels_and_closes(provider):
 
 def test_emotion_probe_samples_the_live_slot_only(provider):
     import torch
-    from process.app_core.conversation.messages import ChatMessage
+    from process.app_core.kernel.messages import ChatMessage
     from process.app_core.emotion.probe import FEATURE_VERSION
     captures, identities = [], []
 

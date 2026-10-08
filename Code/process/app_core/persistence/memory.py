@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 
+from ..kernel.cancellation import BackgroundPreempted
 from .atomic import atomic_write
 from .preserve import preserve_unreadable
 
@@ -184,8 +185,8 @@ class JuliaMemoryDecider:
             return {"memory_type": "episodic", "importance": .5, "confidence": .2, "retain": True, "tags": []}
 
 
-class ReflectionDeferred(Exception):
-    pass
+class ReflectionDeferred(BackgroundPreempted):
+    """A live turn or shutdown interrupted reflection; the record stays pending and is retried."""
 
 
 class MemoryStore:
@@ -210,7 +211,7 @@ class MemoryStore:
         self.index_snapshot = None
         self.index_dirty = bool(self.records)
         self.embeddings_failed = False
-        from ..runtime.torch_device import validate
+        from ..kernel.torch_device import validate
         validate(config.device)
         self.decider = JuliaMemoryDecider(config.system1_model_id, config.system1_cache_dir, config.system1_max_length, config.device) if config.system1_enabled else None
         if not self.records and config.default_memories:
@@ -435,7 +436,6 @@ class MemoryStore:
         self._event('classified', record=result)
 
     def _reflect(self, snapshot):
-        from ..inference.llama_context import BackgroundPreempted
         permitted = self.config.reflection_enabled and self.reflection_provider and snapshot.active and not snapshot.derived and snapshot.importance >= self.config.reflection_min_importance
         if not permitted:
             with self.lock:
@@ -444,7 +444,7 @@ class MemoryStore:
                     current.reflection_status = 'skipped'
                     self._save()
             return
-        from ..conversation.messages import ChatMessage
+        from ..kernel.messages import ChatMessage
         # Do not feed a source its own prior descendants as independent evidence.
         with self.lock:
             excluded = {snapshot.id}
@@ -469,7 +469,7 @@ class MemoryStore:
                     '"source_ids": ["evidence IDs"], "confidence": 0.0}]}. Every item must cite the focal memory and all evidence it relies on. '
                     'Return at most four concise items; return an empty list if nothing useful can be derived.'),
                      ChatMessage('user', json.dumps({'focal_id': snapshot.id, 'evidence': evidence}, ensure_ascii=False), context_kind='reflection')]
-            from ..inference.background_budget import check_budget
+            from ..kernel.background_budget import check_budget
             context = self.config.reflection_context_window_tokens
             output = self.config.reflection_max_output_tokens
             check_budget(self.reflection_provider, messages, None, context, output)
@@ -505,7 +505,7 @@ class MemoryStore:
                     importance=snapshot.importance, confidence=min(confidence, *(evidence_by_id[i]['confidence'] for i in ids)),
                     tags=list(snapshot.tags), source='reflection', derived=True, reflection_kind=item['kind'],
                     source_ids=ids, source_revisions={i: evidence_by_id[i]['revision'] for i in ids}))
-        except (ReflectionDeferred, BackgroundPreempted):
+        except BackgroundPreempted:  # ReflectionDeferred, or any provider's preemption
             return  # Durable pending status allows a retry after the live turn.
         with self.condition:
             current = self._find(snapshot.id)
@@ -525,7 +525,7 @@ class MemoryStore:
         import numpy as np
         if self.embedder is None:
             from sentence_transformers import SentenceTransformer
-            from ..runtime.torch_device import resolve
+            from ..kernel.torch_device import resolve
             device = resolve(self.config.device)
             try: self.embedder = SentenceTransformer(self.config.embedding_model, device=device)
             except Exception as exc:

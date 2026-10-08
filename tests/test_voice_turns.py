@@ -11,10 +11,10 @@ import pytest
 
 from process.app_core.audio.voice_input import VoiceInput
 from process.app_core.audio.voice_segments import Segment
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import event_bus
-from process.app_core.runtime.cancellation import TurnCancelled
+from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
 
 DISCORD = {'source': 'discord', 'conversation_id': 'discord:client:dm:1', 'user_id': '1', 'channel_id': '1', 'message_id': 'd1'}

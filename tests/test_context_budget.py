@@ -1,7 +1,7 @@
 import json
 import pytest
 from process.app_core.inference.context_budget import pack_context
-from process.app_core.conversation.messages import ChatMessage, ToolCall
+from process.app_core.kernel.messages import ChatMessage, ToolCall
 
 
 def count(messages):

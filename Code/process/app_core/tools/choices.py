@@ -4,7 +4,7 @@ import math
 import re
 import threading
 
-from ..runtime.workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 
 
 def normalized(value): return re.sub(r'[\s_-]+', ' ', value.strip().casefold())

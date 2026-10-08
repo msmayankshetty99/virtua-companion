@@ -388,7 +388,7 @@ class SettingsStore:
                 errors['presets.default.memories'] = 'Default memories must be a list of objects with text'
             rt = candidate.runtime
             if 'initiative.context_window_tokens' in changes: rt.initiative_n_ctx = changes['initiative.context_window_tokens']
-            from ..inference.background_budget import validate_budget
+            from ..kernel.background_budget import validate_budget
             validate_budget(rt.initiative_n_ctx, changes.get('initiative.max_output_tokens', rt.initiative_max_output_tokens), 'initiative')
             from ..inference.kv_budget import pool_capacity
             if rt.kv_pool_auto:

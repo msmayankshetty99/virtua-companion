@@ -8,7 +8,7 @@ import pytest
 from process.app_core.inference.llama_native import NativeClient, NativeRuntime
 from process.app_core.configuration.config import load_config
 from process.app_core.configuration.config import RuntimeConfig
-from process.app_core.conversation.messages import ChatMessage
+from process.app_core.kernel.messages import ChatMessage
 from process.app_core.inference.llama_native import InProcessLlamaProvider
 from process.app_core.configuration.settings_store import SettingsStore, field
 

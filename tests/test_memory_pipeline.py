@@ -258,7 +258,7 @@ def test_each_capture_stores_a_bounded_formation_context_without_touching_the_ca
 
 def test_chat_capture_keeps_recent_dialogue_and_says_when_it_cut_older(tmp_path):
     from process.app_core.conversation.chat import ChatService
-    from process.app_core.conversation.messages import ChatMessage, ModelResponse
+    from process.app_core.kernel.messages import ChatMessage, ModelResponse
     from process.app_core.persistence.memory import FORMATION_HISTORY_MESSAGES
     class Provider:
         def generate(self, messages, **options): return ModelResponse(ChatMessage('assistant', 'Noted.'))

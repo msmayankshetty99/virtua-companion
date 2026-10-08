@@ -4,7 +4,7 @@ import threading
 import time
 import logging
 from dataclasses import dataclass, field
-from ..runtime.workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 
 from ..events.bus import event_bus
 

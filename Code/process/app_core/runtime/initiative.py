@@ -8,10 +8,10 @@ from pathlib import Path
 import re
 import threading
 import time
-from .workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 
 from ..events.bus import event_bus
-from ..conversation.messages import ChatMessage, conversation_sections
+from ..kernel.messages import ChatMessage, conversation_sections
 from ..persistence.atomic import atomic_write
 
 
@@ -141,7 +141,7 @@ class Initiative:
 
     def validate(self, settings):
         if set(settings) - set(DEFAULTS): raise ValueError('Unknown initiative setting')
-        from ..inference.background_budget import validate_budget
+        from ..kernel.background_budget import validate_budget
         validate_budget(settings['context_window_tokens'], settings['max_output_tokens'], 'initiative')
         for key in ('enabled', 'observe_idle', 'observe_active_app', 'spoken_enabled', 'allow_urgent_spoken'):
             if not isinstance(settings[key], bool): raise ValueError(f'{key} must be boolean')
@@ -320,7 +320,7 @@ class Initiative:
                  ChatMessage('user', json.dumps(payload, ensure_ascii=False), context_kind='initiative')]
             for _ in range(3):
                 if cancelled(): return False
-                from ..inference.background_budget import check_budget
+                from ..kernel.background_budget import check_budget
                 provider = getattr(chat, 'initiative_provider', chat.provider)
                 check_budget(provider, messages, read_tools, settings['context_window_tokens'], settings['max_output_tokens'])
                 response = provider.generate(messages, tools=read_tools or None,
@@ -343,7 +343,7 @@ class Initiative:
             self.error = ''
         event_bus.publish('initiative.checked', **self.last_decision)
         if not proposal['initiate']: return False
-        from ..conversation.output_filter import clean_output
+        from ..kernel.output_filter import clean_output
         message = ' '.join(clean_output(proposal['message']).split()[:120])
         if not message: return False
         spoken = (rule['presentation'] == 'spoken' and settings['spoken_enabled']) or (proposal['urgent'] and settings['allow_urgent_spoken'])

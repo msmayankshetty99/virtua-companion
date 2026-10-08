@@ -9,7 +9,7 @@ import time
 from .library import AnimationLibrary, BONES, validate_settings
 from .policy import AnimationState, eligible_intents, motion_intent
 from ..events.bus import event_bus
-from ..runtime.workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 
 
 class AnimationRuntime:
