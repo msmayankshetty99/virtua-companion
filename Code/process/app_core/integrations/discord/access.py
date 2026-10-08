@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 
 from .config import BotSettings
+from ...persistence.atomic import atomic_write
 
 KEYS = {'admins', 'users', 'channels', 'allow_dms', 'admin_actions'}
 
@@ -84,9 +85,6 @@ class DiscordAccess:
             current = self.read()
             if current['revision'] != revision: raise RuntimeError('Discord settings changed elsewhere. Reload before saving.')
             values = validate_access(values)
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix('.tmp')
-            temporary.write_text(json.dumps(values, indent=2), encoding='utf-8')
-            temporary.replace(self.path)
+            atomic_write(self.path, json.dumps(values, indent=2))
             self._access_key = None
             return self.read()

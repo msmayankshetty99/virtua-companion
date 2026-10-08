@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
+from concurrent.futures import Future, wait
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Iterable, Sequence
 
 from ..conversation.messages import ChatMessage, ModelResponse, ToolCall
 from ..conversation.streaming import WordDeltas
-from .responses import response_input, response_tools
+from .responses import response_input, response_tools, template_messages
 
 
 class OpenAIProvider:
@@ -33,17 +36,14 @@ class OpenAIProvider:
             except Exception as exc:
                 if self.api_mode != 'auto' or getattr(exc, 'status_code', None) not in {404, 405, 501}: raise
                 self.responses_enabled = False
-        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in messages],
+        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in template_messages(messages)],
                       temperature=options.get("temperature", self.config.temperature),
                       max_tokens=options.get("max_output_tokens", self.config.max_output_tokens))
         if tools:
             kwargs["tools"] = tools
         if options.get("on_delta"):
-            stream = self.client.chat.completions.create(**kwargs, stream=True)
-            try:
+            with cancellable_stream(lambda: self.client.chat.completions.create(**kwargs, stream=True), options.get('cancelled')) as stream:
                 return assemble_stream((chunk.model_dump() for chunk in stream), options["on_delta"], on_reasoning=options.get('on_reasoning'))
-            finally:
-                stream.close()
         response = self.client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         msg = choice.message
@@ -56,13 +56,16 @@ class OpenAIProvider:
         return ModelResponse(ChatMessage("assistant", msg.content or "", tool_calls=calls), choice.finish_reason, usage_dict, response, messages)
 
     def _pack(self, messages, tools, options):
+        # Measured as sent: chat templates (Qwen3.5, Gemma, Mistral) reject a system message after the first
+        # turn, so later recall/observations are folded into the next input exactly as the native path does.
         from .context_budget import pack_context, estimate_tokens
-        return pack_context(messages, lambda value: estimate_tokens(value, tools),
+        return pack_context(messages, lambda value: estimate_tokens(template_messages(value), tools),
             min(options.get('context_limit', self.config.n_ctx), self.config.n_ctx),
-            options.get('max_output_tokens', self.config.max_output_tokens), cancelled=options.get('cancelled', lambda: False))
+            options.get('max_output_tokens', self.config.max_output_tokens), cancelled=options.get('cancelled', lambda: False),
+            state=options.get('context_state'))
 
     def _responses(self, messages, *, tools=None, **options):
-        inputs = response_input(messages)
+        inputs = response_input(template_messages(messages))
         definitions = response_tools(tools)
         signature = json.dumps({'model': self.config.model, 'tools': definitions}, sort_keys=True)
         previous, prefix = None, []
@@ -79,27 +82,26 @@ class OpenAIProvider:
         callback = options.get('on_delta')
         words = WordDeltas(callback) if callback else None
         response = None
-        try:
-            try:
-                result = self.client.responses.create(**kwargs, stream=bool(callback))
+        def start():
+            try: return self.client.responses.create(**kwargs, stream=bool(callback))
             except Exception as exc:
                 if not previous or getattr(exc, 'status_code', None) not in {400, 404}: raise
                 with self.cache_lock:
                     self.response_cache = [entry for entry in self.response_cache if entry[1] != previous]
                 kwargs.pop('previous_response_id')
                 kwargs['input'] = inputs
-                result = self.client.responses.create(**kwargs, stream=bool(callback))
+                return self.client.responses.create(**kwargs, stream=bool(callback))
+        try:
             if callback:
-                try:
+                with cancellable_stream(start, options.get('cancelled')) as result:
                     for event in result:
                         if event.type == 'response.output_text.delta': words.feed(event.delta)
                         elif event.type == 'response.reasoning_summary_text.delta' and options.get('on_reasoning'): options['on_reasoning'](event.delta)
                         elif event.type == 'response.completed': response = event.response
                         elif event.type in {'response.failed', 'error'}: raise RuntimeError(str(event))
-                finally: result.close()
                 if response is None: raise RuntimeError('Response stream ended without completion')
                 words.finish()
-            else: response = result
+            else: response = start()
             raw = response.model_dump()
             text, calls = [], []
             for output in raw.get('output', []):
@@ -126,7 +128,7 @@ class OpenAIProvider:
         if self.responses_enabled:
             yield from self._stream_responses(messages, tools=tools, **options)
             return
-        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in messages], stream=True,
+        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in template_messages(messages)], stream=True,
                       temperature=options.get("temperature", self.config.temperature),
                       max_tokens=options.get("max_output_tokens", self.config.max_output_tokens))
         if tools: kwargs["tools"] = tools
@@ -144,8 +146,7 @@ class OpenAIProvider:
         finally: stream.close()
 
     def _stream_responses(self, messages, *, tools=None, **options):
-        from .responses import response_input, response_tools
-        kwargs = dict(model=self.config.model, input=response_input(messages), stream=True,
+        kwargs = dict(model=self.config.model, input=response_input(template_messages(messages)), stream=True,
             temperature=options.get('temperature', self.config.temperature),
             max_output_tokens=options.get('max_output_tokens', self.config.max_output_tokens))
         if tools: kwargs['tools'] = response_tools(tools)
@@ -174,14 +175,60 @@ class OpenAIProvider:
 
     def count_tokens(self, messages):
         from .context_budget import estimate_tokens
-        return estimate_tokens(messages)
+        return estimate_tokens(template_messages(messages))
 
     def count_text_tokens(self, text):
-        return len(text.encode('utf-8')) # Conservative fallback, not an exact tokenizer.
+        from .context_budget import estimate_text_tokens
+        return estimate_text_tokens(text) # A calibrated estimate, not the server's tokenizer.
 
     def close(self):
         close = getattr(self.client, "close", None)
         if close: close()
+
+
+@contextmanager
+def cancellable_stream(start, cancelled=None):
+    """Iterate a streamed request that Stop interrupts even while the server is silent: before its headers arrive
+    (prefill, model load) and between events (unstreamed reasoning). A helper thread makes the request, then shuts
+    its socket down on cancellation, which wakes the blocked read (closing alone may not). It is per request on
+    purpose: initiative and reflection share this provider, so a provider-wide cancel would stop them too.
+    Any failure once cancelled is BackgroundPreempted, as from the llama.cpp providers."""
+    from .llama_context import BackgroundPreempted
+    cancelled = cancelled or (lambda: False)
+    opened, done, abandoned, closing = Future(), threading.Event(), threading.Event(), threading.Lock()
+    def guard():
+        try: stream = start()
+        except BaseException as exc: return opened.set_exception(exc)
+        opened.set_result(stream)
+        while not done.wait(.05):
+            if not cancelled(): continue
+            with closing:  # never after the reader closed it: a finished connection goes back to the shared pool
+                if done.is_set(): break
+                try: stream.response.extensions['network_stream'].get_extra_info('socket').shutdown(socket.SHUT_RDWR)
+                except Exception: pass  # another transport: the per-event check below still stops it
+            return
+        if abandoned.is_set(): stream.close()  # it answered after Stop: hang up at once
+    threading.Thread(target=guard, daemon=True, name='inference-request').start()
+    def events(stream):
+        for event in stream:
+            if cancelled(): raise BackgroundPreempted('Inference cancelled')
+            yield event
+        if cancelled(): raise BackgroundPreempted('Inference cancelled')
+    try:
+        while not wait([opened], .05).done:
+            if cancelled():
+                abandoned.set()
+                raise BackgroundPreempted('Inference cancelled before the server answered')
+        stream = opened.result()
+        try: yield events(stream)
+        finally:
+            with closing: done.set()
+            stream.close()
+    except BackgroundPreempted: raise
+    except Exception:
+        if cancelled(): raise BackgroundPreempted('Inference cancelled') from None
+        raise
+    finally: done.set()
 
 
 def assemble_stream(chunks, on_delta, *, on_reasoning=None):

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,7 @@ from process.app_core.runtime.initiative import Initiative
 from process.app_core.persistence.tasks import TaskConflict
 from process.app_core.events.stream import stream_events
 from process.app_core.persistence.conversation_store import ConversationStore
+from process.app_core.persistence.atomic import atomic_write
 from process.app_core.runtime.lifecycle import close_bounded, run_bounded
 from process.app_core.desktop.media import resolve_media
 from fastapi.responses import FileResponse
@@ -71,7 +73,15 @@ async def lifespan(_app):
     global chat, session, conversation_store, _desktop_settings_loaded, startup_error, resource_events, task_file_events
     # Importing the ASGI module must not start model/memory/audio workers.
     startup_error = ''
-    try: chat = await run_in_threadpool(create_chat_service, config)
+    session = None
+    try:
+        chat = await run_in_threadpool(create_chat_service, config)
+        # Voice, wake and speech settings are checked here, after the model has loaded; a mistake in them takes the
+        # same fallback, so Settings can repair it instead of every launch failing.
+        try: session = SessionManager(config, chat, state, getattr(chat, 'action_controller', None))
+        except BaseException:
+            await run_in_threadpool(close_bounded, chat, 6)
+            raise
     except Exception as exc:
         if not config.raw.get('desktop', {}).get('setup_on_startup_error', False): raise
         logger.exception('Backend unavailable; keeping settings available')
@@ -83,13 +93,11 @@ async def lifespan(_app):
         try: yield
         finally: unsubscribe()
         return
-    session = None
     conversation_store = None
     unsubscribers = []
     _desktop_settings_loaded = False
     saved = config.root / 'persistent_memories' / 'desktop_settings.json'
     try:
-        session = SessionManager(config, chat, state, getattr(chat, 'action_controller', None))
         if config.runtime.warmup and hasattr(session, 'speech'):
             from process.app_core.runtime.warmup import warm_session
             await run_in_threadpool(warm_session, session)
@@ -718,16 +726,17 @@ def displays(request: list[Display]):
     state._emit('displays', values)
     return {'accepted': True}
 
+
+desktop_settings_write = threading.Lock()  # avatar geometry PATCHes still write in order
+
 @app.patch('/api/surfaces/avatar')
 def avatar_surface(request: dict[str, StrictInt]):
     try: state.update_geometry('avatar', **request)
     except ValueError as exc: raise HTTPException(400, str(exc))
-    path = config.root / 'persistent_memories' / 'desktop_settings.json'
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.tmp')
-    with state._lock:
-        temporary.write_text(json.dumps({'avatar_geometry': state.avatar_geometry}), encoding='utf-8')
-        temporary.replace(path)
+    # Write outside DesktopState's lock (bus listeners and turns take it): a durable write can take a while.
+    with desktop_settings_write:
+        with state._lock: payload = json.dumps({'avatar_geometry': state.avatar_geometry})
+        atomic_write(config.root / 'persistent_memories' / 'desktop_settings.json', payload)
     return snapshot()
 
 @app.get('/api/tasks/{task_id}')
@@ -809,6 +818,10 @@ def chat_endpoint(request: ChatRequest):
         response = session.respond(request.text, request.user_name)
     except TurnCancelled:
         return {"cancelled": True}
+    except RuntimeError as exc:
+        # Another turn (voice, Discord, a reply still stopping) holds the session: a conflict, not a server failure.
+        if str(exc) == 'Riko is already handling another turn': raise HTTPException(409, 'Riko is still handling another reply; send again when it finishes') from exc
+        raise
     state.set_speech(response.message.content)
     return {"text": response.message.content, "emotion": snapshot()["emotion"]}
 
@@ -832,7 +845,17 @@ def voice_activity(request: VoiceActivityRequest):
 
 @app.post("/api/voice/interjection")
 def voice_interjection(request: InterjectionRequest):
-    return {"accepted": session.voice_transcript(request.text, request.started_at, request.ended_at)}
+    # 'fresh' words belong to no reply in flight: the client sends them as a chat turn instead. 'reply' words cut the
+    # reply in flight and are already in history, so the reply is redone here, as VoiceInput does.
+    anchor = session.voice_anchor()
+    disposition = session.voice_transcript(request.text, request.started_at, request.ended_at, anchor) if anchor else 'fresh'
+    if disposition == 'reply':
+        def redo():
+            try: session.respond(request.text, record_user=False, reply_to=anchor[0], wait=lambda: False, origin={'source': 'microphone'})
+            except TurnCancelled: pass
+            except Exception: logger.exception('Could not redo the reply an interjection cut')
+        threading.Thread(target=redo, daemon=True, name='interjection-redo').start()
+    return {"accepted": disposition in {'preserved', 'reply'}}
 
 @app.post("/api/mic/toggle")
 def toggle_mic():

@@ -56,6 +56,42 @@ def test_mcp_rules_tools_and_conflicts_are_reported_as_errors(tmp_path):
     assert 'changed' in result.content
 
 
+def test_task_get_tool_returns_recent_change_summaries_while_the_store_keeps_every_snapshot(tmp_path):
+    from process.app_core.persistence.tasks import TOOL_HISTORY_DEFAULT, TOOL_HISTORY_MAX, TOOL_REASON_CHARS
+    store = TaskStore(tmp_path / 'tasks.sqlite3')
+    task = store.create('Learn Japanese', description='Daily practice. ' * 200, reason='User asked')
+    for revision in range(1, 31):
+        store.update(task['id'], revision, {'progress': revision / 40, 'next_step': f'Lesson {revision} ' + 'vocabulary. ' * 300},
+                     reason=f'Finished lesson {revision}. ' + 'detail ' * 500)
+    store.update(task['id'], 31, {'status': 'blocked', 'blocker': 'No textbook'}, reason='User said so')
+    registry = ToolRegistry()
+    registry.register_mcp(TaskMCP(store))
+    try:
+        schema = next(d['function']['parameters'] for d in registry.definitions() if d['function']['name'] == 'task_get')
+        assert schema['properties']['history_limit'] == {'type': 'integer', 'minimum': 0, 'maximum': TOOL_HISTORY_MAX} and schema['required'] == ['task_id']
+        result = registry.execute('task_get', {'task_id': task['id']}, 'call')
+        assert not result.is_error
+        got = result.content
+        assert got['revision'] == 32 and got['status'] == 'blocked' and got['description'] == task['description']  # the current record is whole
+        assert [e['revision'] for e in got['history']] == list(range(32 - TOOL_HISTORY_DEFAULT + 1, 33)) and got['history_omitted'] == 32 - TOOL_HISTORY_DEFAULT
+        assert all('snapshot' not in e and len(e['reason']) <= TOOL_REASON_CHARS + len(' [truncated]') for e in got['history'])
+        assert got['history'][-1]['changed'] == ['status', 'blocker'] and got['history'][-1]['status'] == 'blocked'
+        assert got['history'][0]['changed'] == ['progress', 'next_step']  # named against the event before the window
+        assert len(str(got)) < 16000  # was ~110 KB: every snapshot of every revision
+        oldest = registry.execute('task_get', {'task_id': task['id'], 'history_limit': TOOL_HISTORY_MAX}, 'call').content
+        assert len(oldest['history']) == TOOL_HISTORY_MAX and oldest['history_omitted'] == 32 - TOOL_HISTORY_MAX
+        assert registry.execute('task_get', {'task_id': task['id'], 'history_limit': 0}, 'call').content['history'] == []
+        created = registry.execute('task_get', {'task_id': store.create('Fresh task')['id']}, 'call').content['history']
+        assert [e['kind'] for e in created] == ['created'] and 'changed' not in created[0]
+        for bad in (TOOL_HISTORY_MAX + 1, -1, True, 2.5):
+            refused = registry.execute('task_get', {'task_id': task['id'], 'history_limit': bad}, 'call')
+            assert refused.is_error and 'history_limit' in refused.content
+        full = store.get(task['id'])  # the panel and /api/tasks/{id} still read every snapshot
+        assert len(full['history']) == 32 and full['history'][0]['snapshot']['status'] == 'active' and 'history_omitted' not in full
+        with pytest.raises(ValueError): store.get(task['id'], history_limit=-1)
+    finally: registry.close()
+
+
 def test_tasks_are_requested_by_tools_not_preloaded(tmp_path):
     store = TaskStore(tmp_path / 'tasks.sqlite3')
     registry = ToolRegistry()
@@ -87,6 +123,8 @@ def test_real_stdio_mcp_handshake_and_task_round_trip(tmp_path):
         stored = TaskStore(tmp_path / 'tasks.sqlite3').get(task['id'])
         assert stored['title'] == 'Via stdio ✦'
         assert stored['history'][0]['actor'] == 'external_mcp'
+        got = client.call('task_get', {'task_id': task['id'], 'history_limit': 1})['structuredContent']
+        assert got['history'] == [{k: v for k, v in stored['history'][0].items() if k != 'snapshot'} | {'status': 'active', 'progress': 0.0}] and got['history_omitted'] == 0
         conflict = client.call('task_update', {'task_id': task['id'], 'expected_revision': 9, 'changes': {'status': 'completed'}, 'reason': 'Wrong revision'})
         assert conflict['isError']
     finally:

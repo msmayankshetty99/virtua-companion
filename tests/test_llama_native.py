@@ -441,3 +441,70 @@ def test_probe_identity_records_the_flash_attention_llama_cpp_chose(requested, n
         provider.native = SimpleNamespace(notes=notes)
         assert provider._flash_attention_identity() == identity
     finally: provider.native = None; provider.close()
+
+
+def chat_over_native(monkeypatch, replies, tool_output='found'):
+    """ChatService on the native provider; the fake tokenizer counts four characters per token."""
+    from process.app_core.conversation.chat import ChatService
+    from process.app_core.tools.registry import RegisteredTool, ToolRegistry
+    runtime, requests, replies = fake_runtime([]), [], iter(replies)
+    def request(handle, path, body, output, cancel, user):
+        path, payload = path.decode(), json.loads(body)
+        requests.append((path, payload))
+        if path == '/apply-template': data = {'prompt': '\n'.join(m['content'] for m in payload['messages'])}
+        elif path == '/tokenize': data = {'tokens': [0] * (len(payload['content']) // 4)}
+        else: data = {'type': 'response.completed', 'response': {'status': 'completed', 'output': [next(replies)]}}
+        data = ('data: ' + json.dumps(data) + '\n\n' if path == '/v1/responses' else json.dumps(data)).encode()
+        buffer = ctypes.create_string_buffer(data)
+        output(200, ctypes.cast(buffer, ctypes.c_void_p), len(data), user)
+        return 0
+    runtime.dll = SimpleNamespace(riko_request=request, riko_stop=lambda _: None, riko_destroy=lambda _: None)
+    provider = InProcessLlamaProvider(RuntimeConfig(model_path='unused.gguf'))
+    provider.native, provider.client = runtime, NativeClient(runtime)
+    monkeypatch.setattr(provider, '_start', lambda: None)
+    registry = ToolRegistry()
+    registry.tools['lookup'] = RegisteredTool('lookup', 'Look it up', {'type': 'object', 'properties': {}}, lambda args: tool_output)
+    chat = ChatService(provider, system_prompt='Riko', tool_registry=registry)
+    chat.context_limit = 8192
+    chat.history = [ChatMessage(role, f'{role} {i} ' + 'q' * 400) for i in range(120) for role in ('user', 'assistant')]
+    return chat, requests
+
+
+CALL = {'type': 'function_call', 'call_id': 'call', 'name': 'lookup', 'arguments': '{}'}
+SAID = {'type': 'message', 'content': [{'type': 'output_text', 'text': 'Summary'}]}
+
+
+def test_native_chat_keeps_sent_observations_and_a_fixed_prefix_with_one_count_per_reply(monkeypatch):
+    chat, requests = chat_over_native(monkeypatch, [CALL, CALL, SAID] + [SAID] * 5)
+    observed = iter(range(100))
+    chat.runtime_context = lambda: {'observation': next(observed)}
+    try:
+        for turn in range(6): assert chat.respond(f'turn {turn} ' + 'z' * 400).message.content == 'Summary'
+    finally: chat.tool_registry.close(); chat.provider.close()
+    inputs = [body['input'] for path, body in requests if path == '/v1/responses']
+    counts, pending = [], 0
+    for path, _ in requests:
+        if path == '/apply-template': pending += 1
+        elif path == '/v1/responses': counts.append(pending); pending = 0
+    assert len(inputs) == 8
+    for number, items in enumerate(inputs):  # every request carries the latest observation
+        assert f'{{\\"observation\\": {number}}}' in json.dumps(items)
+    # A tool loop keeps the observations it already sent, so each of its requests extends the previous one.
+    assert [json.dumps(items).count('Current runtime observation') for items in inputs] == [1, 2, 3, 1, 1, 1, 1, 1]
+    assert all(later[:len(earlier)] == earlier for earlier, later in zip(inputs[:2], inputs[1:3]))
+    assert counts[1:] == [1] * 7  # after the first pack, one template+tokenize per request
+    assert len({json.dumps(items[1]) for items in inputs}) == 1  # one retained start for every request
+    for earlier, later in zip(inputs[3:], inputs[4:]):  # each reply's prompt, minus its current input, prefixes the next
+        assert later[:len(earlier) - 1] == earlier[:-1]
+
+
+def test_native_chat_answers_with_cut_tool_output_instead_of_failing(monkeypatch):
+    chat, requests = chat_over_native(monkeypatch, [CALL, SAID], 'HEAD' + 'x' * 100000 + 'TAIL')
+    try: assert chat.respond('summarise report.pdf').message.content == 'Summary'
+    finally: chat.tool_registry.close(); chat.provider.close()
+    sent = [body['input'] for path, body in requests if path == '/v1/responses'][-1]
+    result = next(item['output'] for item in sent if item.get('type') == 'function_call_output')
+    assert result.startswith('HEAD') and result.endswith('TAIL') and '[tool output truncated to fit the context: ' in result
+    prompt = sum(len(item['output'] if 'output' in item else item.get('content') if isinstance(item.get('content'), str) else '') for item in sent)
+    assert prompt // 4 + 1024 <= 8192 and len(result) > 20000
+    assert [m.content for m in chat.history[-2:]] == ['User: summarise report.pdf', 'Summary']

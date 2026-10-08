@@ -15,7 +15,7 @@ import queue
 import math
 import time
 from pathlib import Path
-from concurrent.futures import TimeoutError
+from concurrent.futures import TimeoutError, wait
 from ..runtime.workers import DaemonExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +25,9 @@ import types
 from ..conversation.messages import ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+class ToolCancelled(RuntimeError): pass
 
 
 def _schema_for(annotation):
@@ -121,8 +124,9 @@ class StdioMCPClient:
         if isinstance(response, Exception): raise response
         return response
 
-    def _request(self, method, params=None):
+    def _request(self, method, params=None, cancelled=lambda: False):
         with self._lock:
+            if cancelled(): raise ToolCancelled('MCP request cancelled')  # stopped while another request held the server
             self._counter += 1
             request = {"jsonrpc": "2.0", "id": self._counter, "method": method, "params": params or {}}
             assert self.process.stdin is not None
@@ -132,7 +136,16 @@ class StdioMCPClient:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0: raise TimeoutError('MCP request deadline exceeded')
-                response = self._read(remaining)
+                if cancelled():
+                    # MCP cancellation: the server should stop the request. A late reply carries this id, which later requests skip.
+                    try:
+                        self.process.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/cancelled',
+                            'params': {'requestId': request['id'], 'reason': 'The user stopped the reply'}}) + '\n')
+                        self.process.stdin.flush()
+                    except (OSError, ValueError): pass  # the server already exited; the next call restarts it
+                    raise ToolCancelled('MCP request cancelled')
+                try: response = self._read(min(remaining, .05))
+                except TimeoutError: continue
                 if response.get("id") == request["id"]:
                     if "error" in response: raise RuntimeError(response["error"])
                     return response.get("result", {})
@@ -144,13 +157,13 @@ class StdioMCPClient:
             self.process.stdin.flush()
 
     def list_tools(self): return self._request("tools/list").get("tools", [])
-    def call(self, name, arguments):
+    def call(self, name, arguments, cancelled=lambda: False):
         if self.process.poll() is not None:
             with self._restart_lock:
                 if self.process.poll() is not None:
                     replacement = StdioMCPClient(self.command, self.args, self.env)
                     self.process, self._responses, self._counter, self._lock = replacement.process, replacement._responses, replacement._counter, replacement._lock
-        return self._request("tools/call", {"name": name, "arguments": arguments})
+        return self._request("tools/call", {"name": name, "arguments": arguments}, cancelled)
     def close(self):
         if self.process.poll() is None:
             self.process.terminate()
@@ -193,7 +206,7 @@ class ToolRegistry:
         self._running = {}
         self._execution_lock = threading.Lock()
         self._closed = False
-        self._processes = set()
+        self._processes = {}  # live isolated worker -> its call's stop event
         self.approvals = None
         self.choice_resolver = None
 
@@ -238,22 +251,23 @@ class ToolRegistry:
             try: client.close()
             except Exception: logger.exception('Unable to close MCP client')
 
-    def _isolated_call(self, tool, arguments):
+    def _isolated_call(self, tool, arguments, stop):
         command = [sys.executable, '--tool-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(Path(__file__).with_name('worker.py'))]
         # stderr carries whatever the tool's libraries print, in the ANSI code page on Windows: never fail decoding it.
         process = subprocess.Popen(command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         with self._execution_lock:
-            if self._closed:
+            if self._closed or stop.is_set():
                 process.kill(); process.wait()
-                raise RuntimeError('Tool registry closed')
-            self._processes.add(process)
+                raise RuntimeError('Tool registry closed') if self._closed else ToolCancelled('Tool call cancelled')
+            self._processes[process] = stop
         try:
             try:
                 output, errors = process.communicate(json.dumps({**tool.isolated, 'arguments': arguments}), timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired:
                 process.kill(); process.communicate()
                 raise TimeoutError('Isolated tool terminated at deadline')
+            if stop.is_set(): raise ToolCancelled('Tool call cancelled')  # killed by execute
             if not output.strip():  # the worker itself failed to start (a frozen build missing a module, say)
                 logger.warning('Tool worker exited with code %s and no result:\n%s', process.returncode, errors[-4000:])
                 raise RuntimeError(f'Tool worker exited with code {process.returncode} and no result')
@@ -261,7 +275,7 @@ class ToolRegistry:
             if 'error' in payload: raise RuntimeError(payload['error'])
             return payload['result']
         finally:
-            with self._execution_lock: self._processes.discard(process)
+            with self._execution_lock: self._processes.pop(process, None)
 
     def execute(self, name: str, arguments: dict[str, Any], call_id: str | None = None, *, cancelled=lambda: False) -> ToolResult:
         from ..desktop.state import get_desktop_state
@@ -294,12 +308,21 @@ class ToolRegistry:
             previous = self._running.get(name)
             if previous is not None and not previous.done():
                 return ToolResult(call_id or str(uuid.uuid4()), name, 'Previous call is still running; retry blocked to prevent duplicate side effects', True)
-            future = self.executor.submit(self._isolated_call, tool, arguments) if tool.isolated else self.executor.submit(tool.handler, arguments)
+            # This call's own stop: Stop kills only its worker or cancels only its MCP request.
+            stop, stoppable = threading.Event(), tool.isolated or isinstance(tool.client, StdioMCPClient)
+            future = (self.executor.submit(self._isolated_call, tool, arguments, stop) if tool.isolated
+                else self.executor.submit(tool.client.call, tool.name, arguments, stop.is_set) if isinstance(tool.client, StdioMCPClient)
+                else self.executor.submit(tool.handler, arguments))
             self._running[name] = future
         activity_id = desktop_state.tool_started(name, arguments)
         try:
-            # Isolated workers enforce their own hard deadline, including teardown.
-            result = future.result(timeout=self.timeout_seconds + (1 if tool.isolated else 0))
+            # Isolated workers enforce their own hard deadline, including teardown. Waiting in slices lets Stop end
+            # the call now: the turn holds the turn lock meanwhile, so every new message would be refused as busy.
+            deadline = time.monotonic() + self.timeout_seconds + (1 if tool.isolated else 0)
+            while not wait([future], max(0, min(.05, deadline - time.monotonic()))).done:
+                if time.monotonic() >= deadline: raise TimeoutError('Tool deadline exceeded')
+                if cancelled(): raise ToolCancelled('Tool call cancelled')
+            result = future.result()
             error = bool(tool.remote and isinstance(result, dict) and result.get('isError'))
             if tool.remote and isinstance(result, dict):
                 result = result.get('structuredContent', result.get('content', result))
@@ -307,6 +330,19 @@ class ToolRegistry:
             desktop_state.tool_finished(name, result, error, activity_id=activity_id)
             if corrections: result = {'result':result,'effective_arguments':arguments,'input_corrections':corrections}
             return ToolResult(call_id or str(uuid.uuid4()), name, result, error)
+        except ToolCancelled:
+            with self._execution_lock:
+                stop.set()
+                workers = [process for process, owner in self._processes.items() if owner is stop]
+            future.cancel()  # still queued: it never runs
+            for process in workers:
+                if process.poll() is None: process.kill()
+            if stoppable: wait([future], 1)  # a killed worker or a cancelled MCP request ends within moments
+            message = ('Tool cancelled because its turn was stopped; ' + ('its worker was terminated.' if tool.isolated
+                else 'the MCP server was asked to stop it.' if stoppable else 'it may still finish and cause side effects. Retries are blocked until it finishes.')
+                + ' Prior side effects are not rolled back.')
+            desktop_state.tool_finished(name, message, True, activity_id=activity_id)
+            return ToolResult(call_id or str(uuid.uuid4()), name, message, True)
         except TimeoutError:
             if isinstance(tool.client, StdioMCPClient): tool.client.close()
             message = ('Tool timed out; isolated worker terminated. Prior side effects are not rolled back.' if tool.isolated or isinstance(tool.client, StdioMCPClient)

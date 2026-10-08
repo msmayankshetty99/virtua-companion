@@ -76,7 +76,7 @@ def test_streamed_discord_edits_split_long_replies_and_keep_reasoning_separate()
             def __init__(self, content): self.content, self.deleted = content, False
             async def edit(self, *, content): self.content = content
             async def delete(self): self.deleted = True
-        async def send(content):
+        async def send(content, **kwargs):
             message = Message(content); sent.append(message); return message
         reply = StreamReply(send, prefix='Reasoning: ')
         reply.feed('a' * 4000)
@@ -89,6 +89,61 @@ def test_streamed_discord_edits_split_long_replies_and_keep_reasoning_separate()
         assert reply.timer is None
     asyncio.run(run())
 
+
+def test_a_failed_streamed_update_costs_only_that_update_and_the_final_reply_is_still_sent():
+    aiohttp = pytest.importorskip('aiohttp')
+    async def run():
+        sent, drops = [], [aiohttp.ServerDisconnectedError()] # Not an HTTPException or OSError: discord.py passes it through.
+        class Message:
+            def __init__(self, content): self.content = content
+            async def edit(self, *, content): self.content = content
+            async def delete(self): raise AssertionError('Nothing is superseded')
+        async def send(content, **kwargs):
+            if drops: raise drops.pop()
+            message = Message(content); sent.append(message); return message
+        reply = StreamReply(send)
+        reply.feed('Hel'); await reply.timer # The coalesced send hits a brief network drop.
+        assert not sent and reply.timer is None
+        reply.feed('lo'); await reply.timer # Streaming carries on with the next update.
+        assert [message.content for message in sent] == ['Hello']
+        await reply.finish('Hello there')
+        assert [message.content for message in sent] == ['Hello there']
+    asyncio.run(run())
+
+
+def test_one_failed_discord_chunk_does_not_stop_the_others_and_finish_is_idempotent():
+    async def run():
+        calls, fail, messages = [], set(), []
+        class Message:
+            def __init__(self, content): self.index, self.content = len(messages), content
+            async def edit(self, *, content):
+                calls.append(('edit', self.index))
+                if ('edit', self.index) in fail: raise OSError('connection reset')
+                self.content = content
+            async def delete(self): calls.append(('delete', self.index))
+        async def send(content, **kwargs):
+            calls.append(('send', len(messages)))
+            if ('send', len(messages)) in fail: raise ConnectionResetError('dropped')
+            message = Message(content); messages.append(message); return message
+        reply = StreamReply(send)
+        reply.text = 'a' * 1900 + 'b' * 1900; await reply.flush()
+        reply.text = 'A' * 1900 + 'B' * 1900 + 'c' * 1900 + 'd' * 1900 + 'e'
+        fail.update({('edit', 0), ('send', 3)})
+        with pytest.raises(OSError, match='connection reset'): await reply.flush() # The first failure, after the rest ran.
+        assert [message.content[0] for message in messages] == ['a', 'B', 'c'] # Chunk 4 never posts ahead of chunk 3.
+        fail.clear(); await reply.flush()
+        assert [message.content[0] for message in messages] == ['A', 'B', 'c', 'd', 'e']
+        await reply.finish('short')
+        assert messages[0].content == 'short' and calls[-4:] == [('delete', 1), ('delete', 2), ('delete', 3), ('delete', 4)]
+        count = len(calls); await reply.finish(); await reply.finish('other')
+        assert len(calls) == count and messages[0].content == 'short'
+        attempts = []
+        async def offline(content, **kwargs): attempts.append(content); raise ConnectionResetError('offline')
+        lost = StreamReply(offline)
+        with pytest.raises(ConnectionResetError): await lost.finish('final') # An undelivered final reply is reported once.
+        await lost.finish() # The turn queue's cleanup call neither retries nor raises again.
+        assert attempts == ['final']
+    asyncio.run(run())
 
 def test_voice_receive_requires_consent_and_discards_buffers_on_revoke():
     async def run():
@@ -351,3 +406,90 @@ def test_whiteboard_changes_send_images_without_polling_or_audio(tmp_path):
         assert calls == ['/api/whiteboard/image'] and sent == ['whiteboard.png']
         await bot.close()
     asyncio.run(run())
+
+
+def test_discord_transport_errors_never_end_the_turn_queue(tmp_path):
+    pytest.importorskip('discord'); aiohttp = pytest.importorskip('aiohttp')
+    from process.app_core.integrations.discord.backend import BackendError
+    from process.app_core.integrations.discord.bot import CompanionBot, Job
+    async def run():
+        sent, cleaned = [], []
+        class Backend:
+            def __init__(self, *args): self.ready = asyncio.Event(); self.ready.set()
+            async def request(self, method, path, **kwargs):
+                job, text = bot.active, kwargs['body']['text']
+                if text == 'busy': raise BackendError(409, 'Riko is already handling another turn')
+                if job.channel is offline:
+                    await bot.backend_event({'type':'chat.delta', 'turn_id':job.id, 'payload':{'text':'partial'}})
+                    job.reasoning = StreamReply(job.send); job.reasoning.feed('thinking')
+                    async def finish_view(): cleaned.append('view'); raise aiohttp.ServerDisconnectedError()
+                    bot.approvals['call'] = SimpleNamespace(job=job, finish=finish_view)
+                return {'text': 'Reply to ' + text}
+            async def close(self): pass
+        async def drop(content=None, **kwargs): raise aiohttp.ServerDisconnectedError() # Every Discord call drops (Wi-Fi roam).
+        async def deliver(content=None, **kwargs): sent.append(content); return SimpleNamespace(content=content)
+        offline, online = SimpleNamespace(id=42, guild=None, send=drop), SimpleNamespace(id=42, guild=None, send=deliver)
+        user = SimpleNamespace(id=1, display_name='Owner')
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot.processor = asyncio.create_task(bot.process_queue())
+        for channel, text in ((offline, 'lost'), (online, 'busy'), (online, 'hello')): bot.queue.put_nowait(Job(channel, user, text))
+        await asyncio.wait_for(bot.queue.join(), 10) # The bound only catches a dead queue; a passing run returns at once.
+        assert not bot.processor.done() and bot.active is None and not bot.approvals and cleaned == ['view']
+        assert sent == ['Riko is already handling another turn', 'Reply to hello'] # The backend's busy detail still reaches the user.
+        await bot.close()
+        assert bot.processor.cancelled()
+    asyncio.run(run())
+
+
+def test_turn_queue_restarts_after_an_unexpected_failure_and_stops_only_when_cancelled(tmp_path):
+    pytest.importorskip('discord')
+    from process.app_core.integrations.discord.bot import CompanionBot, Job
+    async def run():
+        sent, entered = [], asyncio.Event()
+        class Backend:
+            def __init__(self, *args): self.ready = asyncio.Event(); self.ready.set()
+            async def request(self, method, path, **kwargs):
+                if kwargs['body']['text'] == 'hang': entered.set(); await asyncio.Event().wait()
+                return {'text': 'Reply to ' + kwargs['body']['text']}
+            async def close(self): pass
+        async def deliver(content=None, **kwargs): sent.append(content); return SimpleNamespace(content=content)
+        channel, user = SimpleNamespace(id=42, guild=None, send=deliver), SimpleNamespace(id=1, display_name='Owner')
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        finish_job = bot.finish_job
+        async def bug(job): bot.finish_job = finish_job; raise RuntimeError('unexpected bug')
+        bot.finish_job = bug
+        bot.start_processor(); first = bot.processor
+        bot.queue.put_nowait(Job(channel, user, 'one')); bot.queue.put_nowait(Job(channel, user, 'two'))
+        await asyncio.wait_for(bot.queue.join(), 10)
+        assert first.done() and isinstance(first.exception(), RuntimeError)
+        assert bot.processor is not first and not bot.processor.done() and bot.active is None
+        assert sent == ['Reply to one', 'Reply to two']
+        second = bot.processor
+        bot.queue.put_nowait(Job(channel, user, 'hang')); await asyncio.wait_for(entered.wait(), 10)
+        second.cancel() # Cancelled mid-turn outside close() (loop shutdown): the queue stops instead of swallowing it.
+        await asyncio.wait_for(asyncio.gather(second, return_exceptions=True), 10)
+        assert second.cancelled() and bot.processor is second and bot.active is None
+        await bot.close()
+    asyncio.run(run())
+
+
+def test_a_chunk_retried_after_an_ambiguous_failure_is_posted_once():
+    import aiohttp
+    async def scenario():
+        posted = {}  # Discord's view: one message per nonce, as with enforce_nonce
+        class Message:
+            def __init__(self, content): self.content = content
+            async def edit(self, content): self.content = content
+        calls = []
+        async def send(content, nonce=None, **kwargs):
+            calls.append(nonce)
+            message = posted.setdefault(nonce, Message(content))
+            if len(calls) == 1: raise aiohttp.ServerDisconnectedError()  # created, but the response was lost
+            return message
+        reply = StreamReply(send)
+        reply.feed('Hel')
+        await reply.timer  # the coalesced update fails after Discord made the message
+        await reply.finish('Hello there')
+        return posted, calls
+    posted, calls = asyncio.run(scenario())
+    assert len(posted) == 1 and [message.content for message in posted.values()] == ['Hello there'] and len(set(calls)) == 1

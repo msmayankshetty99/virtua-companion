@@ -109,7 +109,11 @@ export default function StreamChat({onSettings,preferences={},compactMode=false,
     const value = text; setText('');
     try {
       const response = await fetch('http://127.0.0.1:8765/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: value})});
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        let message = await response.text(); try {const {detail} = JSON.parse(message); if (typeof detail === 'string') message = detail;} catch {}
+        if (response.status === 409) setText(current => current || value); // busy: the message was never sent, so keep it to resend
+        throw new Error(message);
+      }
     } catch (error) {setError(error.message);} finally {setBusy(false);}
   }
   async function stop() {

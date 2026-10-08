@@ -219,16 +219,19 @@ class LlamaContextProvider(InferenceLane):
                     # Tokenizer/template preflight is not inference; it shares this
                     # request's cancellable transport, including before first token.
                     from .context_budget import pack_context
+                    probes = []
                     def count(value):
                         check()
+                        probes.append(len(value))
                         rendered = client.post('/apply-template', json={'messages': [m.as_dict() for m in template_messages(value)], 'tools': tools or [], 'add_generation_prompt': True})
                         self._check_response(rendered)
                         tokenized = client.post('/tokenize', json={'content': rendered.json()['prompt'], 'add_special': True, 'parse_special': True})
                         self._check_response(tokenized)
                         return len(tokenized.json()['tokens'])
-                    packed = pack_context(messages, count, limit, payload['max_output_tokens'], cancelled=lambda: stop.is_set() or cancelled() or self.closed)
-                    logger.debug('Inference preflight provider=%s role=%s slot=%s wait_s=%.3f context_pack_s=%.3f messages=%s context_limit=%s',
-                        type(self).__name__, role, slot, leased_at-queued_at, time.perf_counter()-leased_at, len(packed), limit)
+                    packed = pack_context(messages, count, limit, payload['max_output_tokens'], cancelled=lambda: stop.is_set() or cancelled() or self.closed,
+                        state=options.get('context_state'))
+                    logger.debug('Inference preflight provider=%s role=%s slot=%s wait_s=%.3f context_pack_s=%.3f token_counts=%s counted_messages=%s messages=%s context_limit=%s',
+                        type(self).__name__, role, slot, leased_at-queued_at, time.perf_counter()-leased_at, len(probes), sum(probes), len(packed), limit)
                     payload['input'] = response_input(template_messages(packed))
                     with client.stream('POST', '/v1/responses', json=payload) as response:
                         self._check_response(response)

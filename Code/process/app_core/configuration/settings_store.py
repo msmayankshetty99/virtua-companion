@@ -12,6 +12,7 @@ import tempfile
 import threading
 
 from .config import load_config
+from ..persistence.atomic import atomic_write
 
 LOCK = threading.RLock()
 OBSOLETE = {'avatar.camera.distance', 'avatar.expression_engine', 'avatar.view', 'desktop.shortcuts.effects',
@@ -70,6 +71,7 @@ OPTIONAL_TEXT = {'runtime.model_path', 'runtime.hf_repo_id', 'runtime.hf_filenam
 OPTIONAL_TEXT |= {'runtime.tokenizer_model', 'emotion.model_path', 'emotion.cache_dir', 'memory.system1_cache_dir'}
 OPTIONAL_TEXT |= {'runtime.native_library'}
 OPTIONAL_TEXT |= {'sovits_ping_config.executable'}
+TEXT_FIELDS = {'voice.wake_word'}  # edited as text even when the file holds a number or boolean, and written quoted
 HELP = {
     'sovits_ping_config.auto_start': 'Packaged app only: explicitly launch your GPT-SoVITS API executable on startup. The app stops only its owned direct process on quit. Save and restart the app, not just Python.',
     'sovits_ping_config.executable': 'Absolute path to a GPT-SoVITS API-server executable, not a GUI launcher. Its dependencies and model weights must already be installed. Save and restart the packaged app.',
@@ -122,7 +124,7 @@ HELP = {
     'runtime.cache_size_mb': 'Optional extra RAM prompt cache; 0 still preserves per-slot live prefix reuse.',
     'runtime.warmup': 'Preload models and silently test TTS. Does not open your microphone.',
     'voice.input_device': 'Automatic uses the system microphone. Changes apply on backend restart.',
-    'voice.wake_word': 'One short name supported by EfficientWord-Net. Changing name/device requires its matching enrollment.',
+    'voice.wake_word': 'One short name supported by EfficientWord-Net. Without one, the first word of the companion name is used. Changing name/device requires its matching enrollment. Restart Python.',
     'voice.asr_device': 'auto uses CUDA when CTranslate2 sees a supported GPU (NVIDIA, or AMD with a HIP-built CTranslate2), otherwise the CPU. CTranslate2 has no Metal backend, so Macs transcribe on the CPU. Packaged builds bundle no CUDA libraries for speech recognition; keep cpu there. Save and restart Python.',
     'voice.asr_compute_type': 'default picks the fastest precision the device supports: int8_float16 on recent NVIDIA GPUs, int8 on the CPU. float16 and int8_float16 need a GPU. A pair this machine cannot run is refused here; one already in the file is replaced at startup with a logged warning. Save and restart Python.',
     'voice.live_transcript_interval_seconds': 'Rolling provisional ASR updates while you are still speaking. One partial job at a time; final transcription replaces partial text. Smaller intervals increase ASR work. Applies on microphone restart.',
@@ -206,7 +208,7 @@ def flatten(value, prefix=''):
 
 
 def field(path, value):
-    kind = 'boolean' if type(value) is bool else 'number' if type(value) in (int, float) or path in INTEGER_NULLS else 'json' if isinstance(value, (list, dict)) or path in JSON_NULLS else 'text'
+    kind = 'text' if path in TEXT_FIELDS else 'boolean' if type(value) is bool else 'number' if type(value) in (int, float) or path in INTEGER_NULLS else 'json' if isinstance(value, (list, dict)) or path in JSON_NULLS else 'text'
     nullable = value is None or path in INTEGER_NULLS | JSON_NULLS | OPTIONAL_TEXT
     group = {'runtime':'models', 'voice':'voice', 'speech':'speech', 'sovits_ping_config':'speech', 'memory':'memory',
         'wake_feedback':'voice',
@@ -261,7 +263,9 @@ class SettingsStore:
     def _read(self):
         from ruamel.yaml import YAML
         text = self.path.read_text(encoding='utf-8')
-        raw = YAML().load(text)
+        # Keep quotes: ruamel writes YAML 1.2, and the backend's PyYAML reads an unquoted yes or 42 as a boolean or number.
+        yaml = YAML(); yaml.preserve_quotes = True
+        raw = yaml.load(text)
         if not isinstance(raw, dict): raise ValueError('Configuration must be a YAML mapping')
         return text, raw
 
@@ -313,6 +317,8 @@ class SettingsStore:
         from ..audio.asr import MODEL
         for key, value in {'asr_model':MODEL,'asr_device':'auto','asr_compute_type':'default','live_transcript_interval_seconds':2.0}.items():
             values.setdefault('voice.' + key, value)
+        from ..audio.wake_word import wake_phrase
+        values.setdefault('voice.wake_word', wake_phrase(raw.get('voice'), candidate.character_name)[0])
         return json.loads(json.dumps(values, default=str))
 
     def prepare(self, changes):
@@ -339,6 +345,9 @@ class SettingsStore:
                 for key in keys[:-1]:
                     if key not in node: node[key] = {}
                     node = node[key]
+                if path in TEXT_FIELDS and isinstance(value, str):
+                    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+                    value = DoubleQuotedScalarString(value)
                 node[keys[-1]] = deepcopy(value)
         if errors: return text, None, errors
         if any(key in changes for key in ('avatar.model', 'avatar.format')):
@@ -355,9 +364,12 @@ class SettingsStore:
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as file: file.write(output)
             candidate = load_config(temporary)
-            voice = candidate.raw.get('voice', {})
+            voice = candidate.raw.get('voice') or {}
             if voice.get('mode', 'wake_word') not in {'wake_word', 'manual', 'continuous'}: errors['voice.mode'] = 'Invalid activation mode'
-            if len(str(voice.get('wake_word', 'Riko')).split()) != 1: errors['voice.wake_word'] = 'Use one short wake name'
+            # The phrase the runtime will use: voice.wake_word as PyYAML reads it, or the first word of the name.
+            from ..audio.wake_word import wake_phrase
+            problem = wake_phrase(voice, candidate.character_name)[1]
+            if problem: errors['voice.wake_word'] = problem
             # Check the speech recognition pair only when it is edited, so a pair this machine cannot run (which
             # falls back at startup) never blocks saving other settings.
             asr_keys = [key for key in ('voice.asr_device', 'voice.asr_compute_type') if key in changes]
@@ -426,10 +438,7 @@ class SettingsStore:
                 os.replace(temporary, self.path)
                 # Live initiative preferences share these budgets. Preserve all
                 # other preferences while saving model/runtime budgets together.
-                if saved_preferences is not None:
-                    pending = preferences.with_suffix('.settings.tmp')
-                    pending.write_text(json.dumps(saved_preferences, indent=2), encoding='utf-8')
-                    pending.replace(preferences)
+                if saved_preferences is not None: atomic_write(preferences, json.dumps(saved_preferences, indent=2))
             finally: Path(temporary).unlink(missing_ok=True)
             return {**self.snapshot(), 'saved': True, 'restart_required': any(not key.startswith('avatar.') and key not in {'runtime.pause_background_on_live', 'emotion.probe.interval_tokens'} for key in changes)}
 

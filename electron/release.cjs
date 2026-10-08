@@ -27,10 +27,12 @@ function configuration(input,resources,platform=process.platform){
  if(!Number.isInteger(threads)||threads<1||threads>1024)throw new Error('Invalid CPU thread count');
  if(!input.modelPath&&(!input.repo||!input.filename||!input.filename.endsWith('.gguf')||input.filename.includes('..')||input.filename.startsWith('/')))throw new Error('Choose a local GGUF or exact Hugging Face repository/file');
  if(input.modelPath&&(!path.isAbsolute(input.modelPath)||!input.modelPath.toLowerCase().endsWith('.gguf')||!fs.existsSync(input.modelPath)))throw new Error('Local GGUF does not exist');
+ // The name may be several words, but the wake detector enrolls one: the wake name is the name's first word.
+ const name=String(input.name||'').trim()||'Riko';
  return {runtime:{provider:'llama_cpp',native_library:'bundled:'+input.backend,model_path:input.modelPath||null,hf_repo_id:input.repo||null,hf_filename:input.filename||null,hf_revision:input.revision||'main',n_ctx:context,max_output_tokens:output,n_threads:threads,n_gpu_layers:input.cpuOnly?0:-1,parallel_slots:2,flash_attn:'auto',type_k:'f16',type_v:'f16',warmup:false},
-  presets:{default:{name:input.name||'Riko',system_prompt:input.prompt||'You are a helpful local companion.'}},
+  presets:{default:{name,system_prompt:input.prompt||'You are a helpful local companion.'}},
   memory:{context_window_tokens:context-output,default_memories:String(input.memories||'').split('\n').filter(t=>t.trim()).map(text=>({text,memory_type:'factual',importance:.8})),embeddings_enabled:!!input.embeddings,system1_enabled:!!input.julia,reflection_enabled:!!input.reflection},
-  emotion:{enabled:!!input.julia,device:'cpu',probe:{enabled:false}},voice:{asr_device:'cpu',asr_compute_type:'int8'},tools:{require_approval:true},initiative:{enabled:false},desktop:{setup_on_startup_error:true},
+  emotion:{enabled:!!input.julia,device:'cpu',probe:{enabled:false}},voice:{wake_word:name.split(/\s+/)[0],asr_device:'cpu',asr_compute_type:'int8'},tools:{require_approval:true},initiative:{enabled:false},desktop:{setup_on_startup_error:true},
   sovits_ping_config:{auto_start:!!input.sovitsAuto,executable:input.sovitsExecutable||null,arguments:[],url:input.sovitsUrl||'http://127.0.0.1:9880/tts',ref_audio_path:input.referenceAudio||'',prompt_text:input.referenceText||'',text_lang:'en',prompt_lang:'en',sample_rate:32000}};
 }
 // The folder an update replaces and an uninstall deletes (NSIS ends with RMDir /r $INSTDIR): the .app bundle on
@@ -43,8 +45,9 @@ function saveSetup(directory,input,resources,install=resources,platform=process.
  const config=configuration(input,resources,platform);
  fs.mkdirSync(directory,{recursive:true});
  for(const folder of ['models','persistent_memories','logs'])fs.mkdirSync(path.join(directory,folder),{recursive:true});
- // Never overwrite an existing user configuration, even after a failed first run.
- fs.writeFileSync(path.join(directory,'character_config.yaml'),YAML.stringify(config),{flag:'wx',mode:0o600});
+ // Never overwrite an existing user configuration, even after a failed first run. The backend's PyYAML reads YAML 1.1,
+ // so quote what it would not read as text (a companion named Yes or On would otherwise become a boolean).
+ fs.writeFileSync(path.join(directory,'character_config.yaml'),YAML.stringify(config,{compat:'yaml-1.1'}),{flag:'wx',mode:0o600});
  return directory;
 }
 // The backend prints this line once it holds 127.0.0.1:8765. Main sends the API token only after it, so a

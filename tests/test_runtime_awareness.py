@@ -49,6 +49,7 @@ def test_priority_preserves_overlap_and_restores_normal_threshold(monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.time.monotonic', lambda: now[0])
     session = make_session(monkeypatch)
     activate(session)
+    session._generated = 'One two three four five.'  # the user talks over visible text
     anchor = session.voice_anchor()
     result = session.interrupt_user('Let me finish this point')
     assert result['interruption_seconds'] == 6
@@ -56,8 +57,7 @@ def test_priority_preserves_overlap_and_restores_normal_threshold(monkeypatch):
     session.voice_activity(2.0, anchor)
     assert not session.speech.cancelled
     assert not session.user_interrupted(anchor)
-    session._generated = 'One two three four five.'
-    session.voice_transcript('But what about tomorrow?', 100, 102, anchor)
+    assert session.voice_transcript('But what about tomorrow?', 100, 102, anchor) == 'preserved'
     assert '[speaking over you] But what about tomorrow?' in str(session._response_history(session._generated))
     assert session.runtime_snapshot()['runtime']['speaking_priority']['active']
     now[0] = 116
@@ -103,6 +103,8 @@ def test_runtime_context_refreshes_after_tool_and_includes_outcomes(monkeypatch)
         def generate(self, messages, **options):
             snapshot = json.loads(messages[-1].content.split('\n', 1)[1])
             observed.append(snapshot)
+            # A changed state adds a refreshed observation after the tool result; the sent one stays so the prompt prefix is reused.
+            assert sum(m.content.startswith('Current runtime observation') for m in messages) == len(observed)
             if len(observed) == 1:
                 return ModelResponse(ChatMessage('assistant', tool_calls=[ToolCall('call1', 'interrupt_user', {'reason': 'Let me explain'})]))
             assert snapshot['runtime']['speaking_priority']['active']
@@ -126,6 +128,7 @@ def test_runtime_context_refreshes_after_tool_and_includes_outcomes(monkeypatch)
 def test_delayed_asr_preserves_tolerated_speech_without_reply_dispatch(monkeypatch):
     session = make_session(monkeypatch)
     activate(session)
+    session._generated = 'Let me finish this explanation.'  # the user talks over visible text
     anchor = session.voice_anchor()
     session.interrupt_user('Finish my explanation')
     session.voice_activity(2, anchor)

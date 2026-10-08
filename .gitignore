@@ -49,6 +49,9 @@ output.wav
 **/persistent_memories/confirm_key
 **/persistent_memories/.api_token.*.tmp
 **/persistent_memories/.confirm_key.*.tmp
+# Kept copies of unreadable or repaired user files, and writes a killed process left (persistence/preserve.py, atomic.py).
+**/persistent_memories/*.unreadable-*
+**/persistent_memories/.*.tmp
 /.native/
 /character_config.yaml.previous
 /.settings-save-*

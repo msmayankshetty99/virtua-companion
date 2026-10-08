@@ -175,15 +175,11 @@ class VoiceInput:
                     if text:
                         observer = getattr(getattr(self.session, 'state', None), 'observe_input', None)
                         if observer: observer('microphone', text, message_id=segment.utterance_id)
-                        # Preserve interjections immediately, even if the reply
-                        # dispatch worker is still waiting on an earlier turn.
-                        accepted = True
-                        if segment.anchor:
-                            accepted = self.session.voice_transcript(text, segment.started_at, segment.ended_at, segment.anchor)
-                        # Follow actual VAD cancellation, not a threshold re-evaluated
-                        # after slow ASR or speaking-priority expiry.
-                        if accepted and (segment.anchor is None or self.session.user_interrupted(segment.anchor)):
-                            self.responses.submit(self._dispatch, text, segment)
+                        # Place words spoken during a reply now, even if the dispatch worker is still waiting on an
+                        # earlier turn; the session says whether they need a reply (SessionManager.voice_transcript).
+                        disposition = self.session.voice_transcript(text, segment.started_at, segment.ended_at, segment.anchor) if segment.anchor else 'fresh'
+                        if disposition == 'fresh': self.responses.submit(self._dispatch, text, segment)
+                        elif disposition == 'reply': self.responses.submit(self._dispatch, text, segment, segment.anchor[0])
             except Exception as exc:
                 logger.exception("Transcription failed")
                 self._parts.pop(segment.utterance_id, None)
@@ -193,20 +189,16 @@ class VoiceInput:
                     with self._partial_lock: self._partial_pending.discard(segment.utterance_id)
                 self.jobs.task_done()
 
-    def _dispatch(self, text, segment):
+    def _abandoned(self):
+        return self.closed.is_set() or self.session.wake.calibrating or getattr(self.session.wake, 'testing', False)
+
+    def _dispatch(self, text, segment, reply_to=None):
         try:
-            if self.session.wake.calibrating or self.session.wake.testing: return
-            anchor = segment.anchor
-            # Waiting/generation must never block the ASR or microphone workers.
-            while not self.closed.is_set():
-                if self.session.wake.calibrating or self.session.wake.testing: return
-                if self.session._turn_lock.acquire(timeout=0.1):
-                    self.session._turn_lock.release()
-                    if anchor and anchor[0] != self.session._active_turn:
-                        event_bus.publish("voice.error", error="Interrupted turn changed before reply dispatch; transcript was preserved")
-                        return
-                    self.session.respond(text, record_user=anchor is None, origin={'source':'microphone', 'message_id':segment.utterance_id})
-                    return
+            if self._abandoned(): return
+            # respond() waits for a running turn or initiative on this worker (never the ASR or microphone workers), so a
+            # finished utterance is answered after it instead of being refused and lost. reply_to redoes a reply it cut.
+            self.session.respond(text, record_user=reply_to is None, reply_to=reply_to, wait=self._abandoned,
+                origin={'source':'microphone', 'message_id':segment.utterance_id})
         except TurnCancelled:
             pass
         except Exception as exc:

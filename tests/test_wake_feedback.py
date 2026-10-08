@@ -106,6 +106,22 @@ def test_only_keyword_activation_triggers_session_feedback(tmp_path):
         session.close()
 
 
+def test_invalid_feedback_settings_leave_no_session_worker_or_listener(tmp_path, monkeypatch):
+    """desktop_server keeps Settings up when the session cannot start, so a failed construction must not leak."""
+    from process.app_core.desktop.state import DesktopState
+    from process.app_core.runtime.session import SessionManager
+    closed = []
+    class Speech:
+        def __init__(self, *args): pass
+        def close(self): closed.append('speech')
+    monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
+    config = SimpleNamespace(root=tmp_path, character_name='Riko', raw={'wake_feedback': {'volume': 5}})
+    listeners = len(event_bus._listeners)
+    with pytest.raises(ValueError, match='wake_feedback.volume'):
+        SessionManager(config, SimpleNamespace(provider=SimpleNamespace(close=lambda: None)), DesktopState())
+    assert closed == ['speech'] and len(event_bus._listeners) == listeners
+
+
 def test_feedback_defaults_and_rules_are_editable_and_validated_in_settings(tmp_path):
     from process.app_core.configuration.settings_store import SettingsStore
     path = tmp_path / 'character_config.yaml'
