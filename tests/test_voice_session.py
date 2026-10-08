@@ -73,7 +73,7 @@ def test_speech_during_reasoning_extends_original_input_without_annotation(monke
         kwargs['on_reasoning']('Thinking about the answer')
         anchor = session.voice_anchor()
         assert not session.voice_speaking_over(anchor)
-        assert session.voice_transcript('And tomorrow too', 1, 2, anchor)
+        assert session.voice_transcript('And tomorrow too', 1, 2, anchor) == 'reply'  # the cut reply is redone
         raise TurnCancelled()
     chat.respond = respond
     with pytest.raises(TurnCancelled): session.respond('What about today?')
@@ -83,6 +83,26 @@ def test_speech_during_reasoning_extends_original_input_without_annotation(monke
     session.close()
 
 
+def test_stop_during_reasoning_ends_the_turn_at_the_next_reasoning_delta(monkeypatch):
+    from process.app_core.events.bus import event_bus
+    chat = SimpleNamespace(history=[], _save_history=lambda: None, close=lambda: None)  # a chat without a provider can still be stopped
+    session = make_session(monkeypatch, chat)
+    shown, after_stop = [], []
+    unsubscribe = event_bus.subscribe(lambda event: shown.append(event.payload['text']) if event.type == 'model.reasoning' else None)
+    def respond(text, user, **kwargs):
+        kwargs['on_reasoning']('Thinking')
+        session.cancel()  # Stop while the model is still reasoning, before any visible word
+        try: kwargs['on_reasoning']('still thinking')  # a provider streaming reasoning stops right here
+        except TurnCancelled: after_stop.append('raised'); raise
+        after_stop.append('kept reasoning')
+        return ModelResponse(ChatMessage('assistant', 'Late answer'))
+    chat.respond = respond
+    try:
+        with pytest.raises(TurnCancelled): session.respond('Hard question')
+        assert after_stop == ['raised'] and shown == ['Thinking']
+    finally: unsubscribe(); session.close()
+
+
 def test_visible_text_counts_as_speaking_over_even_before_playback(monkeypatch):
     chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
     session = make_session(monkeypatch, chat)
@@ -90,10 +110,10 @@ def test_visible_text_counts_as_speaking_over_even_before_playback(monkeypatch):
         kwargs['on_delta']('Visible answer')
         anchor = session.voice_anchor()
         assert session.voice_speaking_over(anchor)
-        session.voice_transcript('One more thing', 1, 2, anchor)
+        assert session.voice_transcript('One more thing', 1, 2, anchor) == 'preserved'
         chat.history.extend([ChatMessage('user', text), *kwargs['response_history']('Visible answer')])
         return ModelResponse(ChatMessage('assistant', 'Visible answer'))
     chat.respond = respond
-    session.respond('hello', speak=False)
+    session.respond('hello')  # nothing has played yet (FakeSpeech queues nothing)
     assert any(m.content == '[speaking over you] One more thing' for m in chat.history)
     session.close()

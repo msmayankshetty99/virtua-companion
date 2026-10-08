@@ -54,6 +54,6 @@ def warm_session(session):
         model = session.wake._backend()
         model.audioToVector(np.zeros(model.window_frames, dtype='float32'))
     jobs = [('asr', asr), ('vad', vad)]
-    if session.wake.mode == 'wake_word': jobs.append(('wake_detector', wake))
+    if session.wake.mode == 'wake_word' and not session.wake.unavailable: jobs.append(('wake_detector', wake))
     if session.state.audio_enabled: jobs.append(('tts', session.speech.warmup))
     warm_components(jobs, session.config.runtime.startup_timeout_seconds)

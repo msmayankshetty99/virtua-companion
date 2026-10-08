@@ -3,6 +3,7 @@ from collections import deque
 from ..runtime.workers import DaemonExecutor
 from hashlib import sha256
 import json
+import logging
 import os
 import threading
 import time
@@ -10,6 +11,17 @@ import time
 from ..events.bus import event_bus
 from ..events.outbox import Outbox
 from .wake_capture import WakeCapture, prepare_audio
+
+
+def wake_phrase(voice, character_name):
+    """The wake name and, when the detector cannot use it, why ('' otherwise). Without voice.wake_word it is the first
+    word of the companion's name: the packaged setup accepts any name, and enrollment needs one short word."""
+    configured = voice.get('wake_word') if isinstance(voice, dict) else None
+    if configured is None: return (str(character_name or '').split() or ['Riko'])[0], ''
+    if not isinstance(configured, str):  # PyYAML reads an unquoted 42 or yes as a number or boolean
+        return str(configured), f'YAML read it as {type(configured).__name__}, not text: quote numbers and yes, no, on or off'
+    phrase = configured.strip()
+    return phrase, '' if len(phrase.split()) == 1 else 'Use one short wake name (a single word)'
 
 
 def profile_key(phrase, device):
@@ -20,13 +32,15 @@ def profile_key(phrase, device):
 
 class WakeWord:
     def __init__(self, config):
-        settings = config.raw.get("voice", {})
+        settings = config.raw.get("voice") or {}
         self.mode = settings.get("mode", "wake_word")
         if self.mode not in {"wake_word", "continuous", "manual"}:
             raise ValueError("voice.mode must be wake_word, continuous or manual")
-        self.phrase = settings.get("wake_word", config.character_name).strip()
-        if not self.phrase or len(self.phrase.split()) != 1:
-            raise ValueError("This enrollment detector requires a single short wake name")
+        self.phrase, problem = wake_phrase(settings, config.character_name)
+        # An unusable wake word disables only enrollment and keyword detection: startup, chat, Speak now and the
+        # other modes still work, and the status shows why.
+        self.unavailable = f'Wake word “{self.phrase}” cannot be used. {problem}. Change it in Settings and restart Python.' if problem else ''
+        if self.unavailable: logging.getLogger(__name__).warning('%s', self.unavailable)
         self.threshold = float(settings.get("wake_threshold", .9))
         self.config_threshold = self.threshold
         self.followup = float(settings.get("follow_up_seconds", 10))
@@ -50,7 +64,7 @@ class WakeWord:
         self.calibrating = False
         self.closed = False
         self.testing = False
-        self.error = ""
+        self.error = self.unavailable
         self.counter = 0
         self.live_capture = WakeCapture()
         self.last_score = None
@@ -65,9 +79,9 @@ class WakeWord:
             self.path = self.directory / (profile_key(self.phrase, identity) + '.json')
             self.embeddings, self.samples = [], []
             self.threshold = self.config_threshold
-            self.error = ''
+            self.error = self.unavailable
             self.testing = False
-            if self.path.exists():
+            if not self.unavailable and self.path.exists():
                 try:
                     data = json.loads(self.path.read_text(encoding='utf8'))
                     if data.get('key') != self.path.stem: raise ValueError('Enrollment identity mismatch')
@@ -146,6 +160,7 @@ class WakeWord:
 
     def begin_calibration(self):
         with self.lock:
+            if self.unavailable: raise ValueError(self.unavailable)
             if self.device is None: raise ValueError('Start microphone capture first')
             self.calibrating = True
             self.testing = False
@@ -232,7 +247,7 @@ class WakeWord:
                     self.job = self.worker.submit(self._enroll, pcm)
                 return
             testing = getattr(self, 'testing', False)
-            if self.calibrating or (self.mode != 'wake_word' and not testing) or (self.active() and not testing):
+            if self.calibrating or self.unavailable or (self.mode != 'wake_word' and not testing) or (self.active() and not testing):
                 self.live_capture = WakeCapture()
                 return
             outcome, pcm = self.live_capture.feed(frame, speaking)

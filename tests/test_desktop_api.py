@@ -295,6 +295,33 @@ def test_failed_session_start_closes_constructed_chat(backend,monkeypatch):
     assert closed==['chat']
 
 
+def test_a_multi_word_companion_name_starts_the_real_session(backend, monkeypatch):
+    """Regression: WakeWord refused a two-word name such as the fixture's 'Test character' in every mode, which the
+    packaged setup accepts, and the lifespan aborted after the model had loaded."""
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace(provider=SimpleNamespace(close=lambda: None)))
+    monkeypatch.setattr(backend, 'Initiative', lambda session: None)
+    with client_for(backend) as client:
+        wake = client.get('/api/voice/status').json()['wake']
+        assert (wake['mode'], wake['wake_word'], wake['error']) == ('wake_word', 'Test', '')
+        assert client.get('/api/status').json()['startup_error'] == ''
+    assert backend.session._closed
+
+
+def test_setup_mode_survives_a_session_that_cannot_start(backend, monkeypatch):
+    """Voice settings are checked only after the model has loaded; their errors keep Settings up like a model error."""
+    backend.config.raw.update(desktop={'setup_on_startup_error': True}, voice={'mode': 'push_to_talk'})
+    (backend.config.root / 'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n')
+    closed = []
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace(close=lambda: closed.append('chat'), provider=None))
+    listeners = len(backend.event_bus._listeners)
+    with client_for(backend) as client:
+        assert 'voice.mode must be' in client.get('/api/status').json()['startup_error']
+        assert client.get('/api/settings').status_code == 200
+        assert client.get('/api/voice/status').status_code == 503
+        assert closed == ['chat'] and backend.chat is None and backend.session is None  # the loaded model is released
+    assert len(backend.event_bus._listeners) == listeners
+
+
 def test_setup_mode_keeps_settings_accessible_with_cors(backend,monkeypatch):
     backend.config.raw['desktop']={'setup_on_startup_error':True}
     (backend.config.root/'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n')
@@ -512,6 +539,29 @@ def test_stop_turn_cancels_the_live_session_before_the_drain(backend, monkeypatc
     assert calls == ['cancel'] and time.monotonic() - started < 3  # a stuck cancel is abandoned after 1 s
 
 
+def test_chat_while_another_turn_runs_is_a_conflict_not_a_server_error(backend, monkeypatch):
+    from pathlib import Path
+    from process.app_core.runtime.session import SessionManager
+    class Speech:
+        def __init__(self, *args): pass
+        def submit(self, *args): return False
+        def cancel(self): pass
+        def close(self): pass
+    monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
+    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    session = SessionManager(config, SimpleNamespace(history=[], _save_history=lambda: None, close=lambda: None), backend.state)
+    monkeypatch.setattr(backend, 'session', session)
+    client = client_for(backend, raise_server_exceptions=False)
+    session._turn_lock.acquire()  # a voice or Discord turn, or a reply still stopping
+    try:
+        response = client.post('/api/chat', json={'text': 'hello'})
+        assert response.status_code == 409 and 'still handling another reply' in response.json()['detail']
+    finally: session._turn_lock.release(); session.close()
+    def fail(*args): raise RuntimeError('model exploded')
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(respond=fail))
+    assert client.post('/api/chat', json={'text': 'hello'}).status_code == 500  # any other failure is still a server error
+
+
 def test_lifespan_stops_discord_while_the_session_closes(backend, monkeypatch):
     closing, calls = threading.Event(), []
     monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace())
@@ -525,3 +575,19 @@ def test_lifespan_stops_discord_while_the_session_closes(backend, monkeypatch):
         stop=lambda: calls.append(('discord', closing.wait(5)))))
     with client_for(backend): pass
     assert ('discord', True) in calls and 'close' in calls  # Discord's stop overlapped the session close
+
+
+def test_an_interjection_that_cuts_the_reply_in_flight_redoes_it(backend, monkeypatch):
+    redone, calls = threading.Event(), []
+    def respond(text, **kwargs):
+        calls.append((text, kwargs['record_user'], kwargs['reply_to']))
+        redone.set()
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(voice_anchor=lambda: ('turn-1', 0, False),
+        voice_transcript=lambda text, started_at, ended_at, anchor: 'reply', respond=respond))
+    client = client_for(backend)
+    body = {'text': 'and tomorrow', 'started_at': 1, 'ended_at': 2}
+    assert client.post('/api/voice/interjection', json=body).json() == {'accepted': True}
+    assert redone.wait(5) and calls == [('and tomorrow', False, 'turn-1')]  # the words are already in history
+    def unexpected(*args): raise AssertionError('no reply is in flight')
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(voice_anchor=lambda: None, voice_transcript=unexpected))
+    assert client.post('/api/voice/interjection', json=body).json() == {'accepted': False}  # the client sends a chat turn

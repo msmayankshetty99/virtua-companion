@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
+from concurrent.futures import Future, wait
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Iterable, Sequence
 
@@ -39,11 +42,8 @@ class OpenAIProvider:
         if tools:
             kwargs["tools"] = tools
         if options.get("on_delta"):
-            stream = self.client.chat.completions.create(**kwargs, stream=True)
-            try:
+            with cancellable_stream(lambda: self.client.chat.completions.create(**kwargs, stream=True), options.get('cancelled')) as stream:
                 return assemble_stream((chunk.model_dump() for chunk in stream), options["on_delta"], on_reasoning=options.get('on_reasoning'))
-            finally:
-                stream.close()
         response = self.client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         msg = choice.message
@@ -82,27 +82,26 @@ class OpenAIProvider:
         callback = options.get('on_delta')
         words = WordDeltas(callback) if callback else None
         response = None
-        try:
-            try:
-                result = self.client.responses.create(**kwargs, stream=bool(callback))
+        def start():
+            try: return self.client.responses.create(**kwargs, stream=bool(callback))
             except Exception as exc:
                 if not previous or getattr(exc, 'status_code', None) not in {400, 404}: raise
                 with self.cache_lock:
                     self.response_cache = [entry for entry in self.response_cache if entry[1] != previous]
                 kwargs.pop('previous_response_id')
                 kwargs['input'] = inputs
-                result = self.client.responses.create(**kwargs, stream=bool(callback))
+                return self.client.responses.create(**kwargs, stream=bool(callback))
+        try:
             if callback:
-                try:
+                with cancellable_stream(start, options.get('cancelled')) as result:
                     for event in result:
                         if event.type == 'response.output_text.delta': words.feed(event.delta)
                         elif event.type == 'response.reasoning_summary_text.delta' and options.get('on_reasoning'): options['on_reasoning'](event.delta)
                         elif event.type == 'response.completed': response = event.response
                         elif event.type in {'response.failed', 'error'}: raise RuntimeError(str(event))
-                finally: result.close()
                 if response is None: raise RuntimeError('Response stream ended without completion')
                 words.finish()
-            else: response = result
+            else: response = start()
             raw = response.model_dump()
             text, calls = [], []
             for output in raw.get('output', []):
@@ -185,6 +184,51 @@ class OpenAIProvider:
     def close(self):
         close = getattr(self.client, "close", None)
         if close: close()
+
+
+@contextmanager
+def cancellable_stream(start, cancelled=None):
+    """Iterate a streamed request that Stop interrupts even while the server is silent: before its headers arrive
+    (prefill, model load) and between events (unstreamed reasoning). A helper thread makes the request, then shuts
+    its socket down on cancellation, which wakes the blocked read (closing alone may not). It is per request on
+    purpose: initiative and reflection share this provider, so a provider-wide cancel would stop them too.
+    Any failure once cancelled is BackgroundPreempted, as from the llama.cpp providers."""
+    from .llama_context import BackgroundPreempted
+    cancelled = cancelled or (lambda: False)
+    opened, done, abandoned, closing = Future(), threading.Event(), threading.Event(), threading.Lock()
+    def guard():
+        try: stream = start()
+        except BaseException as exc: return opened.set_exception(exc)
+        opened.set_result(stream)
+        while not done.wait(.05):
+            if not cancelled(): continue
+            with closing:  # never after the reader closed it: a finished connection goes back to the shared pool
+                if done.is_set(): break
+                try: stream.response.extensions['network_stream'].get_extra_info('socket').shutdown(socket.SHUT_RDWR)
+                except Exception: pass  # another transport: the per-event check below still stops it
+            return
+        if abandoned.is_set(): stream.close()  # it answered after Stop: hang up at once
+    threading.Thread(target=guard, daemon=True, name='inference-request').start()
+    def events(stream):
+        for event in stream:
+            if cancelled(): raise BackgroundPreempted('Inference cancelled')
+            yield event
+        if cancelled(): raise BackgroundPreempted('Inference cancelled')
+    try:
+        while not wait([opened], .05).done:
+            if cancelled():
+                abandoned.set()
+                raise BackgroundPreempted('Inference cancelled before the server answered')
+        stream = opened.result()
+        try: yield events(stream)
+        finally:
+            with closing: done.set()
+            stream.close()
+    except BackgroundPreempted: raise
+    except Exception:
+        if cancelled(): raise BackgroundPreempted('Inference cancelled') from None
+        raise
+    finally: done.set()
 
 
 def assemble_stream(chunks, on_delta, *, on_reasoning=None):

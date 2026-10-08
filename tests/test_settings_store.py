@@ -247,6 +247,27 @@ def test_speech_recognition_error_names_the_value_that_cannot_run(store, monkeyp
     assert store.validate({'voice.asr_device': 'cpu', 'voice.asr_compute_type': 'default'})['valid']
 
 
+def test_wake_word_is_the_phrase_the_runtime_uses_and_stays_editable_text(tmp_path):
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: lm_studio\npresets:\n  default:\n    name: Riko Chan\n')
+    store = SettingsStore(path)
+    snapshot = store.snapshot()  # a two-word name wakes on its first word, which Settings shows and can change
+    assert snapshot['values']['voice.wake_word'] == 'Riko'
+    assert {item['path']: item for item in snapshot['fields']}['voice.wake_word']['kind'] == 'text'
+    assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
+    assert 'one short wake name' in store.validate({'voice.wake_word': 'Riko Chan'})['errors']['voice.wake_word']
+    # PyYAML, which the runtime uses, reads an unquoted number or yes as a number or boolean, not a word.
+    for value in ('42', 'yes'):
+        path.write_text(f'runtime:\n  provider: lm_studio\nvoice:\n  wake_word: {value}\n')
+        snapshot = store.snapshot()
+        assert {item['path']: item for item in snapshot['fields']}['voice.wake_word']['kind'] == 'text'
+        assert 'not text' in store.validate({'speech.max_words': 20})['errors']['voice.wake_word']
+        result = store.save({'voice.wake_word': 'Mita'}, snapshot['revision'])
+        assert result['saved'] and load_config(path).raw['voice']['wake_word'] == 'Mita'
+    result = store.save({'voice.wake_word': 'Yes'}, result['revision'])  # written quoted, so it stays a word
+    assert result['saved'] and load_config(path).raw['voice']['wake_word'] == 'Yes'
+
+
 def test_live_budget_is_checked_only_when_edited_so_older_setups_can_save(tmp_path, monkeypatch):
     # The setup wizard used to write memory.context_window_tokens equal to n_ctx, which never leaves room for the reply.
     monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(tmp_path / 'application'))
@@ -281,6 +302,31 @@ def test_packaged_setup_writes_a_config_settings_can_save(tmp_path, monkeypatch)
     assert load_config(store.path).runtime.native_library == library
     assert store.validate({'runtime.n_ctx': 8192}) == {'valid': True, 'errors': {}}  # the wizard's budget fits
     assert store.validate({'speech.max_words': 20}) == {'valid': True, 'errors': {}}
+
+
+@pytest.mark.skipif(not shutil.which('node') or not (ROOT / 'electron' / 'node_modules' / 'yaml').is_dir(), reason='needs node and the Electron dependencies')
+@pytest.mark.parametrize('name, wake', [('Riko Chan', 'Riko'), ('Yes', 'Yes'), ('', 'Riko')])
+def test_packaged_setup_name_gives_a_usable_wake_word(tmp_path, monkeypatch, name, wake):
+    """Regression: setup accepts any companion name, and a two-word one (or Yes, which PyYAML read as a boolean) stopped
+    the backend in WakeWord after the model had loaded."""
+    from process.app_core.audio.wake_word import WakeWord
+    resources, backend = tmp_path / 'application', backends_for()[0]
+    library = bundled_library(backend, resources)
+    library.parent.mkdir(parents=True); library.write_text('test')
+    form = {'backend': backend, 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 4, 'name': name}
+    script = "require('./release.cjs').saveSetup(process.argv[1], JSON.parse(process.argv[2]), process.argv[3])"
+    subprocess.run(['node', '-e', script, str(tmp_path / 'data'), json.dumps(form), str(resources)], cwd=ROOT / 'electron', check=True, timeout=60)
+    monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(resources))
+    store = SettingsStore(tmp_path / 'data' / 'character_config.yaml')
+    config = load_config(store.path)
+    assert config.character_name == (name or 'Riko') and config.raw['voice']['wake_word'] == wake
+    detector = WakeWord(config)
+    try: assert (detector.phrase, detector.unavailable) == (wake, '')
+    finally: detector.close()
+    # Saving another setting keeps the quotes setup wrote, so a companion named Yes stays text for PyYAML.
+    assert store.save({'speech.max_words': 20}, store.snapshot()['revision'])['saved']
+    config = load_config(store.path)
+    assert config.character_name == (name or 'Riko') and config.raw['voice']['wake_word'] == wake
 
 
 def test_legacy_preset_context_leaves_room_for_the_reply(tmp_path):
