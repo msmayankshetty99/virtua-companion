@@ -7,7 +7,7 @@ from typing import Iterable, Sequence
 
 from ..conversation.messages import ChatMessage, ModelResponse, ToolCall
 from ..conversation.streaming import WordDeltas
-from .responses import response_input, response_tools
+from .responses import response_input, response_tools, template_messages
 
 
 class OpenAIProvider:
@@ -33,7 +33,7 @@ class OpenAIProvider:
             except Exception as exc:
                 if self.api_mode != 'auto' or getattr(exc, 'status_code', None) not in {404, 405, 501}: raise
                 self.responses_enabled = False
-        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in messages],
+        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in template_messages(messages)],
                       temperature=options.get("temperature", self.config.temperature),
                       max_tokens=options.get("max_output_tokens", self.config.max_output_tokens))
         if tools:
@@ -56,13 +56,16 @@ class OpenAIProvider:
         return ModelResponse(ChatMessage("assistant", msg.content or "", tool_calls=calls), choice.finish_reason, usage_dict, response, messages)
 
     def _pack(self, messages, tools, options):
+        # Measured as sent: chat templates (Qwen3.5, Gemma, Mistral) reject a system message after the first
+        # turn, so later recall/observations are folded into the next input exactly as the native path does.
         from .context_budget import pack_context, estimate_tokens
-        return pack_context(messages, lambda value: estimate_tokens(value, tools),
+        return pack_context(messages, lambda value: estimate_tokens(template_messages(value), tools),
             min(options.get('context_limit', self.config.n_ctx), self.config.n_ctx),
-            options.get('max_output_tokens', self.config.max_output_tokens), cancelled=options.get('cancelled', lambda: False))
+            options.get('max_output_tokens', self.config.max_output_tokens), cancelled=options.get('cancelled', lambda: False),
+            state=options.get('context_state'))
 
     def _responses(self, messages, *, tools=None, **options):
-        inputs = response_input(messages)
+        inputs = response_input(template_messages(messages))
         definitions = response_tools(tools)
         signature = json.dumps({'model': self.config.model, 'tools': definitions}, sort_keys=True)
         previous, prefix = None, []
@@ -126,7 +129,7 @@ class OpenAIProvider:
         if self.responses_enabled:
             yield from self._stream_responses(messages, tools=tools, **options)
             return
-        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in messages], stream=True,
+        kwargs = dict(model=self.config.model, messages=[m.as_dict() for m in template_messages(messages)], stream=True,
                       temperature=options.get("temperature", self.config.temperature),
                       max_tokens=options.get("max_output_tokens", self.config.max_output_tokens))
         if tools: kwargs["tools"] = tools
@@ -144,8 +147,7 @@ class OpenAIProvider:
         finally: stream.close()
 
     def _stream_responses(self, messages, *, tools=None, **options):
-        from .responses import response_input, response_tools
-        kwargs = dict(model=self.config.model, input=response_input(messages), stream=True,
+        kwargs = dict(model=self.config.model, input=response_input(template_messages(messages)), stream=True,
             temperature=options.get('temperature', self.config.temperature),
             max_output_tokens=options.get('max_output_tokens', self.config.max_output_tokens))
         if tools: kwargs['tools'] = response_tools(tools)
@@ -174,10 +176,11 @@ class OpenAIProvider:
 
     def count_tokens(self, messages):
         from .context_budget import estimate_tokens
-        return estimate_tokens(messages)
+        return estimate_tokens(template_messages(messages))
 
     def count_text_tokens(self, text):
-        return len(text.encode('utf-8')) # Conservative fallback, not an exact tokenizer.
+        from .context_budget import estimate_text_tokens
+        return estimate_text_tokens(text) # A calibrated estimate, not the server's tokenizer.
 
     def close(self):
         close = getattr(self.client, "close", None)

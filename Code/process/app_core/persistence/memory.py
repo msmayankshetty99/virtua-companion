@@ -9,11 +9,32 @@ import uuid
 import os
 import re
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 MEMORY_TYPES = ("episodic", "factual", "semantic", "preference", "relationship", "procedural")
+# Per captured memory: the recent dialogue it formed in, and a cap on every string and list in that context.
+FORMATION_HISTORY_MESSAGES, FORMATION_TEXT_CHARS, FORMATION_LIST_ITEMS = 12, 1000, 20
+
+
+def bound_formation_context(context):
+    """A fixed-size copy of a formation context: the newest history messages only, long strings and lists clipped.
+
+    Every capture rewrites the whole store before inference, so a context that held the whole chat
+    history (or a 10,000-point whiteboard stroke) made the file and each turn's stall grow without bound.
+    """
+    def clip(value):
+        if isinstance(value, str): return value if len(value) <= FORMATION_TEXT_CHARS else value[:FORMATION_TEXT_CHARS] + ' [truncated]'
+        if isinstance(value, dict): return {key: clip(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clip(item) for item in value[:FORMATION_LIST_ITEMS]] + ([f'[{len(value) - FORMATION_LIST_ITEMS} more]'] if len(value) > FORMATION_LIST_ITEMS else [])
+        return value
+    context = dict(context or {})
+    history = context.get('history')
+    if isinstance(history, list) and len(history) > FORMATION_HISTORY_MESSAGES:
+        context.update(history=history[-FORMATION_HISTORY_MESSAGES:], history_truncated=True)
+    return clip(context)
 
 
 def top_inner_products(matrix, vector, k):
@@ -195,12 +216,13 @@ class MemoryStore:
     def remember(self, text: str, *, source="conversation", context=None):
         text = text.strip()
         if not text: return None
+        context = bound_formation_context(context)  # a private copy, built outside the lock
         with self.condition:
             if self.closed: raise RuntimeError('Memory store is closed')
             normalized = ' '.join(text.casefold().split())
-            existing = next((r for r in self.records if not r.derived and r.source == source and r.formation_context == (context or {}) and ' '.join(r.text.casefold().split()) == normalized), None)
+            existing = next((r for r in self.records if not r.derived and r.source == source and r.formation_context == context and ' '.join(r.text.casefold().split()) == normalized), None)
             if existing: return deepcopy(existing)
-            record = MemoryRecord(text=text, source=source, classification_status='pending', reflection_status='pending', formation_context=deepcopy(context or {}))
+            record = MemoryRecord(text=text, source=source, classification_status='pending', reflection_status='pending', formation_context=context)
             self.records.append(record)
             self._save()  # Originals are durable and queryable BEFORE any model work.
             self.index_dirty = True
@@ -415,9 +437,9 @@ class MemoryStore:
         return np.divide(vectors, norms, out=vectors, where=norms > 0)
 
     def _rebuild_index(self):
-        with self.lock:
-            records = deepcopy([r for r in self.records if r.active])
-        if not records:
+        with self.lock:  # only what the index needs: never copy every formation context under the lock
+            mapping = [(r.id, r.revision, r.text) for r in self.records if r.active]
+        if not mapping:
             with self.lock:
                 self.index_snapshot = None
                 self.index_dirty = False
@@ -425,9 +447,8 @@ class MemoryStore:
         try:
             # A plain float32 matrix, rebuilt from record text on every start and never written to disk.
             # Not FAISS: on macOS its bundled libomp crashes the process once torch's libomp is also running.
-            with self.embed_lock: vectors = self._embed([r.text for r in records])
+            with self.embed_lock: vectors = self._embed([text for _, _, text in mapping])
             vectors.setflags(write=False)
-            mapping = [(r.id, r.revision, r.text) for r in records]
             with self.lock:
                 # Publish only if the source snapshot is still current. Query fallbacks
                 # cover records added or corrected while vectors were being computed.
@@ -444,7 +465,9 @@ class MemoryStore:
 
     def retrieve(self, query: str, *, exclude_ids=None, return_records=False):
         with self.lock:
-            records = deepcopy([r for r in self.records if r.active and r.id not in (exclude_ids or set())])
+            # Ranking reads text and metadata only. Copying every formation context made each query cost the whole store,
+            # and reflection's related evidence carries none: it reflects on the focal memory's own context.
+            records = [deepcopy(replace(r, formation_context={})) for r in self.records if r.active and r.id not in (exclude_ids or set())]
             snapshot = self.index_snapshot
         if not records: return [] if return_records else ''
         semantic = {}
@@ -493,7 +516,7 @@ class MemoryStore:
             # Access counters are not a synchronous disk-write on every query.
             self.condition.notify_all()
         if return_records:
-            return [{**asdict(r), 'text': excerpt, 'text_truncated': excerpt != r.text} for r, excerpt in selected]
+            return [{**{k: v for k, v in asdict(r).items() if k != 'formation_context'}, 'text': excerpt, 'text_truncated': excerpt != r.text} for r, excerpt in selected]
         return '### Relevant memories\n' + '\n'.join(
             f'- [{r.memory_type}; {"derived interpretation" if r.derived else "original"}; id={r.id}{"; excerpt" if text != r.text else ""}] {text} (tags: {", ".join(r.tags)})'
             for r, text in selected)

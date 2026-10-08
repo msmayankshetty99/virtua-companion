@@ -103,6 +103,8 @@ def test_runtime_context_refreshes_after_tool_and_includes_outcomes(monkeypatch)
         def generate(self, messages, **options):
             snapshot = json.loads(messages[-1].content.split('\n', 1)[1])
             observed.append(snapshot)
+            # A changed state adds a refreshed observation after the tool result; the sent one stays so the prompt prefix is reused.
+            assert sum(m.content.startswith('Current runtime observation') for m in messages) == len(observed)
             if len(observed) == 1:
                 return ModelResponse(ChatMessage('assistant', tool_calls=[ToolCall('call1', 'interrupt_user', {'reason': 'Let me explain'})]))
             assert snapshot['runtime']['speaking_priority']['active']

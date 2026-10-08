@@ -12,7 +12,7 @@ def dispatch(request, server):
     if method == 'initialize':
         version = request.get('params', {}).get('protocolVersion', '2024-11-05')
         if version not in {'2024-11-05', '2025-03-26', '2025-06-18'}: version = '2024-11-05'
-        return {'protocolVersion': version, 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'riko-tasks', 'version': '1.0'}}
+        return {'protocolVersion': version, 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'riko-tasks', 'version': '1.1'}}
     if method == 'ping': return {}
     if method == 'tools/list': return {'tools': server.list_tools()}
     if method == 'tools/call':

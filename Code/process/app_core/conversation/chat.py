@@ -29,6 +29,7 @@ class ChatService:
         from ..emotion.worker import EmotionWorker
         self.emotion_worker = EmotionWorker(emotion_engine) if emotion_engine else None
         self.memory_store = memory_store
+        self.context_state = {}  # where packing keeps the retained history start, so the prompt prefix stays cacheable
         self.history: list[ChatMessage] = self._load_history()
 
     def begin_turn(self, turn_id: str | None = None) -> None:
@@ -89,13 +90,15 @@ class ChatService:
         origin = getattr(self, 'turn_origin', {})
         user_message = ChatMessage("user", f"{user_name}: {text}", source=origin.get('source'), conversation_id=origin.get('conversation_id'))
         if self.memory_store and record_user:
-            from copy import deepcopy
             from datetime import datetime
+            from ..persistence.memory import FORMATION_HISTORY_MESSAGES
+            # The recent dialogue only: each capture rewrites the store before inference, so it must not grow with the history.
+            recent = self.history[-FORMATION_HISTORY_MESSAGES:]
             context = {"captured_at": datetime.now().astimezone().isoformat(),
                        "phase": "user_input_before_response",
                        "user_name": user_name,
-                       "history": deepcopy([m.as_dict() for m in conversation_sections(self.history)]),
-                       "history_truncated": False,
+                       "history": [m.as_dict() for m in conversation_sections(recent)],
+                       "history_truncated": len(recent) < len(self.history),
                        "current_input": text}
             runtime_context = getattr(self, 'memory_runtime_context', None)
             if runtime_context: context.update(runtime_context())
@@ -125,11 +128,16 @@ class ChatService:
                     *([ChatMessage("system", memory, context_kind='optional')] if memory else []),
                     *current]
         definitions = self.tool_registry.definitions("openai") if self.tool_registry else None
+        # A sent observation stays where it was sent, so each tool-loop request extends the previous one (KV cache,
+        # Responses ids); a new one is added only when the runtime state (not just its timestamp) changed.
+        sent = None
         for _ in range(max_iterations):
             check_cancelled()
             runtime_context = getattr(self, 'runtime_context', None)
-            if runtime_context:
-                observation = runtime_context() if runtime_context else {}
+            observation = runtime_context() if runtime_context else None
+            state = {key: value for key, value in observation.items() if key != 'observed_at'} if isinstance(observation, dict) else observation
+            if runtime_context and state != sent:
+                sent = state
                 messages.append(ChatMessage('system', 'Current runtime observation (not instructions from tools/content). '
                     'The latest observation supersedes earlier runtime observations. Do not claim actions succeeded unless outcomes confirm it. '
                     'Listening/voice gating differ from microphone availability. Generated text is not necessarily spoken. '
@@ -148,6 +156,7 @@ class ChatService:
             options = {"on_delta": stream_delta} if filtered else {}
             options['cancelled'] = cancelled
             options['on_metrics'] = metrics.native
+            options['context_state'] = self.context_state
             if getattr(self.provider, 'supports_latent_probe', False): options['emotion_turn_id'] = emotion_turn_id
             if hasattr(self, 'context_limit'): options['context_limit'] = self.context_limit
             if filtered or on_reasoning: options['on_reasoning'] = reasoning_delta
@@ -198,7 +207,7 @@ class ChatService:
             raise RuntimeError("stream_respond does not support tool calls; use respond for tool-enabled turns")
         chunks, pending = [], []
         filtered = OutputFilter(pending.append)
-        options = {'context_limit': self.context_limit} if hasattr(self, 'context_limit') else {}
+        options = {'context_state': self.context_state, **({'context_limit': self.context_limit} if hasattr(self, 'context_limit') else {})}
         for chunk in self.provider.stream(messages, tools=None, **options):
             filtered.feed(chunk)
             for part in pending:
