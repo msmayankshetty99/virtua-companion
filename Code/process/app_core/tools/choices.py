@@ -50,8 +50,7 @@ class ChoiceResolver:
         result = dict(arguments)
         for parameter, options in choices.items():
             if parameter not in result or not options: continue
-            original = result[parameter]
-            if original == '' and parameter in {'name','asset_id'}: continue # Optional fields may be filled with empty defaults.
+            original = result[parameter]  # Tool.choices(arguments) already left out what this call need not choose
             if original in options: continue
             selected = self.choose(tool, parameter, original, list(options))
             if selected is None: raise ValueError(f'Invalid {parameter} for {tool}. Available choices: ' + ', '.join(options[:64]))

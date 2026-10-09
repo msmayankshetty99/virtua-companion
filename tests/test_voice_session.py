@@ -10,6 +10,7 @@ from process.app_core.conversation.history import ConversationHistory
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 from process.app_core.desktop.state import DesktopState
+from process.app_core.inference.provider import BaseProvider
 
 
 class FakeSpeech:
@@ -26,7 +27,7 @@ def make_session(monkeypatch, chat):
 
 
 def test_cancel_keeps_capture_and_trims_at_current_playback(monkeypatch):
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     session = make_session(monkeypatch, chat)
     capture = SimpleNamespace(closed=SimpleNamespace(is_set=lambda: False))
     session.voice = capture
@@ -51,7 +52,7 @@ def test_cancel_keeps_capture_and_trims_at_current_playback(monkeypatch):
 
 
 def test_interjection_rewrite_preserves_following_history(monkeypatch):
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     session = make_session(monkeypatch, chat)
     def respond(text, user, **kwargs):
         kwargs['on_delta']('One two three four five. ')
@@ -69,7 +70,7 @@ def test_interjection_rewrite_preserves_following_history(monkeypatch):
 
 
 def test_speech_during_reasoning_extends_original_input_without_annotation(monkeypatch):
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     session = make_session(monkeypatch, chat)
     def respond(text, user, **kwargs):
         kwargs['on_reasoning']('Thinking about the answer')
@@ -87,7 +88,7 @@ def test_speech_during_reasoning_extends_original_input_without_annotation(monke
 
 def test_stop_during_reasoning_ends_the_turn_at_the_next_reasoning_delta(monkeypatch):
     from process.app_core.events.bus import event_bus
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), close=lambda: None)  # a chat without a provider can still be stopped
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), close=lambda: None, provider=BaseProvider())  # its cancel() is a no-op: Stop still ends the turn
     session = make_session(monkeypatch, chat)
     shown, after_stop = [], []
     unsubscribe = event_bus.subscribe(lambda event: shown.append(event.payload['text']) if event.type == 'model.reasoning' else None)
@@ -106,7 +107,7 @@ def test_stop_during_reasoning_ends_the_turn_at_the_next_reasoning_delta(monkeyp
 
 
 def test_visible_text_counts_as_speaking_over_even_before_playback(monkeypatch):
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     session = make_session(monkeypatch, chat)
     def respond(text, user, **kwargs):
         kwargs['on_delta']('Visible answer')

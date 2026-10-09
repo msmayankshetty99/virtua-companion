@@ -19,6 +19,7 @@ from process.app_core.events.bus import EventBus, RuntimeEvent, event_bus
 from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
 from process.app_core.tools.approval import ToolApprovals
+from process.app_core.inference.provider import BaseProvider
 
 
 class FakeSpeech:
@@ -33,7 +34,7 @@ class FakeSpeech:
 @pytest.fixture
 def session_parts(monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', FakeSpeech)
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     session = SessionManager(config, chat, DesktopState())
     events = []
@@ -199,7 +200,7 @@ def test_permission_denied_files_are_moved_aside_instead_of_blocking_forever(tmp
     finally: gate.close()
     assert not denied  # both reads were denied once
     assert [record['content'] for record in json.loads(history.read_text(encoding='utf-8'))] == ['User: hello', 'hi']
-    assert json.loads(approvals.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True}
+    assert json.loads(approvals.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True, 'version': 2, 'sources': {'riko': {'calculator': False, 'task_create': True}}}
     assert {kept.name.split('.unreadable-')[0] for kept in tmp_path.glob('*.unreadable-*')} == {history.name, approvals.name}
 
 
@@ -211,7 +212,7 @@ def test_unreadable_tool_approval_policy_requires_approval_for_every_tool(tmp_pa
         assert gate.snapshot()['error']
         assert gate.authorize('calculator', {}, 'call-1', timeout=0.05) is False  # not silently allowed
         gate.configure({'calculator': False}, names=['calculator', 'task_create'])
-        assert json.loads(path.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True}
+        assert json.loads(path.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True, 'version': 2, 'sources': {'riko': {'calculator': False, 'task_create': True}}}
         assert gate.snapshot()['error'] == ''
         assert len(list(tmp_path.glob('tool_approvals.json.unreadable-*'))) == 1
     finally: gate.close()

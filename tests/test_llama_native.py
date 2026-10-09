@@ -261,7 +261,7 @@ def test_missing_library_fails_before_model_resolution(tmp_path, monkeypatch):
 
 
 def test_native_probe_capture_checks_utf8_prefix_and_turn_alignment(monkeypatch):
-    from process.app_core.emotion.probe import FEATURE_VERSION
+    from process.app_core.emotion.probe_hook import FEATURE_VERSION, ProbeHook
     runtime = fake_runtime([])
     samples = []
     probe = SimpleNamespace(active_group=None, close=lambda: None)
@@ -285,9 +285,11 @@ def test_native_probe_capture_checks_utf8_prefix_and_turn_alignment(monkeypatch)
         return 0
     runtime.dll.riko_request = request
     provider = InProcessLlamaProvider(RuntimeConfig(model_path='unused.gguf'))
+    hook = ProbeHook(lambda identity, idle: probe)
+    provider.attach_probe(hook, 32)
+    hook.start({}, provider.probe_idle)  # what _start does once the model is up
     provider.native = runtime
     provider.client = NativeClient(runtime)
-    provider.probe = probe
     monkeypatch.setattr(provider, '_start', lambda: None)
     runtime.dll.riko_stop = lambda _: None
     runtime.dll.riko_destroy = lambda _: None

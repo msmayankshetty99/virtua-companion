@@ -80,27 +80,14 @@ class SessionManager:
         self._assertive_reason = ''
         self._interaction_revision = 0
         self._origin = {'source': 'message'}
-        provider = getattr(chat, 'provider', None)
         # The probe asks from its own threads, maybe under its own locks, so this never waits for _voice_lock.
-        if provider is not None: provider.expression_idle = lambda: self.status(locked=False).is_quiet()
+        chat.provider.set_expression_idle(lambda: self.status(locked=False).is_quiet())
         self.initiative = None
         self._unsubscribe_wake_feedback = event_bus.subscribe(self._wake_feedback_event)
         self.animation = None
         self.animation_error = ''
         deps = chat.deps  # what the factory built besides the provider (ChatDeps, empty for a ChatService built directly)
         if deps.task_mcp: deps.task_mcp.source_turn = lambda: self._active_turn  # task changes record the turn making them
-        registry = getattr(self.chat, 'tool_registry', None)
-        if registry:
-            from ..tools.registry import RegisteredTool
-            registry.tools['runtime_status'] = RegisteredTool('runtime_status',
-                'Inspect actual listening/speaking state, user speech, tools, actions and whiteboard. No screen/app perception is implied.',
-                {'type': 'object', 'properties': {}, 'additionalProperties': False}, lambda args: self.runtime_snapshot())
-            registry.tools['interrupt_user'] = RegisteredTool('interrupt_user',
-                'Request temporary speaking priority for this reply when you need to interject or finish an important point. '
-                'Call BEFORE speaking the interjection. User speech is still captured. Protection is bounded, once per turn; '
-                'sustained speech can still interrupt and explicit Stop always works. Does not start microphone capture or create speech by itself.',
-                {'type': 'object', 'properties': {'reason': {'type': 'string'}}, 'required': ['reason'], 'additionalProperties': False},
-                lambda args: self.interrupt_user(**args))
         try:
             from ..animation.runtime import AnimationRuntime
             animation = config.raw.get('animation', {})
@@ -108,18 +95,38 @@ class SessionManager:
             if animation is not False and (not isinstance(animation, dict) or animation.get('enabled', True)):
                 self.animation = AnimationRuntime(self)
                 if deps.desktop: deps.desktop.avatar_motion = self.animation  # move_avatar walks instead of teleporting
-                if registry:
-                    registry.tools['walk_avatar'] = RegisteredTool('walk_avatar',
-                        'Walk the avatar to x/y pixels within the current display. User dragging overrides movement; actual completion is reported by the renderer.',
-                        {'type': 'object', 'properties': {'x': {'type': 'integer'}, 'y': {'type': 'integer'}}, 'required': ['x', 'y'], 'additionalProperties': False},
-                        lambda args: {'queued': self.animation.walk_to(**args).id})
-                    registry.tools['avatar_animation'] = RegisteredTool('avatar_animation',
-                        'List imported animations and current VRM rig capabilities, preview a compatible animation by ID, or stop walking. Choose only a listed ID; missing bones are rejected.',
-                        {'type':'object','properties':{'action':{'type':'string','enum':['list','preview','stop']},'asset_id':{'type':'string'}},'required':['action'],'additionalProperties':False},
-                        self.avatar_animation,
-                        choices=lambda:{'action':['list','preview','stop'],'asset_id':[entry['id'] for entry in self.animation.library.list()]})
         except (ValueError, OSError) as exc:
             self.animation_error = str(exc)
+        registry = getattr(self.chat, 'tool_registry', None)
+        if registry:
+            from ..tools.tool import RIKO
+            for tool in self.runtime_tools(): registry.register(tool, source=RIKO)
+
+    def runtime_tools(self):
+        """The session's own tools, registered like every other (ToolRegistry.register raises on a clash)."""
+        from ..tools.tool import RegisteredTool
+        tools = [RegisteredTool('runtime_status',
+            'Inspect actual listening/speaking state, user speech, tools, actions and whiteboard. No screen/app perception is implied.',
+            {'type': 'object', 'properties': {}, 'additionalProperties': False}, lambda args: self.runtime_snapshot(), owner='session'),
+            RegisteredTool('interrupt_user',
+            'Request temporary speaking priority for this reply when you need to interject or finish an important point. '
+            'Call BEFORE speaking the interjection. User speech is still captured. Protection is bounded, once per turn; '
+            'sustained speech can still interrupt and explicit Stop always works. Does not start microphone capture or create speech by itself.',
+            {'type': 'object', 'properties': {'reason': {'type': 'string'}}, 'required': ['reason'], 'additionalProperties': False},
+            lambda args: self.interrupt_user(**args), owner='session')]
+        if self.animation:
+            def animation_choices(arguments=None):  # an empty asset_id is the default the model filled in, not a choice
+                ids = {'asset_id': [entry['id'] for entry in self.animation.library.list()]} if not arguments or arguments.get('asset_id') != '' else {}
+                return {'action': ['list', 'preview', 'stop'], **ids}
+            tools += [RegisteredTool('walk_avatar',
+                'Walk the avatar to x/y pixels within the current display. User dragging overrides movement; actual completion is reported by the renderer.',
+                {'type': 'object', 'properties': {'x': {'type': 'integer'}, 'y': {'type': 'integer'}}, 'required': ['x', 'y'], 'additionalProperties': False},
+                lambda args: {'queued': self.animation.walk_to(**args).id}, owner='session'),
+                RegisteredTool('avatar_animation',
+                'List imported animations and current VRM rig capabilities, preview a compatible animation by ID, or stop walking. Choose only a listed ID; missing bones are rejected.',
+                {'type':'object','properties':{'action':{'type':'string','enum':['list','preview','stop']},'asset_id':{'type':'string'}},'required':['action'],'additionalProperties':False},
+                self.avatar_animation, choices=animation_choices, owner='session')]
+        return tools
 
     def avatar_animation(self, arguments):
         action = arguments.get('action')
@@ -359,7 +366,7 @@ class SessionManager:
             if event.type == "speech.started" and not self._interrupt_notified:
                 self._playing = dict(event.payload)
                 worker = getattr(self.chat, 'emotion_worker', None)
-                probe=getattr(getattr(self.chat,'provider',None),'probe',None)
+                probe = self._probe()
                 if not (probe and probe.expression_for_segment(event.payload.get('end_offset') or 0)) and worker:
                     worker.submit('speech', event.payload.get('text',''), final=True)
             elif event.type == "speech.completed":
@@ -582,7 +589,7 @@ class SessionManager:
                     if self._cancel.is_set(): raise TurnCancelled()
                     self._generated += delta
                     worker = getattr(self.chat, 'emotion_worker', None)
-                    probe=getattr(getattr(self.chat,'provider',None),'probe',None)
+                    probe = self._probe()
                     if worker and not (probe and probe.ready and probe.config.use_for_expression): worker.generation(delta)
                     event_bus.publish("chat.delta", turn_id=turn_id, text=delta, **origin)
                     for sentence in sentences.feed(delta): send_sentence(sentence)
@@ -592,8 +599,7 @@ class SessionManager:
                 if self._cancel.is_set(): raise TurnCancelled()
                 event_bus.publish('model.reasoning', turn_id=turn_id, text=text)
 
-            provider = getattr(self.chat, 'provider', None)
-            if hasattr(provider, 'set_foreground'): provider.set_foreground(True)
+            self.chat.provider.set_foreground(True)
             if getattr(self.chat, "memory_store", None): self.chat.memory_store.set_foreground(getattr(self.config.runtime, 'pause_background_on_live', True))
             response = self.chat.respond(text, user_name,
                 max_iterations=self.config.tools.max_iterations, on_delta=on_delta,
@@ -631,8 +637,7 @@ class SessionManager:
             if not self._closed: event_bus.publish("model.error", turn_id=turn_id, error=str(exc), **origin)
             raise
         finally:
-            provider = getattr(self.chat, 'provider', None)
-            if hasattr(provider, 'set_foreground'): provider.set_foreground(False)
+            self.chat.provider.set_foreground(False)
             if getattr(self.chat, "memory_store", None): self.chat.memory_store.set_foreground(False)
             with self._voice_lock:
                 self._generation_active = False
@@ -658,6 +663,11 @@ class SessionManager:
                 self._history_end = self.chat.conversation.rewrite(change)
                 self._history_start = base + int(record_user)
         except Exception: logger.exception('Could not keep the unfinished turn in chat history')
+
+    def _probe(self):
+        """The running emotion probe, or None (no ProbeHost, not enabled, or it did not start)."""
+        host = self.chat.provider.probe_host
+        return host.probe if host is not None else None
 
     def _turn_in_flight(self):
         return bool(self._active_turn and not self._interrupt_notified and self._read_status().replying())
@@ -691,8 +701,7 @@ class SessionManager:
             if not self._generation_active: self.wake.response_finished()
         # This only signals playback/HTTP cleanup. It never closes microphone input.
         event_bus.publish('turn.cancel_requested', turn_id=self._active_turn)
-        cancel_provider = getattr(getattr(self.chat, 'provider', None), 'cancel', None)
-        if cancel_provider: cancel_provider()
+        self.chat.provider.cancel()  # the live request only: initiative and reflection keep their slots
         self.speech.cancel()
 
         for action in self.actions.active():

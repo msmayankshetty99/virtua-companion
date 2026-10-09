@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 
 from process.app_core.audio.speech import AudioClip, SpeechQueue
+from process.app_core.inference.provider import BaseProvider
 
 
 def test_master_volume_scales_pcm_without_changing_duration():
@@ -99,7 +100,7 @@ def test_missing_sovits_keeps_chat_alive_and_next_reply_recovers(tmp_path, monke
         def write(self, pcm): played.append(pcm)
         def abort(self): pass
     monkeypatch.setitem(sys.modules, 'sounddevice', SimpleNamespace(RawOutputStream=Output))
-    class Provider:
+    class Provider(BaseProvider):
         def generate(self, messages, **kwargs):
             text = 'Here is your answer.'
             kwargs['on_delta'](text)

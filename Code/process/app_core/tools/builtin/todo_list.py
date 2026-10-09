@@ -3,34 +3,12 @@ import pathlib
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
-from .base import BaseTool, ToolType
+from .base import BaseTool
 
 
 class Tool(BaseTool):
     TOOL_NAME = "todo_list"
     TOOL_DESCRIPTION = "Manage a persistent to-do list: add, remove, list, complete, and clear tasks."
-    TOOL_TYPE = ToolType.FUNCTION
-
-    MCP_PROMPT = """todo_list:
-  Manage a persistent to-do list. All tasks are saved automatically.
-
-  Actions:
-    list                          - Show all tasks with their status.
-    add <task description>        - Add a new task (e.g., "add Buy groceries").
-    remove <task_id>              - Remove a task by its ID (shown in list).
-    complete <task_id>            - Mark a task as done (toggle).
-    clear                         - Delete all tasks.
-
-  Task IDs are shown in the list output (e.g., "1. Buy milk") and never change, even after removals.
-  Tasks are stored in './persistent_memories/mcp_modules/todo_list/tasks.json'.
-
-  Examples:
-    todo_list(action="list")                      -> Shows all tasks.
-    todo_list(action="add", task="Write report")  -> Adds a new task.
-    todo_list(action="complete", task_id="2")     -> Toggles task #2 as done.
-    todo_list(action="remove", task_id="3")       -> Deletes task #3.
-    todo_list(action="clear")                     -> Removes all tasks.
-"""
 
     # Persistent storage
     DATA_DIR = pathlib.Path("./persistent_memories/mcp_modules/todo_list")

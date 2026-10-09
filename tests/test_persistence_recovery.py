@@ -15,6 +15,7 @@ from process.app_core.kernel.lifecycle import close_bounded
 from process.app_core.kernel.messages import ChatMessage
 from process.app_core.tools.registry import RegisteredTool, ToolRegistry
 from process.app_core.kernel.workers import DaemonExecutor
+from process.app_core.inference.provider import BaseProvider
 
 
 def test_archive_pages_sessions_and_interrupted_text_survive_restart(tmp_path):
@@ -129,9 +130,10 @@ def test_factory_rolls_back_resources_after_partial_construction_failure(tmp_pat
     from process.app_core import factory
     from process.app_core.configuration.config import AppConfig
     closed=[]
-    monkeypatch.setattr(factory,'create_provider',lambda config:SimpleNamespace(close=lambda:closed.append('provider')))
+    provider=BaseProvider();provider.close=lambda:closed.append('provider')
+    monkeypatch.setattr(factory,'create_provider',lambda config:provider)
     monkeypatch.setattr(factory.ToolRegistry,'from_config',lambda config, activity=None, desktop=None:SimpleNamespace(
-        register_mcp=lambda client:None, close=lambda:closed.append('registry')))
+        register_mcp=lambda client,**keys:None, close=lambda:closed.append('registry')))
     def fail(*args,**kwargs): raise RuntimeError('memory failure')
     monkeypatch.setattr(factory,'MemoryStore',fail)
     # The shared desktop state the factory hands the desktop tools (through DesktopServices) and the emotion bridge.
@@ -190,5 +192,5 @@ class Tool:
         result=registry.execute('isolated',{})
         assert result.is_error and 'terminated' in result.content
         assert marker.read_text()=='started'
-        assert not registry._processes
+        assert not registry.workers.processes
     finally: registry.close()

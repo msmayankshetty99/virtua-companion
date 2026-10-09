@@ -12,6 +12,7 @@ from process.app_core.events.bus import EventBus, event_bus
 from process.app_core.events.outbox import Outbox
 from process.app_core.events.resources import ResourceEvents
 from process.app_core.runtime.actions import ActionController
+from process.app_core.inference.provider import BaseProvider
 
 ROOT = Path(__file__).resolve().parents[1] / 'Code'
 EMITTERS = {'publish', 'emit', '_emit', 'notify', 'on_prediction', 'on_fallback', 'callback'}
@@ -70,7 +71,7 @@ def test_wake_calibration_timeout_does_not_deadlock_with_runtime_snapshot(monkey
             voice_held.wait(2)
     unsubscribe = event_bus.subscribe(gate)
     monkeypatch.setattr(session_module, 'SpeechQueue', FakeSpeech)
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     session = session_module.SessionManager(config, chat, DesktopState())
     session.wake.recording = WakeCapture(max_seconds=0.01)  # next frame times out the sample

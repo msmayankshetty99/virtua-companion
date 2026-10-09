@@ -58,28 +58,30 @@ def _build_chat_service(config, cleanup):
         ))
         emotion_worker = own(EmotionWorker(emotion_engine))
     provider = own(create_provider(config.runtime))
+    hook = None  # the emotion probe's ProbeHook; its probe exists once the model has loaded
     def publish_teacher(event):
-        probe = getattr(provider, 'probe', None)
+        probe = hook.probe if hook else None
         if probe: probe.publish_teacher(event, bridge.update)
         else: bridge.update(event.state)
     if config.emotion.probe.get('enabled'):
         from .emotion.probe import EmotionProbe, ProbeConfig
+        from .emotion.probe_hook import ProbeHook
         from .emotion.probe_storage import probe_directory, training_directory
-        if not hasattr(provider, 'probe_factory'):
-            raise ValueError('Selected provider does not expose hidden-state probe capture')
+        host = provider.probe_host
+        if host is None: raise ValueError('Selected provider does not expose hidden-state probe capture')
         probe_config = ProbeConfig.from_raw(config.emotion.probe)
-        provider.set_probe_interval(probe_config.interval_tokens)
         playback_active = emotion_worker.playback_active  # the probe needs emotion.enabled (load_config), so the worker exists
         def expression(state):  # while sentences play, they drive the expression: the probe's reading waits
             if not playback_active(): bridge.update(state)
-        provider.probe_factory = lambda identity, idle: EmotionProbe(
+        hook = ProbeHook(lambda identity, idle: EmotionProbe(
             probe_directory(config.root, config.runtime), identity, emotion_engine,
             probe_config, idle=idle, legacy_directory=config.root / 'persistent_memories' / 'emotion_probes',
             training_directory=training_directory(config.root, config.runtime),
-            on_prediction=expression, on_fallback=expression)
+            on_prediction=expression, on_fallback=expression))
+        host.attach_probe(hook, probe_config.interval_tokens)
         # Julia remains the teacher and low-confidence fallback. Student
         # events use the same expression/action bridge, never tool execution.
-    if config.runtime.warmup and hasattr(provider, 'warmup'): provider.warmup()
+    if config.runtime.warmup: provider.warmup()
     task_path = config.raw.get('tasks', {}).get('store_file', 'persistent_memories/tasks.sqlite3')
     task_store = TaskStore(config.root / task_path)
     registry = own(ToolRegistry.from_config(config, activity=get_desktop_state(), desktop=desktop))
@@ -88,9 +90,10 @@ def _build_chat_service(config, cleanup):
         enabled=config.tools.best_fit_inputs, timeout=config.tools.best_fit_timeout_seconds,
         confidence=config.tools.best_fit_min_confidence)
     task_mcp = TaskMCP(task_store)
-    registry.register_mcp(task_mcp)
-    memory = own(MemoryStore(config.memory, reflection_provider=getattr(provider, 'reflection', provider), start_worker=not config.runtime.warmup))
-    if hasattr(provider, 'count_text_tokens'): memory.token_counter = provider.count_text_tokens
+    from .tools.tool import RIKO
+    registry.register_mcp(task_mcp, source=RIKO, owner='tasks')  # Riko's own server: its read-only hints are trusted
+    memory = own(MemoryStore(config.memory, reflection_provider=provider.lanes['reflection'], parallelism=provider.capabilities.background_parallelism,
+        token_counter=provider.count_text_tokens, start_worker=not config.runtime.warmup))
     if config.runtime.warmup:
         from .runtime.warmup import warm_core
         warm_core(memory, emotion_engine, config.runtime.startup_timeout_seconds)
@@ -104,7 +107,7 @@ def _build_chat_service(config, cleanup):
         emotion_engine=emotion_engine,
         memory_store=memory,
         deps=ChatDeps(action_controller=actions, task_store=task_store, task_mcp=task_mcp,
-            initiative_provider=getattr(provider, 'initiative', provider),
+            initiative_provider=provider.lanes['initiative'],
             context_limit=min(config.runtime.n_ctx, config.memory.context_window_tokens + config.runtime.max_output_tokens),
             emotion_worker=emotion_worker, desktop=desktop, cleanup=cleanup),
     )

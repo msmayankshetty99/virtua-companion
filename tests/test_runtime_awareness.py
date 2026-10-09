@@ -14,6 +14,7 @@ from process.app_core.runtime.session import SessionManager
 from process.app_core.tools.registry import ToolRegistry
 from process.app_core.audio.voice_input import VoiceInput
 from process.app_core.audio.voice_segments import Segment
+from process.app_core.inference.provider import BaseProvider
 
 
 class Speech:
@@ -26,7 +27,7 @@ class Speech:
 def make_session(monkeypatch, provider=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     config = SimpleNamespace(raw={'voice': {}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
-    chat = ChatService(provider or SimpleNamespace(close=lambda: None), system_prompt='Riko', tool_registry=ToolRegistry())
+    chat = ChatService(provider or BaseProvider(), system_prompt='Riko', tool_registry=ToolRegistry())
     return SessionManager(config, chat, DesktopState())
 
 
@@ -99,7 +100,7 @@ def test_priority_ends_when_playback_finishes(monkeypatch):
 
 def test_runtime_context_refreshes_after_tool_and_includes_outcomes(monkeypatch):
     observed = []
-    class Provider:
+    class Provider(BaseProvider):
         def generate(self, messages, **options):
             snapshot = json.loads(messages[-1].content.split('\n', 1)[1])
             observed.append(snapshot)

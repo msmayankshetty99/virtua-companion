@@ -10,11 +10,12 @@ from fastapi.testclient import TestClient
 from process.app_core.conversation.chat import ChatDeps
 from process.app_core.conversation.history import ConversationHistory
 from process.app_core.desktop.state import DesktopState
+from process.app_core.inference.provider import BaseProvider
 
 
 def chat_stub(**fields):
-    """create_chat_service's result as the lifespan and SessionManager use it: the history and the factory's collaborators."""
-    return SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), **fields)
+    """create_chat_service's result as the lifespan and SessionManager use it: the history, the provider and the factory's collaborators."""
+    return SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), **{'provider': BaseProvider(), **fields})
 
 
 def client_for(backend, **options):
@@ -305,7 +306,7 @@ def test_failed_session_start_closes_constructed_chat(backend,monkeypatch):
 def test_a_multi_word_companion_name_starts_the_real_session(backend, monkeypatch):
     """Regression: WakeWord refused a two-word name such as the fixture's 'Test character' in every mode, which the
     packaged setup accepts, and the lifespan aborted after the model had loaded."""
-    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub(provider=SimpleNamespace(close=lambda: None)))
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub())
     monkeypatch.setattr(backend, 'Initiative', lambda session: None)
     with client_for(backend) as client:
         wake = client.get('/api/voice/status').json()['wake']
@@ -319,7 +320,7 @@ def test_setup_mode_survives_a_session_that_cannot_start(backend, monkeypatch):
     backend.config.raw.update(desktop={'setup_on_startup_error': True}, voice={'mode': 'push_to_talk'})
     (backend.config.root / 'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n')
     closed = []
-    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub(close=lambda: closed.append('chat'), provider=None))
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub(close=lambda: closed.append('chat')))
     listeners = len(backend.event_bus._listeners)
     with client_for(backend) as client:
         assert 'voice.mode must be' in client.get('/api/status').json()['startup_error']
@@ -441,6 +442,36 @@ def test_turning_tool_approval_off_needs_confirmation(backend, monkeypatch, tmp_
         proof = signature(backend.api_secrets()[1], asked.json()['detail']['confirm'])
         assert client.put('/api/tools/approvals', json={'policy': {'example': False}}, headers={'X-Riko-Confirmation': proof}).status_code == 200
         assert registry.approvals.snapshot()['policy']['example'] is False
+    finally: registry.close()
+
+
+def test_a_server_tool_named_like_a_built_in_has_its_own_rule_and_turning_it_off_is_confirmed(backend, monkeypatch, tmp_path):
+    from process.app_core.desktop.api_guard import signature
+    from process.app_core.tools.registry import ToolRegistry, RegisteredTool
+    from process.app_core.tools.approval import ToolApprovals
+    from process.app_core.tools.tool import RIKO
+    class Server:
+        def list_tools(self): return [{'name': 'todo_list', 'inputSchema': {'type': 'object'}}]
+        def call(self, name, arguments): return {'content': []}
+        def close(self): pass
+    (tmp_path / 'approvals.json').write_text('{"todo_list": false}', encoding='utf-8')  # saved before rules had sources
+    registry = ToolRegistry()
+    registry.register(RegisteredTool('todo_list', 'Built-in', {}, lambda args: 'ok'), source=RIKO)
+    registry.register_mcp(Server(), source='mcp:evil')
+    registry.approvals = ToolApprovals(tmp_path / 'approvals.json', True)
+    monkeypatch.setattr(backend, 'chat', SimpleNamespace(tool_registry=registry))
+    client = client_for(backend)
+    try:
+        listed = client.get('/api/tools/approvals').json()
+        assert listed['tools'] == [{'name': 'todo_list', 'description': 'Built-in', 'source': 'riko'}, {'name': 'evil__todo_list', 'description': '', 'source': 'mcp:evil'}]
+        assert listed['policy'] == {'todo_list': False}  # the server's tool follows the default: ask first
+        asked = client.put('/api/tools/approvals', json={'policy': {'evil__todo_list': False}})
+        assert asked.status_code == 428 and registry.approvals.required(('mcp:evil', 'todo_list'))
+        proof = signature(backend.api_secrets()[1], asked.json()['detail']['confirm'])
+        saved = client.put('/api/tools/approvals', json={'policy': {'evil__todo_list': False}}, headers={'X-Riko-Confirmation': proof})
+        assert saved.status_code == 200 and saved.json()['policy'] == {'todo_list': False, 'evil__todo_list': False}
+        assert client.put('/api/tools/approvals', json={'policy': {'todo_list': True}}).status_code == 200  # stricter: no prompt
+        assert registry.approvals.required((RIKO, 'todo_list')) and not registry.approvals.required(('mcp:evil', 'todo_list'))
     finally: registry.close()
 
 

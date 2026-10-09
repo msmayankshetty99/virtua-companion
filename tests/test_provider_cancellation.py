@@ -1,4 +1,5 @@
-"""Stop reaches OpenAI-compatible servers at once: while reasoning, while silent, and before any header."""
+"""Stop reaches OpenAI-compatible servers at once: while reasoning, while streaming tool-call arguments, while silent, and
+before any header."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
@@ -13,8 +14,9 @@ from process.app_core.kernel.cancellation import BackgroundPreempted
 from process.app_core.inference.providers import OpenAIProvider
 
 
-def chunk(content=None, reasoning=None, finish=None):
-    delta = {**({'content': content} if content else {}), **({'reasoning_content': reasoning} if reasoning else {})}
+def chunk(content=None, reasoning=None, finish=None, arguments=None):
+    delta = {**({'content': content} if content else {}), **({'reasoning_content': reasoning} if reasoning else {}),
+        **({'tool_calls': [{'index': 0, 'id': 'call_1', 'type': 'function', 'function': {'name': 'lookup', 'arguments': arguments}}]} if arguments else {})}
     return {'id': 'c', 'object': 'chat.completion.chunk', 'created': 0, 'model': 'test', 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]}
 
 
@@ -25,7 +27,8 @@ COMPLETED = {'type': 'response.completed', 'sequence_number': 3, 'response': {'i
 
 class FakeServer:
     """Speaks streamed /v1/responses and /v1/chat/completions. stall: None; 'prefill' (silent before any header, like a
-    server loading or prefilling); 'stream' (silent after its first event); 'reasoning' (reasoning deltas, no text)."""
+    server loading or prefilling); 'stream' (silent after its first event); 'reasoning' (reasoning deltas, no text);
+    'tool_call' (tool-call argument deltas, no text)."""
     def __init__(self, stall=None):
         self.stall, self.streaming, self.disconnected = stall, threading.Event(), threading.Event()
         owner = self
@@ -63,6 +66,8 @@ class FakeServer:
                         if self.stalled(): return
                     if stall == 'reasoning' and self.stalled(lambda: send(chunk(reasoning='think ') if chat else {'type': 'response.reasoning_summary_text.delta',
                             'delta': 'think ', 'item_id': 'r', 'output_index': 0, 'summary_index': 0, 'sequence_number': 1})): return
+                    if stall == 'tool_call' and self.stalled(lambda: send(chunk(arguments='{"q') if chat else {'type': 'response.function_call_arguments.delta',
+                            'delta': '{"q', 'item_id': 'fc', 'output_index': 0, 'sequence_number': 1})): return
                     if chat:
                         send(chunk(content='Hello world')); send(chunk(finish='stop')); self.wfile.write(b'data: [DONE]\n\n')
                     else:
@@ -82,7 +87,7 @@ class FakeServer:
 
 
 @pytest.mark.parametrize('api_mode', ['responses', 'chat_completions'])
-@pytest.mark.parametrize('stall', ['reasoning', 'stream', 'prefill'])
+@pytest.mark.parametrize('stall', ['reasoning', 'tool_call', 'stream', 'prefill'])
 def test_stop_ends_a_streamed_reply_at_once_and_the_provider_keeps_working(api_mode, stall):
     server = FakeServer(stall)
     # request_timeout_seconds stays 120 and the server stalls for 60 s: Stop must not wait for either.

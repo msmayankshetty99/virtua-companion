@@ -217,16 +217,24 @@ def save_discord_settings(request: DiscordSettingsRequest, x_riko_confirmation: 
 @app.get('/api/discord/inbox')
 def discord_inbox(): return discord_launcher.inbox_snapshot()
 
+def probe_host():
+    """The provider's ProbeHost, or None (no chat service yet, or a provider without hidden-state capture)."""
+    return chat.provider.probe_host if chat is not None else None
+
 def current_probe():
-    probe=getattr(getattr(chat,'provider',None),'probe',None)
-    if probe is None: raise HTTPException(409,'Enable the expression probe and a compatible in-process native library, then restart Python')
+    host=probe_host()
+    probe=host.probe if host else None
+    if probe is None: raise HTTPException(409,host.probe_error.rstrip('.')+'; fix the cause and restart Python' if host and host.probe_error
+        else 'Enable the expression probe and a compatible in-process native library, then restart Python')
     return probe
 
 @app.get('/api/neural/status')
 def neural_status():
-    probe=getattr(getattr(chat,'provider',None),'probe',None)
-    return {'available':probe is not None, **(probe.status() if probe else {'mode':'unavailable','samples':0}),
-        'note':'Requires hidden-state capture from the compatible in-process riko-native library.'}
+    host=probe_host()
+    probe=host.probe if host else None
+    error=host.probe_error if host else ''  # the probe failed to start; chat runs without it
+    return {'available':probe is not None, **(probe.status() if probe else {'mode':'unavailable','samples':0}), 'probe_error':error,
+        'note':error.rstrip('.')+'. Chat works without it; fix the cause and restart Python.' if error else 'Requires hidden-state capture from the compatible in-process riko-native library.'}
 
 @app.post('/api/neural/train')
 def neural_train():
@@ -267,42 +275,16 @@ def neural_corpora():
 
 @app.post('/api/neural/replay/{key}')
 def neural_replay(key:str):
-    import threading
     if len(key)!=64 or any(c not in '0123456789abcdef' for c in key): raise HTTPException(400,'Invalid model key')
     probe=current_probe()
-    provider=chat.provider
     from process.app_core.emotion.probe_storage import corpus_files
     path=next((file for file in corpus_files(config.root) if file.parent.name==key),None)
     if path is None: raise HTTPException(404,'Retained examples not found')
     try: examples=json.loads(path.read_text(encoding='utf-8'))['examples']
-    except (OSError,ValueError,KeyError): raise HTTPException(404,'Retained examples not found')
-    if not examples: raise HTTPException(400,'No retained text is available')
-    with probe.condition:
-        if getattr(probe,'replaying',False): raise HTTPException(409,'Example replay is already running')
-        probe.replaying=True
-    def replay():
-        from process.app_core.kernel.messages import ChatMessage
-        from uuid import uuid4
-        import time
-        try:
-            for example in examples[:probe.config.max_samples]:
-                while not provider.probe_idle():
-                    if probe.closed: return
-                    time.sleep(.5)
-                text=example.get('text')
-                if not isinstance(text,str) or not text.strip(): continue
-                group='replay-'+str(uuid4())
-                provider.generate([ChatMessage('system','Use this earlier dialogue as a training scenario. Continue with a short new assistant reply.'),ChatMessage('user',text[:2000])],
-                    max_output_tokens=96,emotion_turn_id=group,probe_replay=True,cancelled=lambda:probe.closed)
-                # Finish labels before moving to another group; no history/audio/UI turn.
-                while probe.pending:
-                    if probe.closed:return
-                    time.sleep(.1)
-        except Exception:
-            logger.exception('Expression example replay failed')
-            probe.error='Example replay failed; see the diagnostic log.'
-        finally: probe.replaying=False
-    threading.Thread(target=replay,name='expression-example-replay',daemon=True).start()
+    except (OSError,ValueError,KeyError,TypeError): raise HTTPException(404,'Retained examples not found')
+    if not isinstance(examples,list) or not examples: raise HTTPException(400,'No retained text is available')
+    try: probe.replay(examples,probe_host().replay_lane)  # at background priority on the capture slot: a live turn preempts it
+    except RuntimeError as exc: raise HTTPException(409,str(exc)) from exc
     return {'queued':True,'examples':len(examples),'note':'Old text is replayed; new activations and labels are collected. Old weights are not reused.'}
 
 @app.websocket('/ws/discord/client')
@@ -334,13 +316,14 @@ def approval_registry():
 @app.get('/api/tools/approvals')
 def tool_approvals():
     registry = approval_registry()
-    return {**registry.approvals.snapshot(), 'tools': [{'name': t.name, 'description': t.description} for t in registry.tools.values()]}
+    # Rules belong to (source, name) (tools/approval.py); policy and tools name them as the model calls them.
+    return {**registry.approvals.snapshot(registry.tools), 'tools': [{'name': t.name, 'description': t.description, 'source': t.source} for t in list(registry.tools.values())]}
 
 @app.put('/api/tools/approvals')
 def approval_policy(request: dict, x_riko_confirmation: str | None = Header(default=None)):
     registry = approval_registry()
     # Switching approval off lets the model run that tool unattended: confirm it.
-    policy, current = request.get('policy'), registry.approvals.snapshot()
+    policy, current = request.get('policy'), registry.approvals.snapshot(registry.tools)
     if isinstance(policy, dict):
         require_confirmation('tool_approvals', {name: False for name, value in policy.items()
             if value is False and current['policy'].get(name, current['default_required'])}, x_riko_confirmation)
@@ -443,13 +426,12 @@ def save_settings(request: SettingsPatch, x_riko_confirmation: str | None = Head
         if result.get('saved') and 'emotion.probe.interval_tokens' in request.changes:
             interval = result['values']['emotion.probe.interval_tokens']
             config.emotion.probe['interval_tokens'] = interval
-            provider = getattr(chat, 'provider', None)
-            if hasattr(provider, 'set_probe_interval'): provider.set_probe_interval(interval)
+            host = probe_host()
+            if host: host.set_probe_interval(interval)
         if result.get('saved') and 'runtime.pause_background_on_live' in request.changes:
             enabled = result['values']['runtime.pause_background_on_live']
             config.runtime.pause_background_on_live = enabled
-            provider = getattr(chat, 'provider', None)
-            if hasattr(provider, 'set_pause_background'): provider.set_pause_background(enabled)
+            if chat is not None: chat.provider.set_pause_background(enabled)
             memory = getattr(chat, 'memory_store', None)
             if memory: memory.set_foreground(bool(enabled and session is not None and session.status().generating))
         if result.get('saved') and any(key.startswith('avatar.') for key in request.changes):

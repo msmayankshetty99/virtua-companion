@@ -18,6 +18,7 @@ from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import event_bus
 from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
+from process.app_core.inference.provider import BaseProvider
 
 DISCORD = {'source': 'discord', 'conversation_id': 'discord:client:dm:1', 'user_id': '1', 'channel_id': '1', 'message_id': 'd1'}
 
@@ -33,7 +34,7 @@ class Speech:
 @pytest.fixture
 def parts(monkeypatch, tmp_path):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), calls=[], provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), calls=[], provider=BaseProvider())
     config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     session = SessionManager(config, chat, DesktopState())
     events = []
@@ -384,7 +385,7 @@ def test_sustained_speech_after_stop_cuts_nothing_and_starts_a_turn_of_its_own(p
 def test_an_animation_setting_that_is_not_a_section_disables_animation_without_failing_the_session(monkeypatch, tmp_path, animation):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     config = SimpleNamespace(raw={'animation': animation}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
-    session = SessionManager(config, SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None)), DesktopState())
+    session = SessionManager(config, SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider()), DesktopState())
     try: assert session.animation is None and (session.animation_error == '' if animation is False else 'must be a mapping' in session.animation_error)
     finally: session.close()
 

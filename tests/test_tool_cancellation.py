@@ -36,7 +36,7 @@ class Tool:
         result = registry.execute('isolated', {}, cancelled=stop.is_set)
         assert time.monotonic() - started < 30
         assert result.is_error and 'cancelled' in result.content and 'terminated' in result.content
-        assert not registry._processes and registry._running['isolated'].done()  # killed, so a retry is not blocked
+        assert not registry.workers.processes and registry._running['isolated'].done()  # killed, so a retry is not blocked
     finally: registry.close()
 
 
@@ -73,7 +73,7 @@ for line in sys.stdin:
         except OSError: return []
     client = StdioMCPClient(sys.executable, [str(server)])
     registry, stop = ToolRegistry(timeout_seconds=60), threading.Event()
-    registry.register_mcp(client)
+    registry.register_mcp(client, source='mcp:test')
     try:
         when(lambda: any(m.get('params', {}).get('name') == 'slow' for m in logged()), stop.set)
         started = time.monotonic()

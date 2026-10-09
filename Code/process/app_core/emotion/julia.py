@@ -61,6 +61,7 @@ class JuliaEmotionEngine:
         self._pending_tokens = 0
         self._model = None
         self._load_attempted = False
+        self._resolved_source = None
         self._lock = threading.RLock()
         self.state = EmotionState(turn_id=self.turn_id)
 
@@ -93,6 +94,19 @@ class JuliaEmotionEngine:
                 raise RuntimeError(f"Unable to load Julia 1 emotion model: {exc}") from exc
             logger.warning("Julia 1 model unavailable; using fallback emotion interpreter: %s", exc)
         return self._model
+
+    def ensure_loaded(self):
+        """Load the model now rather than at its first use, once; the model, or None when it fell back."""
+        with self._lock: return self._load_model()
+
+    @property
+    def resolved_source(self) -> str | None:
+        """The directory or file the model loaded from (a Hugging Face snapshot unless model_path exists); None before."""
+        return self._resolved_source
+
+    def question_set(self) -> dict:
+        """The questions every interpretation and probe label asks (a fresh copy)."""
+        return self._questions()
 
     def start_turn(self, turn_id: str | None = None) -> None:
         with self._lock:
@@ -233,10 +247,10 @@ class JuliaEmotionEngine:
                 logger.warning('Julia probe supervision failed', exc_info=True)
                 return None
 
-    def probe_fingerprint(self):
-        """Detect local weight, tokenizer or runtime changes at the same path."""
+    def fingerprint(self):
+        """Detect local weight, tokenizer or runtime changes at the same path (the probe's identity records it)."""
         import hashlib
-        source = getattr(self, '_resolved_source', None)
+        source = self._resolved_source
         if not source: return None
         root = Path(source)
         files = [root] if root.is_file() else sorted(path for path in root.rglob('*')

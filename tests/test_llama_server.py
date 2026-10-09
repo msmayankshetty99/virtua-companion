@@ -175,7 +175,7 @@ def test_configuration_settings_and_probe_rules(tmp_path):
     config = load_config(path)  # no GGUF, native library or GPU settings: the server owns them
     assert config.runtime.base_url == 'http://127.0.0.1:8080'
     provider = create_provider(config.runtime)
-    try: assert isinstance(provider, LlamaServerProvider) and not provider.supports_latent_probe
+    try: assert isinstance(provider, LlamaServerProvider) and not provider.capabilities.latent_probe and provider.probe_host is None
     finally: provider.close()
     path.write_text('runtime:\n  provider: llama_server\nemotion:\n  enabled: true\n  probe:\n    enabled: true\n', encoding='utf-8')
     with pytest.raises(ValueError, match='llama_cpp'): load_config(path)

@@ -18,8 +18,7 @@ class FakeProvider:
 class AddTool:
     TOOL_NAME = "add"
     TOOL_DESCRIPTION = "Add two numbers"
-    def _call(self, a: int, b: int): return a + b
-    def execute(self, **kwargs): return self._call(**kwargs)
+    def execute(self, a: int, b: int): return a + b
 
 
 def test_tool_loop():

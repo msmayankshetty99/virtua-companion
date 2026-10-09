@@ -28,6 +28,7 @@ from process.app_core.kernel.turns import TurnGate
 from process.app_core.runtime import warmup
 from process.app_core.runtime.initiative import Initiative
 from process.app_core.runtime.session import SessionManager
+from process.app_core.inference.provider import BaseProvider
 from test_desktop_api import backend, client_for  # noqa: F401 (backend is a fixture)
 from test_private_access import CODE, private_access
 
@@ -45,7 +46,7 @@ class Speech:
 @pytest.fixture
 def session(monkeypatch, tmp_path):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko',
         tools=SimpleNamespace(max_iterations=8), runtime=SimpleNamespace(startup_timeout_seconds=5))
     session = SessionManager(config, chat, DesktopState())

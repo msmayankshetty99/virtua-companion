@@ -24,7 +24,7 @@ EDGES = {
         'kernel': 'lazy', 'persistence': 'load', 'runtime': 'lazy'},
     'conversation': {'emotion': 'lazy', 'kernel': 'load', 'persistence': 'load'},
     'emotion': {'kernel': 'load'},
-    'inference': {'emotion': 'lazy', 'events': 'lazy', 'kernel': 'load'},
+    'inference': {'events': 'lazy', 'kernel': 'load'},
     'integrations': {'audio': 'load', 'desktop': 'lazy', 'events': 'load', 'kernel': 'load', 'persistence': 'load'},
     'persistence': {'emotion': 'lazy', 'events': 'lazy', 'kernel': 'load'},
     'resources': {'audio': 'lazy', 'events': 'lazy', 'inference': 'load'},

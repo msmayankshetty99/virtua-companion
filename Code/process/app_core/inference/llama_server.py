@@ -124,7 +124,6 @@ class ServerClient:
 
 
 class LlamaServerProvider(LlamaContextProvider):
-    supports_latent_probe = False
     transport = 'llama-server'
     missing_route_hint = ' Update llama-server to a recent llama.cpp build; Riko needs /v1/responses, /apply-template, /tokenize and /slots.'
 

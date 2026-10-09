@@ -16,9 +16,9 @@ import uuid
 import time
 
 from .models import EMOTIONS, EmotionState
+from .probe_hook import FEATURE_VERSION, FEATURE_WIDTH  # noqa: F401  (FEATURE_VERSION was defined here: old imports work)
 
 logger = logging.getLogger(__name__)
-FEATURE_VERSION = 'result_norm-pool256-v1'
 
 
 @dataclass
@@ -78,7 +78,7 @@ def build_network(config):
     # Low-rank connections make 24,576 hidden units affordable on CPU rather
     # than allocating a dense 16,384 x 8,192 matrix.
     with torch.device('cpu'):
-        return nn.Sequential(nn.LayerNorm(256), nn.Linear(256, config.rank),
+        return nn.Sequential(nn.LayerNorm(FEATURE_WIDTH), nn.Linear(FEATURE_WIDTH, config.rank),
             nn.Linear(config.rank, a), nn.GELU(), nn.Linear(a, config.rank),
             nn.Linear(config.rank, b), nn.GELU(), nn.Linear(b, len(EMOTIONS) + 3))
 
@@ -86,7 +86,7 @@ def build_network(config):
 def latent_features(hidden):
     import torch
     value = hidden.detach().float().reshape(-1, hidden.shape[-1])[-1]
-    value = torch.nn.functional.adaptive_avg_pool1d(value[None, None], 256).flatten().cpu()
+    value = torch.nn.functional.adaptive_avg_pool1d(value[None, None], FEATURE_WIDTH).flatten().cpu()
     if not torch.isfinite(value).all(): raise ValueError('Nonfinite probe activations')
     return value
 
@@ -126,13 +126,13 @@ class EmotionProbe:
         self.config, self.teacher, self.idle = config, teacher, idle
         self.on_prediction = on_prediction
         self.on_fallback = on_fallback
-        with teacher._lock: teacher._load_model()
+        teacher.ensure_loaded()
         self.identity = {**identity, 'feature_version': FEATURE_VERSION,
             'teacher': teacher.model_id, 'teacher_path': str(teacher.model_path),
-            'teacher_snapshot': getattr(teacher, '_resolved_source', None),
-            'teacher_questions': teacher._questions(), 'teacher_context': teacher.context_tokens,
+            'teacher_snapshot': teacher.resolved_source,
+            'teacher_questions': teacher.question_set(), 'teacher_context': teacher.context_tokens,
             'teacher_max_length': teacher.max_length, 'teacher_strict_encoding': teacher.strict_encoding,
-            'teacher_fingerprint': teacher.probe_fingerprint(),
+            'teacher_fingerprint': teacher.fingerprint(),
             'network': [*config.hidden_units, config.rank]}
         self.key = identity_key(self.identity)
         self.path = Path(directory) / self.key / 'probe.pt'
@@ -147,6 +147,7 @@ class EmotionProbe:
         self.closed, self.training, self.since_train = False, False, 0
         self.idle_since = None
         self.manual_training = False
+        self.replaying = False  # replay() is generating from retained examples
         self.data_revision = str(uuid.uuid4())
         self.metadata = {}
         self.save_lock = threading.Lock()
@@ -173,7 +174,7 @@ class EmotionProbe:
             return {'model_key': self.key, 'ready': self.ready, 'training': self.training,
                 'samples': len(self.samples), 'pending': len(self.pending), 'validation': dict(self.validation),
                 'mode': 'probe' if self.ready and self.config.use_for_expression else 'julia_collecting',
-                'manual_training': self.manual_training, 'idle_seconds': self.config.idle_seconds,
+                'manual_training': self.manual_training, 'replaying': self.replaying, 'idle_seconds': self.config.idle_seconds,
                 'idle_elapsed': max(0,time.monotonic()-self.idle_since) if self.idle_since is not None else 0,
                 'revision': self.data_revision, 'error': self.error, 'emotions': list(EMOTIONS)}
 
@@ -184,6 +185,49 @@ class EmotionProbe:
             self.manual_training = True
             self.condition.notify_all()
             return self.status()
+
+    def replay(self, examples, lane):
+        """Generate a short new reply to each retained example's text on lane (ProbeHost.replay_lane: the capture slot, which
+        any live request preempts) whenever the provider and session are idle, so this backbone collects its own features and
+        Julia labels; no history, speech or UI turn. One replay at a time, on its own thread; a preempted example runs again."""
+        with self.condition:
+            if self.closed: raise RuntimeError('The expression probe is closed')
+            if self.replaying: raise RuntimeError('Example replay is already running')
+            self.replaying = True
+        try: threading.Thread(target=self._replay, args=(list(examples), lane), name='expression-example-replay', daemon=True).start()
+        except BaseException:
+            self.replaying = False
+            raise
+
+    def _wait(self, ready, poll):
+        """Poll ready() until it holds; False once closed. ready may take provider and session locks: never under self.condition."""
+        while not self.closed:
+            if ready(): return True
+            with self.condition: self.condition.wait(poll)  # close() wakes it
+        return False
+
+    def _replay(self, examples, lane):
+        from ..kernel.cancellation import BackgroundPreempted
+        from ..kernel.messages import ChatMessage
+        try:
+            for example in examples[:self.config.max_samples]:
+                text = example.get('text') if isinstance(example, dict) else None
+                if not isinstance(text, str) or not text.strip(): continue
+                while True:
+                    if not self._wait(self.idle, .5): return
+                    try:
+                        lane.generate([ChatMessage('system', 'Use this earlier dialogue as a training scenario. Continue with a short new assistant reply.'),
+                            ChatMessage('user', text[:2000])], max_output_tokens=96, emotion_turn_id='replay-' + str(uuid.uuid4()),
+                            cancelled=lambda: self.closed)
+                        break
+                    except BackgroundPreempted:
+                        if self.closed: return  # else a live request took the slot: run this example again once idle
+                # Finish this group's labels before the next one.
+                if not self._wait(lambda: not self.pending, .1): return
+        except Exception:
+            logger.exception('Expression example replay failed')
+            self.error = 'Example replay failed; see the diagnostic log.'
+        finally: self.replaying = False
 
     def training_due(self):
         if not self.idle(): self.idle_since=None; return False

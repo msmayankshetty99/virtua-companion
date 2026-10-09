@@ -196,9 +196,10 @@ class MemoryStore:
     All model/embedding work happens outside the record lock. Queries always see
     current originals; indexes are optional immutable snapshots, never authority.
     """
-    def __init__(self, config, *, reflection_provider=None, start_worker=True):
+    def __init__(self, config, *, reflection_provider=None, parallelism=1, token_counter=None, start_worker=True):
+        # parallelism: reflections at once (the provider's background slots); token_counter: the provider's, else UTF-8 bytes
         self.config, self.reflection_provider = config, reflection_provider
-        self.token_counter = lambda text: len(text.encode('utf-8'))
+        self.token_counter = token_counter or (lambda text: len(text.encode('utf-8')))
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.embed_lock = threading.Lock()
@@ -221,7 +222,7 @@ class MemoryStore:
         self.worker = None
         self.workers = []
         self.in_flight = set()
-        self.parallelism = getattr(getattr(reflection_provider, 'owner', None), 'reflection_parallelism', 1)
+        self.parallelism = parallelism
         if start_worker:
             self.start()
 

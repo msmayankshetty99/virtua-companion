@@ -10,11 +10,13 @@ from typing import Iterable, Sequence
 
 from ..kernel.messages import ChatMessage, ModelResponse, ToolCall
 from ..kernel.streaming import WordDeltas
+from .provider import BaseProvider
 from .responses import response_input, response_tools, template_messages
 
 
-class OpenAIProvider:
-    """Adapter for OpenAI-compatible Chat Completions and Responses servers."""
+class OpenAIProvider(BaseProvider):
+    """Adapter for OpenAI-compatible Chat Completions and Responses servers: no slots, estimated token counts (BaseProvider's)
+    and no provider-wide cancel. Each streamed request stops through its own `cancelled` (cancellable_stream)."""
     def __init__(self, config):
         from openai import OpenAI
         self.config = config
@@ -172,14 +174,6 @@ class OpenAIProvider:
             words.finish()
             yield from pending
         finally: stream.close()
-
-    def count_tokens(self, messages):
-        from .context_budget import estimate_tokens
-        return estimate_tokens(template_messages(messages))
-
-    def count_text_tokens(self, text):
-        from .context_budget import estimate_text_tokens
-        return estimate_text_tokens(text) # A calibrated estimate, not the server's tokenizer.
 
     def close(self):
         close = getattr(self.client, "close", None)

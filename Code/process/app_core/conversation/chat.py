@@ -151,7 +151,7 @@ class ChatService:
             options['cancelled'] = cancelled
             options['on_metrics'] = metrics.native
             options['context_state'] = self.context_state
-            if getattr(self.provider, 'supports_latent_probe', False): options['emotion_turn_id'] = emotion_turn_id
+            options['emotion_turn_id'] = emotion_turn_id  # the turn's group for the provider's observers (the emotion probe)
             if self.deps.context_limit is not None: options['context_limit'] = self.deps.context_limit
             if filtered or on_reasoning: options['on_reasoning'] = reasoning_delta
             try: response = self.provider.generate(messages, tools=definitions, **options)

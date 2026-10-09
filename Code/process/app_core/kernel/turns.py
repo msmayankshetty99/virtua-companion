@@ -60,7 +60,7 @@ class RuntimeStatus:
         return self.spoken_here and self.replying()
 
     def is_quiet(self):
-        """No reply in flight and no user speech (the emotion probe trains only then: provider.expression_idle)."""
+        """No reply in flight and no user speech (the emotion probe trains only then: provider.set_expression_idle)."""
         return not (self.replying() or self.user_speaking)
 
     def idle_for_background(self):

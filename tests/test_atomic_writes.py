@@ -19,6 +19,7 @@ from process.app_core.persistence import atomic
 from process.app_core.persistence.atomic import atomic_write
 from process.app_core.persistence.memory import MemoryStore
 from process.app_core.tools.approval import ToolApprovals
+from process.app_core.inference.provider import BaseProvider
 
 
 @pytest.fixture(autouse=True)
@@ -42,7 +43,9 @@ def provider(text='hi'):
     def generate(messages, on_delta=None, **options):
         if on_delta: on_delta(text)  # streamed (and spoken) before the history is saved
         return ModelResponse(ChatMessage('assistant', text))
-    return SimpleNamespace(generate=generate, close=lambda: None)
+    stub = BaseProvider()
+    stub.generate = generate
+    return stub
 
 
 def test_a_brief_sharing_violation_is_retried_and_leaves_no_temporary_file(tmp_path, monkeypatch):
@@ -130,7 +133,7 @@ def test_other_json_stores_retry_a_brief_sharing_violation(tmp_path, monkeypatch
     finally: gate.close()
     sharing_violation(monkeypatch, tmp_path, 1)
     Preferences(tmp_path / 'discord_preferences.json').set(42, 'audio', True)
-    assert json.loads((tmp_path / 'tool_approvals.json').read_text(encoding='utf-8')) == {'calculator': True}
+    assert json.loads((tmp_path / 'tool_approvals.json').read_text(encoding='utf-8')) == {'calculator': True, 'version': 2, 'sources': {'riko': {'calculator': True}}}
     assert Preferences(tmp_path / 'discord_preferences.json').get(42, 'audio') is True
 
 

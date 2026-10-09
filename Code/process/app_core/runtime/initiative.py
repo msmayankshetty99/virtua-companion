@@ -302,7 +302,8 @@ class Initiative:
                        'sleep_mode': bool(self.session.state.sleep_mode)},
                    'recent_messages': history}
         registry = chat.tool_registry
-        read_tools = [tool for tool in registry.definitions('openai') if tool['function']['name'] in {'task_list', 'task_get'}] if registry else []
+        read_tools = registry.definitions('openai', read_only=True) if registry else []  # the tools that declare read_only
+        readable = {tool['function']['name'] for tool in read_tools}
         idle_check = event.get('type') == 'environment.user_idle' or environment.get('idle_seconds', 0) >= settings['idle_seconds']
         try:
             messages = [
@@ -329,7 +330,7 @@ class Initiative:
                 if not response.message.tool_calls: break
                 messages.append(response.message)
                 for call in response.message.tool_calls:
-                    if call.name not in {'task_list', 'task_get'} or not registry: raise ValueError('Initiative only permits read-only task tools')
+                    if call.name not in readable: raise ValueError('Initiative only permits read-only tools')
                     result = registry.execute(call.name, call.arguments, call.id, cancelled=cancelled)
                     messages.append(ChatMessage('tool', str(result.content), tool_call_id=result.tool_call_id, name=result.name))
             else: raise ValueError('Initiative exceeded its task lookup limit')

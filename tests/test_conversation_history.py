@@ -14,6 +14,7 @@ from process.app_core.desktop.state import DesktopState
 from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
+from process.app_core.inference.provider import BaseProvider
 from test_private_access import CODE
 
 
@@ -92,7 +93,7 @@ def test_continued_input_replaces_the_message_a_reader_holds_instead_of_editing_
         def cancel(self): pass
         def close(self): pass
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     session = SessionManager(config, chat, DesktopState())
     held = []

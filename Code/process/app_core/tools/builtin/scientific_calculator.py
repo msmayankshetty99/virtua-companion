@@ -1,7 +1,7 @@
 import ast
 import math
 import operator
-from .base import BaseTool, ToolType
+from .base import BaseTool
 
 # Expressions come from model output, which prompt injection can control, so they are never
 # passed to eval(). Only the syntax below is evaluated; everything else is rejected.
@@ -86,37 +86,6 @@ def evaluate(expression):
 class Tool(BaseTool):
     TOOL_NAME = "scientific_calculator"
     TOOL_DESCRIPTION = "Evaluates mathematical expressions using Python's math functions."
-    TOOL_TYPE = ToolType.FUNCTION
-
-    MCP_PROMPT = """scientific_calculator:
-  Evaluates a mathematical expression using Python's math functions.
-
-  Parameters:
-    expression (str) - The mathematical expression to evaluate.
-                       Use standard arithmetic operators and math functions.
-
-  Supported functions and constants:
-    sin, cos, tan, asin, acos, atan, atan2,
-    log (natural), log10, log2,
-    exp, sqrt, pow, hypot,
-    pi, e, tau, inf, nan
-
-  Basic arithmetic: +, -, *, /, //, ** (exponentiation), % (modulo)
-  Parentheses for grouping: ( ... )
-  Use ** for exponentiation (e.g., 2**10 = 1024)
-
-  Examples:
-    scientific_calculator(expression="sin(pi/4) + log(100)")  -> 5.31227696717464
-    scientific_calculator(expression="sqrt(2**10)")           -> 32.0
-    scientific_calculator(expression="5 * (3 + 2) - 4")       -> 21
-    scientific_calculator(expression="atan2(3, 4) * 180 / pi") -> 36.86989764584402
-    scientific_calculator(expression="pow(2, 8)")             -> 256.0
-    scientific_calculator(expression="log10(1000)")           -> 3.0
-    scientific_calculator(expression="exp(1)")                -> 2.718281828459045
-
-  Anything else (names, attributes, strings, very large results) is rejected
-  with an error describing the problem.
-"""
 
     def _call(self, expression: str) -> str: #type: ignore
         """Evaluate the expression with the restricted evaluator; errors raise ValueError."""

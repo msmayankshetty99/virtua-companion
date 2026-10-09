@@ -327,7 +327,9 @@ def test_release_check_runs_per_shipped_bundle_on_the_stage_and_inside_the_signe
 
 
 def test_probe_feature_version_matches_the_native_patch():
-    # The bridge reports this string in /props and tags every sample with it; the provider refuses a mismatch at startup.
-    from process.app_core.emotion.probe import FEATURE_VERSION
+    # The bridge reports this string in /props and tags every sample with it; on a mismatch the probe does not start (the
+    # model still loads). It reports no width, so the pooled width, the event name and the capture slot are checked here.
+    from process.app_core.emotion.probe_hook import CAPTURE_SLOT, FEATURE_VERSION, FEATURE_WIDTH, SAMPLE_EVENT
     patch = (Path(__file__).resolve().parents[1] / 'tools/llama_cpp/emotion-probe.patch').read_text(encoding='utf-8')
-    assert f'"{FEATURE_VERSION}"' in patch
+    assert f'"{FEATURE_VERSION}"' in patch and f'"{SAMPLE_EVENT}"' in patch and f'token.id_slot == {CAPTURE_SLOT} ' in patch
+    assert f'std::vector<float> features({FEATURE_WIDTH});' in patch and f'riko_probe_features.size() == {FEATURE_WIDTH})' in patch

@@ -13,23 +13,33 @@ from process.app_core.conversation.chat import ChatDeps, ChatService
 from process.app_core.desktop.state import DesktopState, get_desktop_state
 from process.app_core.desktop.tools import DesktopServices, EffectTool, iter_tools
 from process.app_core.emotion.worker import EmotionWorker
+from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.actions import ActionController
 from process.app_core.runtime.session import SessionManager
 
 
+class ProbeProvider(BaseProvider):
+    """A provider that captures for the emotion probe: attach_probe keeps the hook."""
+    hook = interval = None
+    def __init__(self, close): self.close = close
+    @property
+    def probe_host(self): return self
+    def attach_probe(self, hook, interval_tokens): self.hook, self.interval = hook, interval_tokens
+
+
 def build(root, monkeypatch, closed, **emotion):
     """create_chat_service over stubs for the provider, tool registry and memory store, with emotion as given."""
     seen = {}
-    provider = SimpleNamespace(probe_factory=None, set_probe_interval=lambda tokens: None, close=lambda: closed.append(('provider', root.name)))
+    provider = ProbeProvider(close=lambda: closed.append(('provider', root.name)))
     monkeypatch.setattr(factory, 'create_provider', lambda runtime: provider)
     def registry(config, activity=None, desktop=None):
         seen['desktop'] = desktop
-        stub = SimpleNamespace(register_mcp=lambda client: None, choice_resolver=None)
+        stub = SimpleNamespace(register_mcp=lambda client, **keys: None, choice_resolver=None)
         stub.close = lambda: (stub.choice_resolver.close(), closed.append(('registry', root.name)))
         return stub
     monkeypatch.setattr(factory.ToolRegistry, 'from_config', registry)
-    monkeypatch.setattr(factory, 'MemoryStore', lambda *args, **kwargs: SimpleNamespace(close=lambda: closed.append(('memory', root.name))))
+    monkeypatch.setattr(factory, 'MemoryStore', lambda *args, **kwargs: seen.setdefault('memory', kwargs) and SimpleNamespace(close=lambda: closed.append(('memory', root.name))))
     config = AppConfig(root=root)
     config.runtime.warmup = False
     config.memory.history_file = root / 'persistent_memories' / 'chat_history.json'  # never the cwd's (user data)
@@ -47,7 +57,8 @@ def test_the_factory_passes_collaborators_explicitly_and_close_owns_them(tmp_pat
         deps = first.deps
         assert seen['desktop'] is deps.desktop and deps.desktop.state is get_desktop_state() and deps.desktop.actions is deps.action_controller
         assert isinstance(deps.action_controller, ActionController) and isinstance(deps.cleanup, ExitStack)
-        assert deps.initiative_provider is provider and deps.task_mcp.store is deps.task_store
+        assert deps.initiative_provider is provider and deps.task_mcp.store is deps.task_store  # provider.lanes: one lane without slots
+        assert seen['memory']['reflection_provider'] is provider and seen['memory']['parallelism'] == 1 and seen['memory']['token_counter'] == provider.count_text_tokens
         assert deps.context_limit == 8192 and deps.emotion_worker is None and first.emotion_worker is None  # min(n_ctx, memory + reply)
         # A second service in the same process keeps its own media root, effects and gestures instead of replacing the first's.
         assert first.deps.desktop is not second.deps.desktop
@@ -71,7 +82,8 @@ def test_the_probe_holds_its_reading_back_while_playback_drives_the_expression(t
     try:
         worker = service.emotion_worker
         assert isinstance(worker, EmotionWorker) and service.deps.emotion_worker is worker and worker.engine is engine
-        assert provider.probe_factory({'gguf_sha256': 'x'}, lambda: True) == 'probe'
+        assert provider.interval == 32 and provider.hook.probe is None  # attached before the model loads
+        assert provider.hook.start({'gguf_sha256': 'x'}, lambda: True) == 'probe' and provider.hook.probe == 'probe'
         predicted = probes[0]['on_prediction']
         predicted('calm')
         worker.submit('speech', 'Hello there.', final=True)  # a sentence started playing: it drives the expression now
@@ -94,8 +106,8 @@ class Speech:
 def test_a_turn_reaches_chat_service_as_a_turn_context(monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     requests, captures, submitted = [], [], []
-    provider = SimpleNamespace(generate=lambda messages, **kwargs: requests.append(messages) or ModelResponse(ChatMessage('assistant', 'Hi there.')),
-        close=lambda: None)
+    provider = BaseProvider()
+    provider.generate = lambda messages, **kwargs: requests.append(messages) or ModelResponse(ChatMessage('assistant', 'Hi there.'))
     memory = SimpleNamespace(remember=lambda text, context: captures.append(context), retrieve=lambda text: '', set_foreground=lambda value: None, close=lambda: None)
     worker = SimpleNamespace(submit=lambda kind, *args, **kwargs: submitted.append(kind), generation=lambda *args, **kwargs: None,
         invalidate=lambda: None, transcript=lambda *args: None, close=lambda: None)
@@ -128,8 +140,8 @@ def test_close_owns_the_factory_stack_or_what_the_chat_was_built_with(monkeypatc
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     injected = ActionController()
-    session = SessionManager(config, ChatService(None, system_prompt=''), DesktopState(), injected)
-    own = SessionManager(config, ChatService(None, system_prompt=''), DesktopState())
+    session = SessionManager(config, ChatService(BaseProvider(), system_prompt=''), DesktopState(), injected)
+    own = SessionManager(config, ChatService(BaseProvider(), system_prompt=''), DesktopState())
     session.close(); own.close()
     injected.start('gesture')  # still open: the factory's ActionController is closed with the factory's stack
     with pytest.raises(RuntimeError, match='closed'): own.actions.start('gesture')  # the session's own is closed with it

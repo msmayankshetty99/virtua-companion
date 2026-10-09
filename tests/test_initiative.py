@@ -8,6 +8,7 @@ from process.app_core.events.bus import event_bus
 from process.app_core.runtime.initiative import Initiative, DEFAULTS, InitiativeDecisionError, parse_decision
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
+from process.app_core.inference.provider import BaseProvider
 
 
 class Speech:
@@ -20,7 +21,8 @@ class Speech:
 def engine(tmp_path, monkeypatch, *, adapter=None, generate=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     config = SimpleNamespace(root=tmp_path, raw={}, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
-    provider = SimpleNamespace(generate=generate or (lambda *args, **kwargs: ModelResponse(ChatMessage('assistant', json.dumps({'initiate': True, 'message': 'Would you like a hand?', 'urgent': False})))), close=lambda: None)
+    provider = BaseProvider()
+    provider.generate = generate or (lambda *args, **kwargs: ModelResponse(ChatMessage('assistant', json.dumps({'initiate': True, 'message': 'Would you like a hand?', 'urgent': False}))))
     chat = ChatService(provider, system_prompt='Riko')
     session = SessionManager(config, chat, DesktopState())
     session.initiative = Initiative(session, adapter=adapter, start_worker=False)
@@ -180,7 +182,7 @@ def test_idle_check_requests_tasks_through_read_only_tool(tmp_path, monkeypatch)
     store = TaskStore(tmp_path / 'tasks.sqlite3')
     store.create('Write private report')
     registry = ToolRegistry()
-    registry.register_mcp(TaskMCP(store))
+    registry.register_mcp(TaskMCP(store), source='riko')
     chat = initiative.session.chat
     chat.deps, chat.tool_registry = ChatDeps(task_store=store), registry
     calls = []
@@ -200,6 +202,28 @@ def test_idle_check_requests_tasks_through_read_only_tool(tmp_path, monkeypatch)
     assert len(calls) == 2
     assert not chat.history
     initiative.session.close()
+
+
+def test_initiative_offers_only_read_only_tools_and_refuses_a_call_to_any_other(tmp_path, monkeypatch):
+    from process.app_core.tools.registry import ToolRegistry
+    from process.app_core.tools.tool import RIKO, RegisteredTool
+    from process.app_core.kernel.messages import ToolCall
+    initiative = engine(tmp_path, monkeypatch)
+    registry, effects, offered = ToolRegistry(), [], []
+    registry.register(RegisteredTool('peek', 'Look', {'type': 'object'}, lambda args: 'seen', read_only=True), source=RIKO)
+    registry.register(RegisteredTool('poke', 'Change', {'type': 'object'}, lambda args: effects.append(args) or 'done'), source=RIKO)
+    chat = initiative.session.chat
+    chat.tool_registry = registry
+    def generate(messages, **kwargs):
+        offered.append({tool['function']['name'] for tool in kwargs['tools']})
+        return ModelResponse(ChatMessage('assistant', tool_calls=[ToolCall('call', 'poke', {})]))
+    chat.provider.generate = generate
+    initiative.update({'enabled': True})
+    try:
+        with pytest.raises(ValueError, match='only permits read-only tools'):
+            initiative.evaluate(initiative.settings['rules'][0], {'type': 'environment.user_idle'})
+        assert offered == [{'peek'}] and effects == []
+    finally: registry.close(); initiative.session.close()
 
 
 @pytest.mark.parametrize('content', ['', '   ', 'Not now.', 'null', '[]', '{}',

@@ -19,12 +19,7 @@ REFLECTION = {'getattr', 'setattr', 'hasattr', 'delattr'}  # getattr(session, '_
 PRIVATE = {
     ('desktop_server.py', '_emit'): 2, ('desktop_server.py', '_lock'): 3,
     ('process/app_core/emotion/compat.py', '_julia_original_forward'): 1, ('process/app_core/emotion/compat.py', '_update_attention_mask'): 1,  # a transformers encoder it patches
-    ('process/app_core/emotion/probe.py', '_load_model'): 1, ('process/app_core/emotion/probe.py', '_lock'): 1,
-    ('process/app_core/emotion/probe.py', '_questions'): 1, ('process/app_core/emotion/probe.py', '_resolved_source'): 1,
     ('process/app_core/runtime/warmup.py', '_backend'): 1, ('process/app_core/runtime/warmup.py', '_embed'): 1, ('process/app_core/runtime/warmup.py', '_interpret'): 1,
-    ('process/app_core/tools/registry.py', '_call'): 2,  # BaseTool._call: the built-in tool signature local_definition reads
-    ('process/app_core/tools/registry.py', '_counter'): 1, ('process/app_core/tools/registry.py', '_lock'): 1,
-    ('process/app_core/tools/registry.py', '_responses'): 1,  # StdioMCPClient.call adopting its own restarted replacement
     ('run_server.py', '_dyld_get_image_name'): 3, ('run_server.py', '_dyld_image_count'): 1,  # dyld's own C functions via ctypes
 }
 

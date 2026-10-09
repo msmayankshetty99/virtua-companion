@@ -6,7 +6,7 @@ streaming/cancellation contract unchanged. All callbacks enqueue bytes only.
 """
 import atexit
 import ctypes
-import hashlib
+from dataclasses import replace
 import json
 import logging
 import os
@@ -16,8 +16,8 @@ import re
 import threading
 import time
 
-from .llama_context import LlamaContextProvider, context_capacity, native_arguments
-from .llama_runtime import check_native_build, resolve_model, validate_runtime
+from .llama_context import InferenceLane, LlamaContextProvider, context_capacity, fingerprint, native_arguments
+from .llama_runtime import check_native_build, flash_attention, resolve_model, validate_runtime
 from ..kernel.lifecycle import close_bounded
 
 logger = logging.getLogger(__name__)
@@ -271,13 +271,35 @@ def training_context(model):
 
 
 class InProcessLlamaProvider(LlamaContextProvider):
+    """llama.cpp in this process, and the ProbeHost of the emotion probe: the patched bridge captures hidden states on slot 0."""
     def __init__(self, config):
         validate_runtime(config)
         check_native_build(config)
         context_capacity(config)
         super().__init__(config)
+        self.capabilities = replace(self.capabilities, latent_probe=True)
         self.native = None
         self.probe_interval = 32
+        self.probe_hook = None  # the CaptureHook attach_probe installed
+        self.probe_error = ''
+        self.replay_lane = InferenceLane(self, 'probe_replay')
+
+    @property
+    def probe_host(self): return self
+
+    @property
+    def probe(self): return self.probe_hook.probe if self.probe_hook else None
+
+    def attach_probe(self, hook, interval_tokens):
+        """Capture for hook from the first load: the library arms the capture at riko_create, and hook.start runs once the
+        model is up."""
+        with self.start_lock:
+            if self.native: raise RuntimeError('Attach the emotion probe before the model loads')
+            self.probe_hook = hook
+            self.observers.append(hook)
+        self.set_probe_interval(interval_tokens)
+
+    def probe_idle(self): return self.scheduler.idle() and self.expression_idle()
 
     def _start(self):
         with self.start_lock:
@@ -295,11 +317,12 @@ class InProcessLlamaProvider(LlamaContextProvider):
                 over = ', '.join(f'{key} ({value})' for key, value in budgets.items() if value > limit)
                 raise RuntimeError(f'This model was trained for {limit} tokens and llama.cpp caps each slot there. Lower {over} to {limit} or less.')
             args = native_arguments(self.config, model)
-            native = NativeRuntime(self.config.native_library, args, self.probe_interval if self.probe_factory else 0)
+            interval = self.probe_interval if self.probe_hook else 0
+            native = NativeRuntime(self.config.native_library, args, interval)
             notes = getattr(native, 'notes', '')
             logger.info('Inference transport=in_process requested_gpu_layers=%s threads=%s flash_attention=%s kv_k=%s kv_v=%s slots=%s probe_interval=%s native=%r',
                 self.config.n_gpu_layers, self.config.n_threads, self.config.flash_attn, self.config.type_k, self.config.type_v,
-                self.config.parallel_slots, self.probe_interval if self.probe_factory else 0, notes)
+                self.config.parallel_slots, interval, notes)
             offload = re.search(r'offloaded (\d+)/(\d+) layers', notes)
             if offload and self.config.n_gpu_layers == -1 and int(offload[1]) < int(offload[2]):
                 logger.warning('llama.cpp put only %s of %s layers on the GPU to keep 1 GiB of GPU memory free; replies will be slower. '
@@ -313,38 +336,62 @@ class InProcessLlamaProvider(LlamaContextProvider):
                 if len(slots) != self.config.parallel_slots or any(s['n_ctx'] < required for s in slots):
                     raise RuntimeError(f'llama.cpp allocated {len(slots)} slots of {sorted({s["n_ctx"] for s in slots})} tokens, but Riko needs '
                         f'{self.config.parallel_slots} slots of {required} (the largest of {", ".join(budgets)}).')
-                self._initialize_probe(model)
             except BaseException:
                 self.client.close()
                 native.close()
                 self.native = self.client = None
                 raise
+            # The probe is optional: chat works without expressions, so its failure (a stale library, torch or Julia
+            # missing, an unreadable file) leaves the model up. /api/neural/status reports why; restart Python to retry.
+            try: self._initialize_probe(model)
+            except Exception as exc:
+                self.probe_error = f'The emotion probe did not start: {exc}'
+                logger.exception('Emotion probe did not start; chat continues without it')
+                # Capture stays loaded until restart (the bridge has no off switch): sample as rarely as it allows.
+                try: native.set_interval(512)
+                except Exception: logger.exception('Could not slow the unused emotion capture')
+
+    def _initialize_probe(self, model):
+        hook = self.probe_hook
+        if hook is None or hook.probe is not None: return
+        response = self.client.get('/props')
+        self._check_response(response)
+        props = response.json()
+        if props.get('riko_emotion_probe') != hook.feature_version:  # before hashing gigabytes for an identity
+            raise RuntimeError(f'it needs a riko-native library that captures {hook.feature_version} hidden states, and this one reports '
+                f'{props.get("riko_emotion_probe")!r}; rebuild it from this checkout (tools/llama_cpp/README.md)')
+        # Every split shard, not just the first file. The keys and values stay as they are: they name existing probe data.
+        split = re.fullmatch(r'(.*)-00001-of-(\d{5})\.gguf', model.name)
+        files = [model.with_name(f'{split[1]}-{i:05d}-of-{split[2]}.gguf') for i in range(1, int(split[2]) + 1)] if split else [model]
+        identity = {'gguf_sha256': fingerprint(files), 'server_build': props.get('build_info'),
+            'chat_template': props.get('chat_template'), 'feature_version': hook.feature_version,
+            'type_k': self.config.type_k, 'type_v': self.config.type_v,
+            'flash_attn': self._flash_attention_identity(), 'n_ctx': self.config.n_ctx,
+            'runtime_fingerprint': self._probe_runtime_fingerprint()}
+        hook.start(identity, self.probe_idle)
 
     def _inference_client(self): return NativeClient(self.native, self.config.request_timeout_seconds)
 
     def _flash_attention_identity(self):
-        # With auto, record what llama.cpp chose (the bridge reports it), so a config that never set flash_attn
-        # and resolves to off keeps its earlier probe data, and captures with and without it never mix.
-        notes, requested = getattr(self.native, 'notes', ''), super()._flash_attention_identity()
+        # on/off keep the true/false of probe data recorded before flash_attn had an auto setting. With auto, record what
+        # llama.cpp chose (the bridge reports it), so a config that never set flash_attn and resolves to off keeps its
+        # earlier probe data, and captures with and without it never mix.
+        requested = {'on': True, 'off': False}.get(flash_attention(self.config.flash_attn), 'auto')
+        notes = getattr(self.native, 'notes', '')
         if requested != 'auto' or 'Flash Attention' not in notes: return requested
         return 'Flash Attention enabled' in notes
 
     def _probe_runtime_fingerprint(self):
         path = Path(self.config.native_library)
-        files = sorted({path, *path.parent.glob('*.dll'), *path.parent.glob('*.so*'), *path.parent.glob('*.dylib')})
-        digest = hashlib.sha256()
-        for library in files:
-            digest.update(library.name.encode())
-            with library.open('rb') as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b''): digest.update(chunk)
-        return digest.hexdigest()
+        return fingerprint(sorted({path, *path.parent.glob('*.dll'), *path.parent.glob('*.so*'), *path.parent.glob('*.dylib')}), names=True)
 
     def set_probe_interval(self, interval):
         if type(interval) is not int or not 1 <= interval <= 512: raise ValueError('Invalid probe interval')
         with self.start_lock:
             self.probe_interval = interval
-            if self.native and self.probe_factory: self.native.set_interval(interval)
-            if self.probe: self.probe.config.interval_tokens = interval
+            if self.native and self.probe_hook and not self.probe_error: self.native.set_interval(interval)  # a failed probe stays sparse
+            probe = self.probe
+            if probe: probe.config.interval_tokens = interval
 
     def close(self):
         self.closed = True
@@ -352,4 +399,4 @@ class InProcessLlamaProvider(LlamaContextProvider):
         with self.start_lock:
             if self.client: self.client.close()
             if self.native: self.native.close()
-            if self.probe: self.probe.close()
+            if self.probe_hook: self.probe_hook.close()

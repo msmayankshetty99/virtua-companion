@@ -136,7 +136,7 @@ def test_memory_dispatches_parallel_reflections_without_duplicate_sources(tmp_pa
     from process.app_core.persistence.memory import MemoryStore, MemoryRecord
     from types import SimpleNamespace
     config = MemoryConfig(store_file=tmp_path/'memory.json', embeddings_enabled=False, system1_enabled=False)
-    store = MemoryStore(config, reflection_provider=SimpleNamespace(owner=SimpleNamespace(reflection_parallelism=3)), start_worker=False)
+    store = MemoryStore(config, reflection_provider=SimpleNamespace(), parallelism=3, start_worker=False)
     entered = set(); ready = threading.Event(); release = threading.Event()
     def reflect(record):
         with store.lock:
