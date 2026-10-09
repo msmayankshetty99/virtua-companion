@@ -1,8 +1,9 @@
-"""The one faster-whisper factory. auto/default resolve to what this CTranslate2 build can run here (it has no
-Metal backend, and its CPU path rejects float16), and a configured pair it cannot run falls back once, with one
-warning, instead of failing every utterance."""
+"""The one faster-whisper factory, and the session's one model built with it (AsrService). auto/default resolve to what
+this CTranslate2 build can run here (it has no Metal backend, and its CPU path rejects float16), and a configured pair
+it cannot run falls back once, with one warning, instead of failing every utterance."""
 from functools import lru_cache
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 MODEL = 'distil-small.en'
@@ -45,3 +46,33 @@ def create_whisper(voice):
         logger.warning('Speech recognition %s/%s cannot run here (%s); using %s/%s. Choose auto and default in Settings.',
             voice.get('asr_device', 'auto'), voice.get('asr_compute_type', 'default'), note, device, precision)
     return WhisperModel(voice.get('asr_model', MODEL), device=device, compute_type=precision)
+
+
+class AsrService:
+    """The session's one Whisper model (SessionManager.asr), shared by the microphone (VoiceInput), startup warmup and
+    Discord's /transcribe: built through create_whisper on first use, kept until close(), one decode at a time."""
+    def __init__(self, voice, *, model=None):
+        self.voice, self.model, self.lock, self.closed = voice, model, threading.Lock(), False
+
+    def transcribe(self, samples, **options):
+        """The text of float32 16 kHz mono samples; options go to WhisperModel.transcribe."""
+        with self.lock:
+            if self.closed: raise RuntimeError('Speech recognition is closed')
+            model = self.model
+            if model is None:  # a caller that arrives meanwhile waits for this one instead of building another
+                model = create_whisper(self.voice)
+                if not self.closed: self.model = model  # one finished after close() is not kept
+            segments, _ = model.transcribe(samples, **options)
+            return ' '.join(segment.text.strip() for segment in segments).strip()  # decoding runs while iterating
+
+    def transcribe_pcm(self, pcm, **options):
+        """The text of mono 16 kHz signed little-endian PCM16."""
+        import numpy as np
+        return self.transcribe(np.frombuffer(pcm, dtype='<i2').astype('float32') / 32768, **options)
+
+    def warm(self):
+        import numpy as np
+        self.transcribe(np.zeros(16000, dtype='float32'), beam_size=1, vad_filter=False)
+
+    def close(self):  # never waits for a decode in progress
+        self.closed, self.model = True, None

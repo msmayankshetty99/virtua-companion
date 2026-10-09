@@ -2,7 +2,6 @@ import asyncio
 import io
 import json
 from pathlib import Path
-import threading
 import time
 from types import SimpleNamespace
 from uuid import uuid4
@@ -179,8 +178,7 @@ def test_call_pcm_is_resampled_to_mono_16khz():
 def test_discord_api_uses_existing_session_without_local_speech_and_scopes_stop(monkeypatch):
     identity = str(uuid4())
     calls = []
-    session = SimpleNamespace(_closed=False, _voice_lock=threading.RLock(),
-        _active_turn=identity, _generation_active=True, cancel=lambda: calls.append('cancel'),
+    session = SimpleNamespace(is_open=True, cancel_turn=lambda turn_id: turn_id == identity and not calls.append('cancel'),
         respond=lambda *args, **kwargs: calls.append(kwargs) or SimpleNamespace(message=SimpleNamespace(content='hello')))
     app = FastAPI(); app.include_router(api.create_router(lambda: session))
     client = TestClient(app)
@@ -195,7 +193,7 @@ def test_discord_api_uses_existing_session_without_local_speech_and_scopes_stop(
 
 def test_discord_asr_api_validates_limits_and_recovers_after_failure(monkeypatch):
     calls = []
-    session = SimpleNamespace(_closed=False)
+    session = SimpleNamespace(is_open=True)
     monkeypatch.setattr(api, 'transcribe_pcm', lambda session, pcm: calls.append(len(pcm)) or 'heard you')
     app = FastAPI(); app.include_router(api.create_router(lambda: session))
     client = TestClient(app)
@@ -213,7 +211,7 @@ def test_audio_export_failure_does_not_disable_subsequent_requests(monkeypatch):
         if not state[0]: raise RuntimeError('offline')
         return b'RIFFfake'
     monkeypatch.setattr(api, 'synthesize_wav', synthesize)
-    app = FastAPI(); app.include_router(api.create_router(lambda: SimpleNamespace(_closed=False, config=None)))
+    app = FastAPI(); app.include_router(api.create_router(lambda: SimpleNamespace(is_open=True, config=None)))
     client = TestClient(app)
     assert client.post('/api/discord/speech', json={'text':'hello'}).status_code == 503
     state[0] = True

@@ -15,6 +15,7 @@ from .config import load_config
 from ..persistence.atomic import atomic_write
 
 LOCK = threading.RLock()
+RUNTIME_DERIVED = {'initiative_n_ctx', 'initiative_max_output_tokens', 'reflection_n_ctx'}  # edited as initiative.* and memory.*
 OBSOLETE = {'avatar.camera.distance', 'avatar.expression_engine', 'avatar.view', 'desktop.shortcuts.effects',
             'emotion.pause_during_inference', 'runtime.server_path',
             'emotion.temperature', 'sovits_ping_config.media_type', 'your_name',
@@ -286,6 +287,7 @@ class SettingsStore:
             for key, value in asdict(getattr(candidate, group)).items():
                 if group == 'emotion' and key == 'probe': continue
                 if group == 'memory' and key in {'default_memories', 'history_file'}: continue
+                if group == 'runtime' and key in RUNTIME_DERIVED: continue
                 values[f'{group}.{key}'] = value
         values.update(dict(flatten(raw)))
         if type(values.get('runtime.flash_attn')) is bool: values['runtime.flash_attn'] = 'on' if values['runtime.flash_attn'] else 'off'

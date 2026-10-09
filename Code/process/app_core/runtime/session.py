@@ -6,12 +6,15 @@ import threading
 import time
 import uuid
 import math
+from dataclasses import replace
 
 from ..events.bus import event_bus
 from .actions import ActionController
 from ..audio.speech import SpeechQueue
 from ..audio.speech_chunks import SpeechChunks
 from ..kernel.cancellation import TurnCancelled
+from ..kernel.turns import RuntimeStatus, TurnContext, TurnGate
+from ..audio.asr import AsrService
 from .interjections import Interjections
 from ..kernel.messages import ChatMessage
 from ..audio.wake_word import WakeWord
@@ -25,20 +28,18 @@ class SessionManager:
     """Own turns independently of capture, transcription and ordered playback."""
     def __init__(self, config, chat, state, actions=None):
         self.config, self.chat, self.state = config, chat, state
-        self.chat.emotion_playback_managed = True
-        provider=getattr(chat,'provider',None)
-        if provider is not None:
-            provider.expression_idle=lambda:not (self._generation_active or self._playing or self._speech_pending or self._user_speaking)
+        self._owns_actions = actions is None  # the factory's own ActionController is closed with the chat
         self.actions = actions or ActionController()
         # Lock order: _capture_lock (request handlers only) -> _voice_lock -> any component lock.
         # Bus listeners take _voice_lock, so components must not publish while holding their own
         # locks (use events.outbox.Outbox); tests/test_lock_discipline.py enforces this.
-        self._turn_lock = threading.Lock()
+        self._turns = TurnGate()  # one foreground turn: respond() and present_initiative()
         self._voice_lock = threading.RLock()
         self._capture_lock = threading.Lock()
         self._closed = False
         self._cancel = threading.Event()
-        self.asr_lock = threading.Lock()
+        self.asr = AsrService(config.raw.get('voice', {}))  # the one Whisper model: microphone, warmup and Discord
+        self.warmed_vad = None  # warm_session's Silero model, which each VoiceInput copies
         self._turn_speak = True
         # Validate wake configuration before starting audio workers, and wake feedback before subscribing, so a
         # failed construction leaves no worker or bus listener behind (desktop_server then keeps Settings up).
@@ -79,14 +80,15 @@ class SessionManager:
         self._assertive_reason = ''
         self._interaction_revision = 0
         self._origin = {'source': 'message'}
+        provider = getattr(chat, 'provider', None)
+        # The probe asks from its own threads, maybe under its own locks, so this never waits for _voice_lock.
+        if provider is not None: provider.expression_idle = lambda: self.status(locked=False).is_quiet()
         self.initiative = None
         self._unsubscribe_wake_feedback = event_bus.subscribe(self._wake_feedback_event)
         self.animation = None
-        self.state.avatar_motion = None
         self.animation_error = ''
-        if getattr(self.chat, 'task_mcp', None): self.chat.task_mcp.source_turn = lambda: self._active_turn
-        self.chat.memory_runtime_context = self.memory_runtime_context
-        self.chat.runtime_context = self.runtime_snapshot
+        deps = chat.deps  # what the factory built besides the provider (ChatDeps, empty for a ChatService built directly)
+        if deps.task_mcp: deps.task_mcp.source_turn = lambda: self._active_turn  # task changes record the turn making them
         registry = getattr(self.chat, 'tool_registry', None)
         if registry:
             from ..tools.registry import RegisteredTool
@@ -105,7 +107,7 @@ class SessionManager:
             # `animation: false` turns it off; any other non-section value is rejected by AnimationRuntime (ValueError).
             if animation is not False and (not isinstance(animation, dict) or animation.get('enabled', True)):
                 self.animation = AnimationRuntime(self)
-                self.state.avatar_motion = self.animation
+                if deps.desktop: deps.desktop.avatar_motion = self.animation  # move_avatar walks instead of teleporting
                 if registry:
                     registry.tools['walk_avatar'] = RegisteredTool('walk_avatar',
                         'Walk the avatar to x/y pixels within the current display. User dragging overrides movement; actual completion is reported by the renderer.',
@@ -153,20 +155,64 @@ class SessionManager:
         with self._voice_lock:
             return bool(anchor and anchor[0] == self._active_turn and self._interjections and self._interjections.interrupted)
 
+    @property
+    def is_open(self): return not self._closed
+
+    def status(self, *, locked=True):
+        """One RuntimeStatus reading, whose predicates are the only definition of busy and idle. It takes _voice_lock, so a
+        caller holding a component lock, or a callback a provider or tool may run under its own lock (a cancel poll,
+        expression_idle), passes locked=False and gets the fields read one by one instead."""
+        if not locked: return self._read_status()
+        with self._voice_lock: return self._read_status()
+
+    def _read_status(self):  # takes no lock itself, so the session's own code calls it under _voice_lock
+        voice, wake = self.voice, self.wake
+        capture = bool(voice and not voice.closed.is_set())
+        return RuntimeStatus(closed=self._closed, active_turn=self._active_turn, generating=self._generation_active,
+            speaking=self._playing is not None, pending_audio=self._speech_pending, spoken_here=self._turn_speak,
+            user_speaking=self._user_speaking, capture_running=capture,
+            listening=capture and bool(self.state.mic_enabled) and self._voice_status == 'ready',
+            voice_status=self._voice_status, voice_phase=self._voice_phase, sleeping=bool(self.state.sleep_mode),
+            calibrating=bool(wake.calibrating or wake.testing),
+            speaking_priority=time.monotonic() < self._assertive_until, interaction_revision=self._interaction_revision)
+
+    def active_turn(self):
+        """The latest foreground turn's id (None before the first), which may already have finished."""
+        with self._voice_lock: return self._active_turn
+
+    def cancel_turn(self, turn_id):
+        """Stop turn_id if it is still generating. False, stopping nothing, when another turn or none is running."""
+        with self._voice_lock:
+            matched = turn_id is not None and turn_id == self._active_turn and self._generation_active
+            if matched: self.cancel()  # still under the lock, so a turn that starts meanwhile is never the one stopped
+        return matched
+
+    def set_user_speaking(self, speaking):
+        """VoiceInput reports what VAD hears on the open microphone, frame by frame."""
+        with self._voice_lock: self._user_speaking = bool(speaking)
+
+    def transcribe(self, pcm, **options):
+        """The text of mono 16 kHz PCM16 through the session's one Whisper model (options go to WhisperModel.transcribe)."""
+        return self.asr.transcribe_pcm(pcm, **options)
+
+    def history_snapshot(self):
+        """A copy of the conversation history, never one that an interjection or a cut is halfway through rewriting: each
+        rewrite is one step of the history's owner (ConversationHistory)."""
+        return self.chat.conversation.snapshot()
+
     def runtime_snapshot(self):
         from copy import deepcopy
         from datetime import datetime
         with self._voice_lock:
-            active_priority = time.monotonic() < self._assertive_until
-            voice = self.voice
-            runtime = {'turn_id': self._active_turn, 'generating': self._generation_active,
+            status = self._read_status()
+            active_priority = status.speaking_priority
+            runtime = {'turn_id': status.active_turn, 'generating': status.generating,
                         'generated_text': self._generated[-12000:], 'input_origin': deepcopy(getattr(self, '_origin', {'source':'message'})),
-                       'speaking': self._playing is not None, 'pending_speech': self._speech_pending,
-                       'listening': bool(voice and not voice.closed.is_set() and self.state.mic_enabled and self._voice_status == 'ready'),
-                        'microphone_status': self._voice_status, 'microphone_error': self._voice_error,
-                        'voice_phase': self._voice_phase,
+                       'speaking': status.speaking, 'pending_speech': status.pending_audio, 'listening': status.listening,
+                        'microphone_status': status.voice_status, 'microphone_error': self._voice_error,
+                        'voice_phase': status.voice_phase,
                         'speech_error': getattr(self.speech, 'last_error', ''),
-                       'user_speaking': self._user_speaking, 'latest_transcript': deepcopy(self._live_transcript),
+                       'user_speaking': status.user_speaking, 'latest_transcript': deepcopy(self._live_transcript),
                        'speaking_over': [{'text': item.text, 'timestamp': item.timestamp, 'audible_offset': item.offset}
                                          for item in (self._interjections.items[-10:] if self._interjections else [])],
                        'interrupted': self._interrupt_notified, 'audible_offset': self._audible_offset(),
@@ -199,12 +245,18 @@ class SessionManager:
 
     def present_initiative(self, message, *, spoken=False, guard=lambda: False):
         """Commit a background proposal only while foreground interaction is idle."""
-        if not self._turn_lock.acquire(blocking=False): return False
+        if not self._turns.try_begin(): return False
         try:
             with self._voice_lock:
-                if guard() or self._closed or self._generation_active or self._playing or self._speech_pending or self._user_speaking or self.state.sleep_mode: return False
+                if guard() or not self._read_status().idle_for_background(): return False
+                # Validate voice and speech settings before committing: a bad value fails this presentation without leaving
+                # a message nobody saw or heard in history (and another on every retry).
+                voice = self.config.raw.get('voice', {})
+                interjections = Interjections(self.cancel, float(voice.get('interruption_seconds', 1.5)),
+                    float(voice.get('interjection_debounce_seconds', 1.0))) if spoken else None
+                sentences = SpeechChunks(self.config.raw.get('speech', {})) if spoken else None
                 self._input_history_base = None  # No later speech may rewrite the input of a reply this message follows.
-                base = len(self.chat.history)
+                start = self.chat.conversation.append([ChatMessage('assistant', message)])
                 if spoken:
                     self._active_turn = str(uuid.uuid4())
                     self._turn_speak = True
@@ -216,16 +268,10 @@ class SessionManager:
                     self._playing = self._cutoff = None
                     self._assertive_until = 0
                     self._assertive_used = False
-                    self._interjections = Interjections(self.cancel,
-                        float(self.config.raw.get('voice', {}).get('interruption_seconds', 1.5)),
-                        float(self.config.raw.get('voice', {}).get('interjection_debounce_seconds', 1.0)))
-                    self._history_start, self._history_end = base, base + 1
+                    self._interjections = interjections
+                    self._history_start, self._history_end = start, start + 1
                     self.wake.responding()
-                self.chat.history.append(ChatMessage('assistant', message))
-                self.chat._save_history()
                 if spoken:
-                    settings = self.config.raw.get('speech', {})
-                    sentences = SpeechChunks(settings)
                     cursor = 0
                     for text in sentences.feed(message, final=True):
                         pattern = r'\s+'.join(re.escape(part) for part in text.split())
@@ -239,7 +285,7 @@ class SessionManager:
                 event_bus.publish('chat.completed', turn_id=self._active_turn if spoken else str(uuid.uuid4()), text=message,
                     initiative=True, spoken=spoken)
             return True
-        finally: self._turn_lock.release()
+        finally: self._turns.end()
 
     def memory_runtime_context(self):
         return self.runtime_snapshot()
@@ -267,13 +313,12 @@ class SessionManager:
         if event.type != 'voice.activated' or event.payload.get('source') != 'keyword': return
         with self._voice_lock:
             if self._closed or not self.state.mic_enabled: return
-            desktop = self.state.snapshot()
-            model_state = ('sleeping' if self.state.sleep_mode else 'speaking' if self._playing else
-                           'tool' if any(item.get('status') == 'running' for item in desktop['tools']) else
-                           'thinking' if self._generation_active else 'idle')
-            emotion = desktop['emotion'] or {}
+            desktop, status = self.state.snapshot(), self._read_status()
             audio_enabled = self.state.audio_enabled
-        self.wake_feedback.trigger(emotion.get('primary', 'neutral'), model_state, audio_enabled=audio_enabled)
+        # The state the avatar shows, except that the user speech it heard is the wake word itself.
+        model_state = status.model_state(tool_running=any(item.get('status') == 'running' for item in desktop['tools']))
+        emotion = desktop['emotion'] or {}
+        self.wake_feedback.trigger(emotion.get('primary', 'neutral'), 'idle' if model_state == 'listening' else model_state, audio_enabled=audio_enabled)
 
     def _playback_event(self, event):
         # Only voice/speech events change playback state; skip the rest before locking.
@@ -344,7 +389,7 @@ class SessionManager:
     def voice_anchor(self):
         # Only a reply spoken here can be talked over: a remote (speak=False) turn never anchors local speech.
         with self._voice_lock:
-            return (self._active_turn, self._audible_offset(), bool(self._generated.strip())) if self._turn_speak and (self._playing or self._generation_active or self._speech_pending) else None
+            return (self._active_turn, self._audible_offset(), bool(self._generated.strip())) if self._read_status().local_reply() else None
 
     def voice_speaking_over(self, anchor):
         return bool(anchor and (anchor[2] if len(anchor) > 2 else self._generated.strip()))
@@ -358,25 +403,28 @@ class SessionManager:
 
     def _response_history(self, response):
         if self._cutoff is not None: response = response[:self._cutoff]
-        from dataclasses import replace
         origin = getattr(self, '_origin', {})
         return [replace(message, source='microphone' if message.role == 'user' else origin.get('source'),
             conversation_id=origin.get('conversation_id')) for message in self._interjections.messages(response)]
 
-    def _rewrite_history(self):
+    def _rewrite_history(self, reply=None):
+        """Rewrite the current turn's recorded reply (speech over it, a cut) and its continued input in one step. Caller
+        holds _voice_lock."""
         if self._history_start is None: return
-        self._rewrite_user_input()
-        messages = self._response_history(self._generated)
-        self.chat.history[self._history_start:self._history_end] = messages
-        self._history_end = self._history_start + len(messages)
-        self.chat._save_history()
+        start, end, messages = self._history_start, self._history_end, self._response_history(self._generated if reply is None else reply)
+        def change(history):
+            self._continue_input(history)
+            history[start:end] = messages
+        self.chat.conversation.rewrite(change)
+        self._history_end = start + len(messages)
 
-    def _rewrite_user_input(self):
+    def _continue_input(self, history):
+        """In a history being rewritten, extend the user message this reply answers with the speech that continued it."""
         base = self._input_history_base
-        if self._input_continued and base is not None and len(self.chat.history) > base and self.chat.history[base].role == 'user':
-            message = self.chat.history[base]
+        if self._input_continued and base is not None and len(history) > base and history[base].role == 'user':
+            message = history[base]
             prefix = f"{self._input_user_name}: " if message.content.startswith(f"{self._input_user_name}: ") else ''
-            message.content = prefix + self._input_text
+            history[base] = replace(message, content=prefix + self._input_text)
 
     def voice_transcript(self, text, started_at, ended_at, anchor=None):
         """Place the final transcript of speech that began during a spoken reply, and return what the caller must do:
@@ -432,39 +480,38 @@ class SessionManager:
     def _unplace(self, placement, text, user_name):
         """A cut reply's redo that another turn overtook becomes a new turn: take back the words voice_transcript placed
         in the cut turn's history and return them as its input, so they are recorded once. Caller holds _voice_lock."""
-        history = self.chat.history
-        if placement and placement[0] == 'input':
-            _, name, merged = placement
-            for index in range(len(history) - 1, -1, -1):
-                if history[index].role == 'user' and history[index].content in {merged, f'{name}: {merged}'}:
-                    # Its reply was discarded for the redo, so the whole merged question is still unanswered.
-                    if index + 1 < len(history) and history[index + 1].role == 'assistant': break
-                    del history[index]
-                    return merged, name
-        elif placement:
+        if placement and placement[0] == 'interjections':
             _, interjections, offset = placement
             with interjections.lock: items = [item for item in interjections.items if item.offset >= offset]  # at the cut
             placed = {('[speaking over you] ' + item.text, item.timestamp) for item in items}
-            kept = [message for message in history if not (message.role == 'user' and (message.content, message.timestamp) in placed)]
-            if len(kept) < len(history):
-                history[:] = kept
-                return ' '.join(item.text for item in items), user_name
-        return text, user_name
+        def change(history):
+            if placement and placement[0] == 'input':
+                _, name, merged = placement
+                for index in range(len(history) - 1, -1, -1):
+                    if history[index].role == 'user' and history[index].content in {merged, f'{name}: {merged}'}:
+                        # Its reply was discarded for the redo, so the whole merged question is still unanswered.
+                        if index + 1 < len(history) and history[index + 1].role == 'assistant': break
+                        del history[index]
+                        return merged, name
+            elif placement and placement[0] == 'interjections':
+                kept = [message for message in history if not (message.role == 'user' and (message.content, message.timestamp) in placed)]
+                if len(kept) < len(history):
+                    history[:] = kept
+                    return ' '.join(item.text for item in items), user_name
+            return text, user_name
+        return self.chat.conversation.rewrite(change)
 
     def respond(self, text: str, user_name="User", *, record_user=True, speak=True, turn_id=None, origin=None, reply_to=None, wait=None):
-        """Run one foreground turn. Without `wait` a busy session refuses at once (RuntimeError); a queued voice turn passes
-        wait, a callable that abandons it (TurnCancelled), and waits for the running turn instead of being lost. reply_to
-        redoes that turn's cut reply (record_user=False); if any turn or initiative came after it, the text is a new turn."""
+        """Run one foreground turn. Without `wait` a busy session refuses at once (TurnBusy, which every route answers with
+        409); a queued voice turn passes wait, a callable that abandons it (TurnCancelled), and waits for the running turn
+        instead of being lost. reply_to redoes that turn's cut reply (record_user=False); if any turn or initiative came
+        after it, the text is a new turn."""
         if self._closed: raise RuntimeError("The companion session is closed")
         origin = dict(origin or {'source':'message'})
         if origin.get('source') not in {'message','microphone','discord'}: raise ValueError('Unknown input source')
         turn_id = turn_id or str(uuid.uuid4())
-        self._interaction_revision += 1 # Before waiting: a background initiative check backs off.
-        if wait is None:
-            if not self._turn_lock.acquire(blocking=False): raise RuntimeError("Riko is already handling another turn")
-        else:
-            while not self._turn_lock.acquire(timeout=0.1):
-                if self._closed or wait(): raise TurnCancelled()
+        with self._voice_lock: self._interaction_revision += 1  # Before waiting: a background initiative check backs off.
+        self._turns.begin(None if wait is None else lambda: self._closed or wait())
         try:
             if wait is not None and (self._closed or wait()): raise TurnCancelled()
             # Only a turn that runs records its input: a refused one was never taken.
@@ -473,16 +520,16 @@ class SessionManager:
                     context={key: origin[key] for key in ('user_id','channel_id','guild_id','conversation_id') if key in origin})
             with self._voice_lock:
                 placement = self._placed.pop(reply_to, None) if reply_to is not None else None
-                if reply_to is not None and (reply_to != self._active_turn or self._history_end != len(self.chat.history)):
+                if reply_to is not None and (reply_to != self._active_turn or self._history_end != len(self.chat.conversation)):
                     text, user_name = self._unplace(placement, text, user_name)
                     record_user = True
             if self._playing or self._speech_pending:
                 self.cancel() # Foreground input supersedes queued initiative/previous speech.
-            base = len(self.chat.history)
+            base = len(self.chat.conversation)
             from ..tools.approval import approval_turn
             approval_token = approval_turn.set(turn_id)
         except BaseException:
-            self._turn_lock.release() # A leaked lock would refuse every later turn until restart.
+            self._turns.end() # A leaked turn would refuse every later one until restart.
             raise
         try:
             settings = self.config.raw.get("voice", {})
@@ -492,14 +539,13 @@ class SessionManager:
                 float(settings.get("interruption_seconds", 1.5)),
                 float(settings.get("interjection_debounce_seconds", 1.0)))
             with self._voice_lock:
-                base = len(self.chat.history)  # measured as this turn takes over: a late transcript for the last one can no longer move it
+                base = len(self.chat.conversation)  # measured as this turn takes over: a late transcript for the last one can no longer move it
                 self._cancel.clear()
                 self._assertive_until = 0.0
                 self._assertive_used = False
                 self._assertive_reason = ''
                 self._generation_active = True
                 self._origin = origin
-                self.chat.turn_origin = origin
                 self._speech_pending = 0
                 if speak: self.wake.responding() # A remote reply never opens the local microphone's wake window.
                 self._interrupt_notified = False
@@ -554,17 +600,21 @@ class SessionManager:
                 on_metrics=lambda value: event_bus.publish('model.metrics', turn_id=turn_id, **value) if not self._cancel.is_set() else None,
                 on_reasoning=on_reasoning,
                 cancelled=self._cancel.is_set, response_history=self._response_history,
-                record_user=record_user)
+                record_user=record_user, context=TurnContext(origin=origin, runtime=self.runtime_snapshot,
+                    memory_runtime=self.memory_runtime_context, emotion_from_playback=True))  # sentences feed Julia as they play
             with self._voice_lock:
                 if self._cancel.is_set(): raise TurnCancelled()
                 worker = getattr(self.chat, 'emotion_worker', None)
                 if worker: worker.generation('', final=True)
                 for sentence in sentences.feed("", final=True): send_sentence(sentence)
+                # A reply with no visible text (reasoning used the whole budget) keeps ChatService's placeholder in history,
+                # but not in _generated: that stays what was shown or spoken, which voice anchors read.
+                shown = self._generated if self._generated.strip() else response.message.content
                 self._history_start = base + int(record_user)
-                self._history_end = len(self.chat.history)
-                self._rewrite_history()
+                self._history_end = len(self.chat.conversation)
+                self._rewrite_history(shown)
             # Frontend offsets refer to the unnormalized stream, not an added name prefix.
-            event_bus.publish("chat.completed", turn_id=turn_id, text=self._generated, **origin)
+            event_bus.publish("chat.completed", turn_id=turn_id, text=shown, **origin)
             return response
         except TurnCancelled:
             # Shutdown cancels too: still keep what the user said and what they already saw or heard.
@@ -589,7 +639,7 @@ class SessionManager:
                 if self._speech_pending == 0:
                     if speak: self.wake.response_finished() # A remote reply opens no local follow-up window.
                     self._assertive_until = 0.0
-            self._turn_lock.release()
+            self._turns.end()
             approval_turn.reset(approval_token)
 
     def _preserve_turn(self, base, turn_id, text, user_name, record_user, origin):
@@ -598,20 +648,19 @@ class SessionManager:
             with self._voice_lock:
                 # Replace, rather than append: ChatService may have committed just before the
                 # turn was cancelled or failed. Never duplicate the original turn.
-                history = self.chat.history
-                prior_user = history[base] if record_user and len(history) > base and history[base].role == 'user' else ChatMessage(
-                    "user", f"{user_name}: {text}", source=origin.get('source'), conversation_id=origin.get('conversation_id'))
+                asked = ChatMessage("user", f"{user_name}: {text}", source=origin.get('source'), conversation_id=origin.get('conversation_id'))
                 reply = self._response_history(self._generated) if self._active_turn == turn_id else []
-                history[base:] = [*([prior_user] if record_user else []), *reply]
+                def change(history):
+                    prior_user = history[base] if record_user and len(history) > base and history[base].role == 'user' else asked
+                    history[base:] = [*([prior_user] if record_user else []), *reply]
+                    self._continue_input(history)
+                    return len(history)
+                self._history_end = self.chat.conversation.rewrite(change)
                 self._history_start = base + int(record_user)
-                self._history_end = len(history)
-                self._rewrite_user_input()
-                self.chat._save_history()
         except Exception: logger.exception('Could not keep the unfinished turn in chat history')
 
     def _turn_in_flight(self):
-        return bool(self._active_turn and not self._interrupt_notified
-                    and (self._generation_active or self._playing or self._speech_pending))
+        return bool(self._active_turn and not self._interrupt_notified and self._read_status().replying())
 
     def _speech_heard(self):
         """False when speech is muted or TTS failed this turn: the user read the text instead."""
@@ -659,11 +708,8 @@ class SessionManager:
         self._unsubscribe_wake_feedback()
         self.cancel()
         self.state.set_speech('', seconds=0)
-        for resource in (self.animation, self.initiative, self.voice, self.speech, self.wake):
+        for resource in (self.animation, self.initiative, self.voice, self.speech, self.wake, self.asr):
             if resource: close_bounded(resource)
         self.voice = None
-        if getattr(self.chat, 'close', None): close_bounded(self.chat, timeout=6)
-        else:
-            for resource in (getattr(self.chat, 'emotion_worker', None), self.actions,
-                             getattr(self.chat, 'memory_store', None), getattr(self.chat, 'tool_registry', None), self.chat.provider):
-                if resource: close_bounded(resource)
+        close_bounded(self.chat, timeout=6)  # ChatService.close: the factory's ExitStack, or what the chat was built with
+        if self._owns_actions: close_bounded(self.actions)

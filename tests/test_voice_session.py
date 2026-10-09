@@ -5,6 +5,8 @@ import pytest
 
 from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.events.bus import RuntimeEvent
+from process.app_core.conversation.chat import ChatDeps
+from process.app_core.conversation.history import ConversationHistory
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 from process.app_core.desktop.state import DesktopState
@@ -24,7 +26,7 @@ def make_session(monkeypatch, chat):
 
 
 def test_cancel_keeps_capture_and_trims_at_current_playback(monkeypatch):
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
     session = make_session(monkeypatch, chat)
     capture = SimpleNamespace(closed=SimpleNamespace(is_set=lambda: False))
     session.voice = capture
@@ -39,35 +41,35 @@ def test_cancel_keeps_capture_and_trims_at_current_playback(monkeypatch):
     with pytest.raises(TurnCancelled): session.respond('hello')
     assert session.voice is capture
     assert session._cutoff == len('One two')
-    assert chat.history[-1].content == 'One two'
+    assert chat.conversation.snapshot()[-1].content == 'One two'
     assert session.speech.cancelled
     session.voice_transcript('Actually Tuesday', 10, 12, (session._active_turn, 0))
-    assert chat.history[-1].content == '[speaking over you] Actually Tuesday'
-    assert 'Six seven' not in str(chat.history)
+    assert chat.conversation.snapshot()[-1].content == '[speaking over you] Actually Tuesday'
+    assert 'Six seven' not in str(chat.conversation.snapshot())
     session.voice = None
     session.close()
 
 
 def test_interjection_rewrite_preserves_following_history(monkeypatch):
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
     session = make_session(monkeypatch, chat)
     def respond(text, user, **kwargs):
         kwargs['on_delta']('One two three four five. ')
-        chat.history.extend([ChatMessage('user', text), *kwargs['response_history']('One two three four five. ')])
+        chat.conversation.append([ChatMessage('user', text), *kwargs['response_history']('One two three four five. ')])
         return ModelResponse(ChatMessage('assistant', 'One two three four five. '))
     chat.respond = respond
     session.respond('hello')
-    chat.history.append(ChatMessage('system', 'unrelated later entry'))
+    chat.conversation.append([ChatMessage('system', 'unrelated later entry')])
     session.voice_transcript('Tuesday', 1, 1.2, (session._active_turn, 8))
     session.voice_transcript('Not Monday', 1.5, 1.8, (session._active_turn, 10))
-    assert chat.history[-1].content == 'unrelated later entry'
-    users = [m.content for m in chat.history if m.role == 'user']
+    assert chat.conversation.snapshot()[-1].content == 'unrelated later entry'
+    users = [m.content for m in chat.conversation.snapshot() if m.role == 'user']
     assert users == ['hello', '[speaking over you] Tuesday Not Monday']
     session.close()
 
 
 def test_speech_during_reasoning_extends_original_input_without_annotation(monkeypatch):
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
     session = make_session(monkeypatch, chat)
     def respond(text, user, **kwargs):
         kwargs['on_reasoning']('Thinking about the answer')
@@ -77,15 +79,15 @@ def test_speech_during_reasoning_extends_original_input_without_annotation(monke
         raise TurnCancelled()
     chat.respond = respond
     with pytest.raises(TurnCancelled): session.respond('What about today?')
-    assert len(chat.history) == 1
-    assert chat.history[0].content == 'User: What about today?\nAnd tomorrow too'
+    assert len(chat.conversation) == 1
+    assert chat.conversation.snapshot()[0].content == 'User: What about today?\nAnd tomorrow too'
     assert not session._interjections.items
     session.close()
 
 
 def test_stop_during_reasoning_ends_the_turn_at_the_next_reasoning_delta(monkeypatch):
     from process.app_core.events.bus import event_bus
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, close=lambda: None)  # a chat without a provider can still be stopped
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), close=lambda: None)  # a chat without a provider can still be stopped
     session = make_session(monkeypatch, chat)
     shown, after_stop = [], []
     unsubscribe = event_bus.subscribe(lambda event: shown.append(event.payload['text']) if event.type == 'model.reasoning' else None)
@@ -104,16 +106,16 @@ def test_stop_during_reasoning_ends_the_turn_at_the_next_reasoning_delta(monkeyp
 
 
 def test_visible_text_counts_as_speaking_over_even_before_playback(monkeypatch):
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
     session = make_session(monkeypatch, chat)
     def respond(text, user, **kwargs):
         kwargs['on_delta']('Visible answer')
         anchor = session.voice_anchor()
         assert session.voice_speaking_over(anchor)
         assert session.voice_transcript('One more thing', 1, 2, anchor) == 'preserved'
-        chat.history.extend([ChatMessage('user', text), *kwargs['response_history']('Visible answer')])
+        chat.conversation.append([ChatMessage('user', text), *kwargs['response_history']('Visible answer')])
         return ModelResponse(ChatMessage('assistant', 'Visible answer'))
     chat.respond = respond
     session.respond('hello')  # nothing has played yet (FakeSpeech queues nothing)
-    assert any(m.content == '[speaking over you] One more thing' for m in chat.history)
+    assert any(m.content == '[speaking over you] One more thing' for m in chat.conversation.snapshot())
     session.close()

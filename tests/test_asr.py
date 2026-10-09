@@ -3,7 +3,6 @@ import logging
 from pathlib import Path
 import re
 import sys
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -82,10 +81,10 @@ def test_discord_transcription_builds_through_the_factory(monkeypatch):
     from process.app_core.integrations.discord.api import transcribe_pcm
     machine(monkeypatch, MAC)
     built = whisper(monkeypatch)
-    session = SimpleNamespace(asr_lock=threading.Lock(), warmed_asr=None, voice=None,
-        config=SimpleNamespace(raw={'voice': {'asr_device': 'cpu', 'asr_compute_type': 'int8_float16'}}))
+    service = asr.AsrService({'asr_device': 'cpu', 'asr_compute_type': 'int8_float16'})
+    session = SimpleNamespace(transcribe=service.transcribe_pcm)
     assert transcribe_pcm(session, bytes(3200)) == 'heard you'
-    assert built == [('distil-small.en', {'device': 'cpu', 'compute_type': 'int8'})] and session.warmed_asr is not None
+    assert built == [('distil-small.en', {'device': 'cpu', 'compute_type': 'int8'})] and service.model is not None
 
 
 def test_only_the_factory_constructs_whisper_or_defaults_the_pair():

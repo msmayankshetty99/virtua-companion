@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from process.app_core.audio.voice_input import VoiceInput
 from process.app_core.audio.voice_segments import Segment
 from process.app_core.audio.wake_word import WakeWord
+from process.app_core.kernel.turns import RuntimeStatus
 
 
 def test_capture_only_queues_post_keyword_request_for_asr(tmp_path, monkeypatch):
@@ -23,7 +24,7 @@ def test_capture_only_queues_post_keyword_request_for_asr(tmp_path, monkeypatch)
     monkeypatch.setitem(sys.modules, 'silero_vad', SimpleNamespace(load_silero_vad=VAD))
     voice = VoiceInput.__new__(VoiceInput)
     voice.session = SimpleNamespace(config=config, wake=wake, state=SimpleNamespace(mic_enabled=True),
-        _voice_lock=threading.RLock(), _assertive_until=0, voice_anchor=lambda: None)
+        set_user_speaking=lambda speaking: None, status=RuntimeStatus, voice_anchor=lambda: None)
     voice.closed, voice.jobs, voice._last_overflow = threading.Event(), queue.Queue(), 0
     class Frames(queue.Queue):
         def get(self, **kwargs):
@@ -51,11 +52,10 @@ def test_capture_only_queues_post_keyword_request_for_asr(tmp_path, monkeypatch)
 def test_asr_keeps_legitimate_wake_name_mentions_in_request(monkeypatch):
     monkeypatch.setitem(sys.modules, 'faster_whisper', SimpleNamespace(WhisperModel=object))
     voice = VoiceInput.__new__(VoiceInput)
-    voice.closed, voice._parts, voice.asr_lock = threading.Event(), {}, threading.Lock()
-    voice.session = SimpleNamespace(config=SimpleNamespace(raw={'voice': {}}),
-        wake=SimpleNamespace(calibrating=False, testing=False, mode='wake_word', phrase='Riko'))
+    voice.closed, voice._parts = threading.Event(), {}
     text = 'Riko is the character in my story.'
-    voice.model = SimpleNamespace(transcribe=lambda *a, **k: (iter([SimpleNamespace(text=text)]), None))
+    voice.session = SimpleNamespace(config=SimpleNamespace(raw={'voice': {}}),
+        wake=SimpleNamespace(calibrating=False, testing=False, mode='wake_word', phrase='Riko'), transcribe=lambda pcm, **options: text)
     submitted = []
     voice.responses = SimpleNamespace(submit=lambda *args: submitted.append(args))
     class Jobs(queue.Queue):

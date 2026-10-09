@@ -54,6 +54,14 @@ def test_round_trip_save_preserves_comments_and_unknown_settings(store):
     assert store.path.with_suffix('.yaml.previous').read_text() == before
 
 
+def test_background_budgets_are_edited_under_their_sections_not_as_runtime_fields(store):
+    """RuntimeConfig declares initiative_n_ctx and the rest, but Settings keeps showing them as the YAML keys they come from."""
+    snapshot = store.snapshot()
+    names = {*snapshot['values'], *(item['path'] for item in snapshot['fields'])}
+    assert not names & {'runtime.initiative_n_ctx', 'runtime.initiative_max_output_tokens', 'runtime.reflection_n_ctx'}
+    assert snapshot['values']['initiative.context_window_tokens'] == 4096 and snapshot['values']['initiative.max_output_tokens'] == 1024
+
+
 def test_validation_does_not_write_config_or_start_models(store):
     before = store.path.read_bytes()
     result = store.validate({'runtime.provider':'llama_cpp'})

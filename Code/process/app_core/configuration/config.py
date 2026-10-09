@@ -13,7 +13,7 @@ except ImportError:  # Keep core imports usable for tooling/tests before depende
     yaml = None
 
 
-@dataclass
+@dataclass(slots=True)  # an undeclared field fails when set (tests/test_declared_attributes.py)
 class RuntimeConfig:
     provider: str = "openai"
     model: str = ""
@@ -57,6 +57,11 @@ class RuntimeConfig:
     warmup: bool = True
     pause_background_on_live: bool = True
     native_library: Path | None = None
+    # Background lanes' budgets, set by load_config from initiative.* (initiative_settings.json overrides them) and
+    # memory.reflection_context_window_tokens; Settings edits them under those keys, not as runtime.* (RUNTIME_DERIVED).
+    initiative_n_ctx: int = 4096
+    initiative_max_output_tokens: int = 1024
+    reflection_n_ctx: int = 4096
 
 
 @dataclass

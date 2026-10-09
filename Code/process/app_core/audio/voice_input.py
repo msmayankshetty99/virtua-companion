@@ -7,7 +7,6 @@ from ..kernel.workers import DaemonExecutor
 
 from ..kernel.cancellation import TurnCancelled
 from ..events.bus import event_bus
-from .asr import create_whisper
 from .voice_segments import VoiceSegments
 
 logger = logging.getLogger(__name__)
@@ -19,8 +18,6 @@ class VoiceInput:
         self.frames = queue.Queue(maxsize=256)
         self.jobs = queue.Queue(maxsize=64)
         self.closed = threading.Event()
-        self.model = getattr(session, 'warmed_asr', None)
-        self.asr_lock = getattr(session, 'asr_lock', threading.Lock())
         self.responses = DaemonExecutor(max_workers=1, thread_name_prefix="voice-turn", max_pending=8)
         self._last_overflow = 0
         self._parts = {}
@@ -86,7 +83,7 @@ class VoiceInput:
                 event_bus.publish("voice.started", utterance_id=segmenter.utterance_id, speaking_over=bool(anchor and (len(anchor) < 3 or anchor[2])))
                 return anchor
             def activity(seconds, anchor):
-                if getattr(self.session, '_voice_phase', '') != 'capturing': event_bus.publish('voice.resumed', utterance_id=segmenter.utterance_id)
+                if self.session.status().voice_phase != 'capturing': event_bus.publish('voice.resumed', utterance_id=segmenter.utterance_id)
                 if anchor is not None: self.session.voice_activity(seconds, anchor)
             segmenter = VoiceSegments(self._enqueue, on_start, activity,
                 pre_roll=float(settings.get("pre_roll_seconds", 1.0)),
@@ -112,16 +109,16 @@ class VoiceInput:
                         event_bus.publish("voice.level", rms=float(np.sqrt(np.mean(samples ** 2))), peak=float(np.max(np.abs(samples))))
                         last_level = timestamp
                     if not self.session.state.mic_enabled:
-                        with self.session._voice_lock: self.session._user_speaking = False
+                        self.session.set_user_speaking(False)
                         segmenter.reset()
                         vad.reset_states()
                         continue
                     with torch.inference_mode(): probability = float(vad(torch.from_numpy(samples), 16000))
                     speaking = probability >= float(settings.get("vad_threshold", 0.5))
-                    with self.session._voice_lock: self.session._user_speaking = speaking
+                    self.session.set_user_speaking(speaking)
                     # A tool may claim speaking priority while an utterance that
                     # began before the reply is still being captured.
-                    if segmenter.utterance_id and segmenter.anchor is None and time.monotonic() < self.session._assertive_until:
+                    if segmenter.utterance_id and segmenter.anchor is None and self.session.status().speaking_priority:
                         segmenter.anchor = self.session.voice_anchor()
                     self.session.wake.feed(frame, speaking)
                     if self.session.wake.calibrating or getattr(self.session.wake, 'testing', False):
@@ -148,21 +145,12 @@ class VoiceInput:
                 if self.session.wake.calibrating or self.session.wake.testing:
                     self._parts.pop(segment.utterance_id, None)
                     continue
-                import numpy as np
-                config = self.session.config.raw.get("voice", {})
                 if not segment.provisional: event_bus.publish('voice.transcribing', utterance_id=segment.utterance_id)
                 parts = self._parts.setdefault(segment.utterance_id, [])
                 partial_text = ''
                 if segment.pcm:
-                    audio = np.frombuffer(segment.pcm, dtype='<i2').astype('float32') / 32768
-                    with self.asr_lock:
-                        if self.model is None:
-                            self.model = getattr(self.session, 'warmed_asr', None)
-                            if self.model is None:
-                                self.model = self.session.warmed_asr = create_whisper(config)
-                        segments, _ = self.model.transcribe(audio, beam_size=1, vad_filter=False,
-                                                           condition_on_previous_text=False)
-                        text = " ".join(item.text.strip() for item in segments).strip()
+                    # The session's one Whisper model, shared with warmup and Discord (audio/asr.py AsrService).
+                    text = self.session.transcribe(segment.pcm, beam_size=1, vad_filter=False, condition_on_previous_text=False)
                     if text:
                         if segment.provisional: partial_text = text
                         else: parts.append(text)

@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from process.app_core.conversation.chat import ChatService
+from process.app_core.conversation.chat import ChatDeps, ChatService
+from process.app_core.conversation.history import ConversationHistory
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.desktop.state import DesktopState
 from process.app_core.emotion.julia import JuliaEmotionEngine
@@ -32,7 +33,7 @@ class FakeSpeech:
 @pytest.fixture
 def session_parts(monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', FakeSpeech)
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
     config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     session = SessionManager(config, chat, DesktopState())
     events = []
@@ -45,12 +46,12 @@ def session_parts(monkeypatch):
 def answer(chat, text):
     def respond(user_text, user_name, **kwargs):
         kwargs['on_delta'](text)
-        chat.history.extend([ChatMessage('user', f'{user_name}: {user_text}'), *kwargs['response_history'](text)])
+        chat.conversation.append([ChatMessage('user', f'{user_name}: {user_text}'), *kwargs['response_history'](text)])
         return ModelResponse(ChatMessage('assistant', text))
     return respond
 
 
-def contents(chat): return [(message.role, message.content) for message in chat.history]
+def contents(chat): return [(message.role, message.content) for message in chat.conversation.snapshot()]
 
 
 def test_stop_sleep_and_shutdown_after_a_finished_reply_keep_it(session_parts):
@@ -95,7 +96,7 @@ def test_shutdown_during_a_reply_keeps_the_users_message(session_parts):
         raise TurnCancelled()
     chat.respond = respond
     with pytest.raises(TurnCancelled): session.respond('hello')
-    assert chat.history[0].content == 'User: hello'
+    assert chat.conversation.snapshot()[0].content == 'User: hello'
 
 
 def test_a_bad_voice_setting_fails_the_turn_with_the_real_error_and_keeps_the_message(session_parts):
@@ -148,7 +149,7 @@ def test_turn_lock_is_released_when_superseding_previous_speech_fails(session_pa
     session.speech.cancel = lambda: None
     chat.respond = answer(chat, 'Second reply.')
     session.respond('second')  # must not fail with "already handling another turn"
-    assert chat.history[-1].content == 'Second reply.'
+    assert chat.conversation.snapshot()[-1].content == 'Second reply.'
 
 
 def provider(text='hi'):
@@ -172,7 +173,7 @@ def test_chat_history_is_never_saved_over_a_file_that_could_not_be_kept(tmp_path
     path.write_text('{"not": "a list"}', encoding='utf-8')
     original = path.read_bytes()
     def locked(path): raise PermissionError('locked by another program')
-    monkeypatch.setattr('process.app_core.conversation.chat.preserve_unreadable', locked)
+    monkeypatch.setattr('process.app_core.conversation.history.preserve_unreadable', locked)
     service = ChatService(provider(), system_prompt='test', history_file=path)
     service.respond('hello')
     assert path.read_bytes() == original

@@ -193,7 +193,7 @@ class LlamaContextProvider(InferenceLane):
             group = options.get('emotion_turn_id') or str(uuid.uuid4())
             if self.probe and role == 'live': self.probe.activate(group)
             from .responses import response_input, response_tools, template_messages, assemble_responses, sse_events
-            ceiling = self.config.n_ctx if role == 'live' else getattr(self.config, role + '_n_ctx', 4096)
+            ceiling = {'live': self.config.n_ctx, 'initiative': self.config.initiative_n_ctx, 'reflection': self.config.reflection_n_ctx}[role]
             limit = options.get('context_limit', ceiling)
             if limit > ceiling: raise ValueError(f'{role} context exceeds the server allocation ({ceiling}); restart Python after changing budgets')
             formatted = template_messages(messages)

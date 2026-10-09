@@ -3,9 +3,11 @@ from __future__ import annotations
 from .configuration.config import AppConfig
 from .inference.providers import create_provider
 from .tools.registry import ToolRegistry
-from .conversation.chat import ChatService
+from .conversation.chat import ChatDeps, ChatService
 from .emotion import JuliaEmotionEngine, ExpressionActionBridge
+from .emotion.worker import EmotionWorker
 from .desktop.state import get_desktop_state
+from .desktop.tools import DesktopServices
 from .persistence.memory import MemoryStore
 from .runtime.actions import ActionController
 from .persistence.tasks import TaskStore, TaskMCP, TASK_RULES
@@ -16,23 +18,25 @@ from .kernel.lifecycle import close_bounded
 
 
 def create_chat_service(config: AppConfig) -> ChatService:
-    """Build the complete application core without importing audio or UI code."""
-    with ExitStack() as cleanup:
-        service = _build_chat_service(config, cleanup)
-        service.close = cleanup.pop_all().close
-        return service
+    """Build the complete application core without importing audio or UI code. The service's close() owns everything built
+    here; a failure part way closes what was built so far."""
+    cleanup = ExitStack()
+    try: return _build_chat_service(config, cleanup)
+    except BaseException:
+        cleanup.close()
+        raise
 
 
 def _build_chat_service(config, cleanup):
     def own(resource):
         cleanup.callback(close_bounded, resource)
         return resource
-    emotion_engine = None
+    emotion_engine = emotion_worker = None
     actions = own(ActionController())
-    get_desktop_state().action_controller = actions
-    get_desktop_state().media_resolver = lambda path: resolve_media(config.root, path, config.raw.get('desktop', {}).get('effects_directory', 'effects/greenscreens'))
-    get_desktop_state().effects_directory = config.raw.get('desktop', {}).get('effects_directory', 'effects/greenscreens')
-    get_desktop_state().effect_library = EffectLibrary(config.root / get_desktop_state().effects_directory)
+    effects_directory = config.raw.get('desktop', {}).get('effects_directory', 'effects/greenscreens')
+    desktop = DesktopServices(get_desktop_state(), actions=actions, effects_directory=effects_directory,
+        media_resolver=lambda path: resolve_media(config.root, path, effects_directory),
+        effect_library=EffectLibrary(config.root / effects_directory))
     if config.emotion.enabled:
         state = get_desktop_state()
         def on_emotion(emotion):
@@ -52,6 +56,7 @@ def _build_chat_service(config, cleanup):
             fallback=config.emotion.fallback,
             on_event=lambda event: publish_teacher(event),
         ))
+        emotion_worker = own(EmotionWorker(emotion_engine))
     provider = own(create_provider(config.runtime))
     def publish_teacher(event):
         probe = getattr(provider, 'probe', None)
@@ -64,18 +69,20 @@ def _build_chat_service(config, cleanup):
             raise ValueError('Selected provider does not expose hidden-state probe capture')
         probe_config = ProbeConfig.from_raw(config.emotion.probe)
         provider.set_probe_interval(probe_config.interval_tokens)
+        playback_active = emotion_worker.playback_active  # the probe needs emotion.enabled (load_config), so the worker exists
+        def expression(state):  # while sentences play, they drive the expression: the probe's reading waits
+            if not playback_active(): bridge.update(state)
         provider.probe_factory = lambda identity, idle: EmotionProbe(
             probe_directory(config.root, config.runtime), identity, emotion_engine,
             probe_config, idle=idle, legacy_directory=config.root / 'persistent_memories' / 'emotion_probes',
             training_directory=training_directory(config.root, config.runtime),
-            on_prediction=lambda state: bridge.update(state) if not getattr(emotion_engine,'playback_active',False) else None,
-            on_fallback=lambda state: bridge.update(state) if not getattr(emotion_engine,'playback_active',False) else None)
+            on_prediction=expression, on_fallback=expression)
         # Julia remains the teacher and low-confidence fallback. Student
         # events use the same expression/action bridge, never tool execution.
     if config.runtime.warmup and hasattr(provider, 'warmup'): provider.warmup()
     task_path = config.raw.get('tasks', {}).get('store_file', 'persistent_memories/tasks.sqlite3')
     task_store = TaskStore(config.root / task_path)
-    registry = own(ToolRegistry.from_config(config, activity=get_desktop_state()))
+    registry = own(ToolRegistry.from_config(config, activity=get_desktop_state(), desktop=desktop))
     from .tools.choices import ChoiceResolver
     registry.choice_resolver = ChoiceResolver(emotion_engine.choose_tool_input if emotion_engine else None,
         enabled=config.tools.best_fit_inputs, timeout=config.tools.best_fit_timeout_seconds,
@@ -88,7 +95,7 @@ def _build_chat_service(config, cleanup):
         from .runtime.warmup import warm_core
         warm_core(memory, emotion_engine, config.runtime.startup_timeout_seconds)
         memory.start()
-    service = ChatService(
+    return ChatService(
         provider,
         system_prompt=config.system_prompt + '\n' + TASK_RULES + '\n' + str(config.raw.get('tasks', {}).get('rules', '')),
         character_name=config.character_name,
@@ -96,11 +103,8 @@ def _build_chat_service(config, cleanup):
         history_file=config.memory.history_file,
         emotion_engine=emotion_engine,
         memory_store=memory,
+        deps=ChatDeps(action_controller=actions, task_store=task_store, task_mcp=task_mcp,
+            initiative_provider=getattr(provider, 'initiative', provider),
+            context_limit=min(config.runtime.n_ctx, config.memory.context_window_tokens + config.runtime.max_output_tokens),
+            emotion_worker=emotion_worker, desktop=desktop, cleanup=cleanup),
     )
-    service.action_controller = actions
-    service.task_store = task_store
-    service.task_mcp = task_mcp
-    service.initiative_provider = getattr(provider, 'initiative', provider)
-    service.context_limit = min(config.runtime.n_ctx, config.memory.context_window_tokens + config.runtime.max_output_tokens)
-    if service.emotion_worker: own(service.emotion_worker)
-    return service

@@ -1,5 +1,5 @@
 """One voice-turn contract: SessionManager.voice_transcript says what each final transcript needs ('preserved',
-'reply', 'fresh' or 'ignored') and VoiceInput acts on it, waiting for the turn lock rather than losing the words.
+'reply', 'fresh' or 'ignored') and VoiceInput acts on it, waiting for the turn gate rather than losing the words.
 Every step runs on the test thread (or behind explicit events), so nothing depends on timing."""
 import queue
 import threading
@@ -11,6 +11,8 @@ import pytest
 
 from process.app_core.audio.voice_input import VoiceInput
 from process.app_core.audio.voice_segments import Segment
+from process.app_core.conversation.chat import ChatDeps
+from process.app_core.conversation.history import ConversationHistory
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import event_bus
@@ -31,7 +33,7 @@ class Speech:
 @pytest.fixture
 def parts(monkeypatch, tmp_path):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    chat = SimpleNamespace(history=[], calls=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), calls=[], provider=SimpleNamespace(close=lambda: None))
     config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     session = SessionManager(config, chat, DesktopState())
     events = []
@@ -47,7 +49,7 @@ def commit(chat, text, user_name, kwargs, reply):
     chat.calls.append((text, kwargs['record_user']))
     if kwargs['cancelled'](): raise TurnCancelled()
     kwargs['on_delta'](reply)
-    chat.history.extend([*([ChatMessage('user', f'{user_name}: {text}')] if kwargs['record_user'] else []), *kwargs['response_history'](reply)])
+    chat.conversation.append([*([ChatMessage('user', f'{user_name}: {text}')] if kwargs['record_user'] else []), *kwargs['response_history'](reply)])
     return ModelResponse(ChatMessage('assistant', reply))
 
 
@@ -58,16 +60,16 @@ def answer(chat, reply, before=None):
     return respond
 
 
-def contents(chat): return [(message.role, message.content) for message in chat.history]
+def contents(chat): return [(message.role, message.content) for message in chat.conversation.snapshot()]
 
 
 def voice_for(session, transcripts):
     """A VoiceInput whose ASR returns the given texts in order; dispatches are collected, then run by run_dispatches."""
     voice = VoiceInput.__new__(VoiceInput)
-    voice.session, voice.closed, voice._parts, voice.asr_lock = session, threading.Event(), {}, threading.Lock()
+    voice.session, voice.closed, voice._parts = session, threading.Event(), {}
     voice._partial_lock, voice._partial_pending = threading.Lock(), set()
     texts = iter(transcripts)
-    voice.model = SimpleNamespace(transcribe=lambda *args, **kwargs: (iter([SimpleNamespace(text=next(texts))]), None))
+    session.asr.model = SimpleNamespace(transcribe=lambda *args, **kwargs: (iter([SimpleNamespace(text=next(texts))]), None))
     voice.dispatched = []
     voice.responses = SimpleNamespace(submit=lambda function, *args: voice.dispatched.append((function, args)))
     return voice
@@ -211,20 +213,20 @@ def test_a_remote_turn_leaves_the_local_wake_window_and_microphone_alone(parts):
 
 def test_a_refused_turn_records_no_input(parts):
     session, _, _ = parts
-    assert session._turn_lock.acquire(blocking=False)  # another turn is running
+    assert session._turns.try_begin()  # another turn is running
     try:
         with pytest.raises(RuntimeError, match='Riko is already handling another turn'):
             session.respond('are you there?', origin={'source': 'message', 'message_id': 'typed'})
-    finally: session._turn_lock.release()
+    finally: session._turns.end()
     assert session.state.snapshot()['incoming'] == []
 
 
-def test_a_finished_utterance_waits_for_an_initiative_that_takes_the_turn_lock_first(parts):
+def test_a_finished_utterance_waits_for_an_initiative_that_takes_the_turn_first(parts, monkeypatch):
     session, chat, events = parts
     voice = voice_for(session, ['what time is it?'])
     transcribe(voice, None)  # finished while idle: a new turn is queued
     settled, proceed, presented = threading.Event(), threading.Event(), []
-    def guard():  # present_initiative calls this while holding _turn_lock
+    def guard():  # present_initiative calls this while holding the turn
         settled.set()
         proceed.wait(5)
         return False
@@ -239,7 +241,7 @@ def test_a_finished_utterance_waits_for_an_initiative_that_takes_the_turn_lock_f
             thread.start()
             settled.wait(5)
         return observe(*args, **kwargs)
-    session.state.observe_input = racing_observe
+    monkeypatch.setattr(DesktopState, 'observe_input', lambda state, *args, **kwargs: racing_observe(*args, **kwargs))  # slots: patch the class
     chat.respond = answer(chat, 'Half past two.')
     try:
         run_dispatches(voice)
@@ -276,7 +278,7 @@ def test_a_queued_voice_turn_waits_for_a_running_turn_and_stops_waiting_on_close
     assert not waiting.is_alive()
     assert contents(chat)[-2:] == [('user', 'User: first'), ('assistant', 'Voice reply.')]
     # A dispatch still waiting when the microphone closes gives up: no turn and no error.
-    assert session._turn_lock.acquire(blocking=False)
+    assert session._turns.try_begin()
     try:
         transcribe(voice, None)
         voice.closed.clear()
@@ -286,7 +288,7 @@ def test_a_queued_voice_turn_waits_for_a_running_turn_and_stops_waiting_on_close
         voice.closed.set()
         waiting.join(5)
         assert not waiting.is_alive()
-    finally: session._turn_lock.release()
+    finally: session._turns.end()
     assert [call[0] for call in chat.calls] == ['typed', 'first']
     assert 'voice.error' not in [event.type for event in events]
 
@@ -325,7 +327,7 @@ def test_a_transcript_whose_turn_was_replaced_is_dispatched_not_dropped(parts):
     chat.respond = answer(chat, 'Typed reply.')
     session.respond('a typed message')  # a second turn starts before the utterance's final ASR
     transcribe(voice, anchors[0])
-    assert not [message for message in chat.history if 'noon' in message.content]  # not inserted into either turn
+    assert not [message for message in chat.conversation.snapshot() if 'noon' in message.content]  # not inserted into either turn
     chat.respond = answer(chat, 'Noon reminder set.')
     run_dispatches(voice)
     assert contents(chat)[-2:] == [('user', 'User: remind me at noon'), ('assistant', 'Noon reminder set.')]
@@ -382,6 +384,43 @@ def test_sustained_speech_after_stop_cuts_nothing_and_starts_a_turn_of_its_own(p
 def test_an_animation_setting_that_is_not_a_section_disables_animation_without_failing_the_session(monkeypatch, tmp_path, animation):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     config = SimpleNamespace(raw={'animation': animation}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
-    session = SessionManager(config, SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None)), DesktopState())
+    session = SessionManager(config, SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None)), DesktopState())
     try: assert session.animation is None and (session.animation_error == '' if animation is False else 'must be a mapping' in session.animation_error)
     finally: session.close()
+
+
+def test_a_reply_with_no_visible_text_keeps_its_placeholder_so_roles_still_alternate(parts):
+    session, chat, events = parts
+    def reasoning_only(text, user_name, **kwargs):  # the model reasoned through its whole budget: no visible delta
+        chat.conversation.append([ChatMessage('user', f'{user_name}: {text}'), *kwargs['response_history']('...')])
+        return ModelResponse(ChatMessage('assistant', '...'))  # ChatService's placeholder for an empty answer
+    chat.respond = reasoning_only
+    session.respond('Say hello')
+    chat.respond = answer(chat, 'Hello there!')
+    session.respond('Again?')
+    assert contents(chat) == [('user', 'User: Say hello'), ('assistant', '...'), ('user', 'User: Again?'), ('assistant', 'Hello there!')]
+    assert [event.payload['text'] for event in events if event.type == 'chat.completed'] == ['...', 'Hello there!']
+
+
+def test_an_empty_reply_is_not_visible_output_that_speech_could_be_over(parts):
+    session, chat, _ = parts
+    anchors = []
+    def reasoning_only(text, user_name, **kwargs):
+        chat.conversation.append([ChatMessage('user', f'{user_name}: {text}'), *kwargs['response_history']('...')])
+        return ModelResponse(ChatMessage('assistant', '...'))
+    chat.respond = reasoning_only
+    original = session._rewrite_history
+    def rewrite(*args):  # speech starting while the finished turn is still generating
+        anchors.append(session.voice_anchor())
+        return original(*args)
+    session._rewrite_history = rewrite
+    session.respond('Say hello')
+    assert anchors and anchors[0][2] is False  # nothing visible: the user's words are a turn of their own, not speech over it
+
+
+def test_a_spoken_initiative_with_bad_voice_settings_commits_nothing(parts):
+    session, chat, _ = parts
+    session.config.raw['voice'] = {'interjection_debounce_seconds': 0}
+    for _ in range(2):
+        with pytest.raises(ValueError): session.present_initiative('Time for a stretch?', spoken=True)
+    assert contents(chat) == []  # neither attempt left a message nobody saw or heard

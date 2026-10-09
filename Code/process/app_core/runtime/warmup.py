@@ -1,6 +1,5 @@
 """Startup preflight without microphone capture, history writes or audible output."""
 import logging
-import threading
 import time
 
 from ..events.bus import event_bus
@@ -34,21 +33,14 @@ def warm_core(memory, emotion, timeout):
 
 
 def warm_session(session):
-    session.asr_lock = threading.Lock()
-    def asr():
-        import numpy as np
-        from ..audio.asr import create_whisper
-        model = create_whisper(session.config.raw.get('voice', {}))
-        segments, _ = model.transcribe(np.zeros(16000, dtype='float32'), beam_size=1, vad_filter=False)
-        list(segments)
-        if not session._closed: session.warmed_asr = model
+    def asr(): session.asr.warm()  # builds the session's one Whisper model, which the microphone and Discord then use
     def vad():
         import torch
         from silero_vad import load_silero_vad
         model = load_silero_vad()
         model(torch.zeros(512), 16000)
         model.reset_states()
-        if not session._closed: session.warmed_vad = model
+        if session.is_open: session.warmed_vad = model
     def wake():
         import numpy as np
         model = session.wake._backend()

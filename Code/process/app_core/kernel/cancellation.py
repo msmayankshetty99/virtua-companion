@@ -11,3 +11,10 @@ class TurnCancelled(Deferred):
 
 class BackgroundPreempted(Deferred, RuntimeError):
     """Background inference (initiative, reflection) gave way to a live turn, a cancel or shutdown; retry it later."""
+
+
+class TurnBusy(RuntimeError):
+    """Another foreground turn holds the session: a conflict to retry (every route answers 409), not a failure. The
+    message is the one SessionManager always raised, so a client that still compares the text keeps working."""
+    MESSAGE = 'Riko is already handling another turn'
+    def __init__(self, message=MESSAGE): super().__init__(message)

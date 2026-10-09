@@ -6,22 +6,35 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from ...audio.tts_http import synthesize_wav
-from ...kernel.cancellation import TurnCancelled
+from ...kernel.cancellation import TurnBusy, TurnCancelled
 
 MAX_AUDIO_SECONDS = 60
 MAX_PCM_BYTES = 16000 * 2 * MAX_AUDIO_SECONDS
 
 
 def transcribe_pcm(session, pcm):
-    import numpy as np
-    from ...audio.asr import create_whisper
-    with session.asr_lock:
-        model = getattr(session, 'warmed_asr', None) or getattr(getattr(session, 'voice', None), 'model', None)
-        if model is None: model = create_whisper(session.config.raw.get('voice', {}))
-        session.warmed_asr = model
-        samples = np.frombuffer(pcm, dtype='<i2').astype('float32') / 32768
-        segments, _ = model.transcribe(samples, beam_size=1, vad_filter=True, condition_on_previous_text=False)
-        return ' '.join(segment.text.strip() for segment in segments).strip()
+    """A Discord voice message or call segment, through the session's one Whisper model (the microphone's)."""
+    return session.transcribe(pcm, beam_size=1, vad_filter=True, condition_on_previous_text=False)
+
+
+# The Discord process sees only what bot.py acts on: its own turns' text, reasoning and tool approvals, approval and
+# Discord resources, initiative messages and whiteboard updates. Local transcripts, chats and desktop state stay local,
+# and voice levels or snapshots never fill its socket's queue (closed with 1013) during a long local turn.
+CLIENT_EVENTS = frozenset({'resource.discord', 'resource.approvals', 'tool.approval_finished', 'tool.approval_resolved',
+    'initiative.presented', 'whiteboard.changed', 'whiteboard.image'})
+TURN_EVENTS = frozenset({'chat.delta', 'model.reasoning', 'tool.approval_requested'})
+
+
+def client_event_filter():
+    """A filter for one Discord socket (events.stream.stream_events). A turn is the bot's once an event of it carries
+    source 'discord' (chat.input, model.started), before any of its deltas."""
+    turns = set()
+    def relevant(event):
+        if event.payload.get('source') == 'discord' and event.turn_id:
+            turns.add(event.turn_id)
+            if len(turns) > 256: turns.clear(); turns.add(event.turn_id)
+        return event.type in CLIENT_EVENTS or event.type in TURN_EVENTS and event.turn_id in turns
+    return relevant
 
 
 class DiscordChat(BaseModel):
@@ -48,7 +61,7 @@ def create_router(get_session, get_launcher=None):
 
     def current():
         session = get_session()
-        if session is None or session._closed: raise HTTPException(503, 'Companion runtime unavailable')
+        if session is None or not session.is_open: raise HTTPException(503, 'Companion runtime unavailable')
         return session
 
     @router.post('/chat')
@@ -68,17 +81,11 @@ def create_router(get_session, get_launcher=None):
                 speak=False, turn_id=str(request.turn_id), **({'origin': origin} if origin else {}))
             return {'text': response.message.content, 'turn_id': str(request.turn_id)}
         except TurnCancelled: return {'cancelled': True, 'turn_id': str(request.turn_id)}
-        except RuntimeError as exc:
-            if str(exc) == 'Riko is already handling another turn': raise HTTPException(409, 'Companion is busy; retry when its active turn finishes') from exc
-            raise
+        except TurnBusy as exc: raise HTTPException(409, 'Companion is busy; retry when its active turn finishes') from exc
 
     @router.post('/stop')
     def stop(request: StopTurn):
-        session = current()
-        with session._voice_lock:
-            matched = session._active_turn == str(request.turn_id) and session._generation_active
-            if matched: session.cancel()
-        return {'stopped': matched}
+        return {'stopped': current().cancel_turn(str(request.turn_id))}  # never a turn other than this one
 
     @router.post('/transcribe')
     async def transcribe(request: Request):

@@ -142,8 +142,7 @@ def test_delayed_asr_preserves_tolerated_speech_without_reply_dispatch(monkeypat
         # Simulate the priority window expiring while ASR is finishing.
         session._assertive_until = 0
         return iter([SimpleNamespace(text='But tomorrow?')]), None
-    voice.model = SimpleNamespace(transcribe=transcribe)
-    voice.asr_lock = threading.Lock()
+    session.asr.model = SimpleNamespace(transcribe=transcribe)
     class Jobs(queue.Queue):
         def task_done(self):
             super().task_done()

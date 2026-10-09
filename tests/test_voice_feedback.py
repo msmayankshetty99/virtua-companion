@@ -48,11 +48,10 @@ def test_partial_asr_revisions_replace_text_and_never_dispatch_a_reply_early(mon
     from process.app_core.audio.voice_input import VoiceInput
     monkeypatch.setitem(sys.modules,'faster_whisper',SimpleNamespace(WhisperModel=object))
     voice=VoiceInput.__new__(VoiceInput)
-    voice.closed=threading.Event();voice.jobs=queue.Queue();voice.asr_lock=threading.Lock()
+    voice.closed=threading.Event();voice.jobs=queue.Queue()
     voice._partial_lock=threading.Lock();voice._partial_pending=set();voice._parts={}
     outputs=iter(['hel','hello','hello there'])
-    voice.model=SimpleNamespace(transcribe=lambda *args,**kwargs:([SimpleNamespace(text=next(outputs))],None))
-    voice.session=SimpleNamespace(wake=SimpleNamespace(calibrating=False,testing=False),config=SimpleNamespace(raw={}))
+    voice.session=SimpleNamespace(wake=SimpleNamespace(calibrating=False,testing=False),config=SimpleNamespace(raw={}),transcribe=lambda pcm,**options:next(outputs))
     replies=[]
     def submit(fn,text,segment):replies.append(text);voice.closed.set()
     voice.responses=SimpleNamespace(submit=submit)

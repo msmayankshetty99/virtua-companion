@@ -7,6 +7,7 @@ from process.app_core.configuration.config import RuntimeConfig
 from process.app_core.kernel.messages import ChatMessage
 from process.app_core.inference.providers import OpenAIProvider
 from process.app_core.kernel.streaming import WordDeltas
+from process.app_core.kernel.turns import TurnContext
 
 
 def provider(create):
@@ -181,7 +182,7 @@ def chat_completion(text='Hello'):
 @pytest.mark.parametrize('responses', [False, True])
 def test_stock_tools_fit_default_budget_and_strict_templates_get_one_leading_system(tmp_path, responses):
     from process.app_core.configuration.config import load_config
-    from process.app_core.conversation.chat import ChatService
+    from process.app_core.conversation.chat import ChatDeps, ChatService
     from process.app_core.persistence.tasks import TaskMCP, TaskStore, TASK_RULES
     from process.app_core.tools.registry import ToolRegistry
     (tmp_path / 'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n', encoding='utf-8')
@@ -195,11 +196,11 @@ def test_stock_tools_fit_default_budget_and_strict_templates_get_one_leading_sys
         instance.config, instance.responses_enabled = config.runtime, responses
         instance.client.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: requests.append(kwargs) or chat_completion()))
         chat = ChatService(instance, system_prompt=config.system_prompt + '\n' + TASK_RULES + '\n', tool_registry=registry,
-            history_file=tmp_path / 'chat_history.json', memory_context=lambda text: 'Riko likes green tea.')
-        chat.context_limit = min(config.runtime.n_ctx, config.memory.context_window_tokens + config.runtime.max_output_tokens)  # as factory sets it
-        chat.runtime_context = lambda: {'observed_at': '2026-10-08T21:14:03+02:00', 'runtime': {'listening': True}}
-        chat.history = [ChatMessage('user', 'User: Earlier'), ChatMessage('assistant', 'Past answer')]
-        assert chat.respond('Hello there').message.content == 'Hello'
+            history_file=tmp_path / 'chat_history.json', memory_context=lambda text: 'Riko likes green tea.',
+            deps=ChatDeps(context_limit=min(config.runtime.n_ctx, config.memory.context_window_tokens + config.runtime.max_output_tokens)))  # as factory sets it
+        observe = TurnContext(runtime=lambda: {'observed_at': '2026-10-08T21:14:03+02:00', 'runtime': {'listening': True}})
+        chat.conversation.append([ChatMessage('user', 'User: Earlier'), ChatMessage('assistant', 'Past answer')])
+        assert chat.respond('Hello there', context=observe).message.content == 'Hello'
         sent = requests[-1]['input' if responses else 'messages']
         assert [item.get('role') for item in sent] == ['system', 'user', 'assistant', 'user']
         assert sent[0]['content'].startswith(config.system_prompt) and TASK_RULES in sent[0]['content']
@@ -237,7 +238,7 @@ def test_remote_token_counts_are_calibrated_estimates_not_bytes():
 
 def test_chat_tool_loop_requests_extend_the_previous_one(tmp_path):
     """The tool loop keeps each sent observation, so request 2 extends request 1 and reuses its response id."""
-    from process.app_core.conversation.chat import ChatService
+    from process.app_core.conversation.chat import ChatDeps, ChatService
     requests, ticks = [], iter(range(100))
     def create(**kwargs):
         requests.append(kwargs)
@@ -250,8 +251,7 @@ def test_chat_tool_loop_requests_extend_the_previous_one(tmp_path):
         execute=lambda name, arguments, call_id, cancelled=None: SimpleNamespace(content='green', tool_call_id=call_id, name=name))
     chat = ChatService(instance, system_prompt='Stable', tool_registry=registry, history_file=tmp_path / 'chat_history.json',
         memory_context=lambda text: 'Riko likes green tea.')
-    chat.runtime_context = lambda: {'observed_at': f'2026-10-08T21:14:{next(ticks):02d}', 'runtime': {'listening': True}}
-    chat.respond('What colour?')
+    chat.respond('What colour?', context=TurnContext(runtime=lambda: {'observed_at': f'2026-10-08T21:14:{next(ticks):02d}', 'runtime': {'listening': True}}))
     assert len(requests) == 2 and requests[1].get('previous_response_id') == 'resp_tool'
     assert [item['type'] for item in requests[1]['input']] == ['function_call_output']  # only the new tool result is sent
     assert 'Current runtime observation' not in requests[1]['input'][0]['output']  # unchanged state: no second observation

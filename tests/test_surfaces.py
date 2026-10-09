@@ -1,7 +1,7 @@
 import pytest
 from process.app_core.desktop.state import DesktopState
 from process.app_core.desktop.media import resolve_media
-from process.app_core.desktop.tools import WhiteboardTool, EffectTool
+from process.app_core.desktop.tools import DesktopServices, WhiteboardTool, EffectTool
 from process.app_core.tools.registry import local_definition
 
 
@@ -56,9 +56,7 @@ def test_whiteboard_invalid_arguments_are_rejected_before_queueing(kwargs):
 def test_effect_tool_requires_an_approved_video(tmp_path):
     folder = tmp_path / 'effects' / 'greenscreens'; folder.mkdir(parents=True)
     (folder / 'sample.webm').write_bytes(b'video')
-    tool = EffectTool(); tool.state = DesktopState()
-    tool.state.media_resolver = lambda path: resolve_media(tmp_path, path)
-    tool.state.effects_directory = 'effects/greenscreens'
+    tool = EffectTool(DesktopServices(DesktopState(), media_resolver=lambda path: resolve_media(tmp_path, path), effects_directory='effects/greenscreens'))
     assert 'queued' in tool.execute(name='sample.webm')
     assert tool.state.active_effect['duration'] == 8
     with pytest.raises(ValueError): tool.execute(name='missing.webm')

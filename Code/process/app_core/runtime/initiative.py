@@ -197,7 +197,7 @@ class Initiative:
             return
         with self.lock:
             if not self.settings['enabled']: return
-            task_store = getattr(self.session.chat, 'task_store', None)
+            task_store = self.session.chat.deps.task_store
             if event.type == 'task.changed' and task_store: self.task_version = task_store.change_version()
             if event.type in {'environment.user_idle', 'environment.user_returned'} and not self.settings['observe_idle']: return
             if event.type == 'environment.active_app_changed' and not self.settings['observe_active_app']: return
@@ -225,7 +225,7 @@ class Initiative:
         if not settings['enabled']: return
         if now - self.last_sample >= 2:
             self.last_sample = now
-            task_store = getattr(self.session.chat, 'task_store', None)
+            task_store = self.session.chat.deps.task_store
             if task_store and not getattr(task_store, 'events_managed', False):
                 task_version = task_store.change_version()
                 if self.task_version is not None and task_version != self.task_version:
@@ -265,9 +265,9 @@ class Initiative:
             event_bus.publish('initiative.tick')
 
     def available(self):
-        s = self.session
-        return not (s._closed or s._generation_active or s._playing or s._speech_pending or s._user_speaking
-                    or s.state.sleep_mode or s.wake.calibrating or s.wake.testing)
+        """Foreground interaction is idle (RuntimeStatus.idle_for_background). It takes the session's _voice_lock, so never
+        call it holding self.lock (a component lock); evaluate's cancel poll reads an unlocked status instead."""
+        return self.session.status().idle_for_background()
 
     def evaluate(self, rule, event, *, version=None):
         with self.lock:
@@ -275,27 +275,27 @@ class Initiative:
             environment = deepcopy(self.environment)
             version = self.version if version is None else version
         now = time.monotonic()
-        if not settings['enabled'] or not self.available(): return False
+        status = self.session.status()
+        if not settings['enabled'] or not status.idle_for_background(): return False
         if now - self.last_evaluation < min(settings['interval_seconds'], 30): return False
         if now - self.last_presented < settings['cooldown_seconds'] or now - self.rule_last.get(rule['id'], float('-inf')) < rule.get('cooldown_seconds', 0): return False
         if rule.get('min_idle_seconds', 0) and environment.get('idle_seconds', -1) < rule['min_idle_seconds']: return False
         if rule.get('app_contains') and rule['app_contains'].casefold() not in environment.get('active_app', {}).get('window_title', '').casefold(): return False
-        revision = self.session._interaction_revision
+        revision = status.interaction_revision
         self.last_evaluation = now
         with self.lock:
             self.last_check = datetime.now().astimezone().isoformat(timespec='seconds')
         event_bus.publish('initiative.check_started')
-        def cancelled():
-            return self.closed.is_set() or version != self.version or revision != self.session._interaction_revision or not self.available()
+        def cancelled():  # polled by the provider and tools, maybe under their own locks: an unlocked reading
+            if self.closed.is_set() or version != self.version: return True
+            current = self.session.status(locked=False)
+            return revision != current.interaction_revision or not current.idle_for_background()
         def delta(_text):
             if cancelled(): raise RuntimeError('Initiative superseded by foreground activity/settings')
         chat = self.session.chat
-        with self.session._voice_lock:
-            dialogue = [m for m in chat.history if m.role in {'user', 'assistant'} and m.content and not m.tool_calls]
-            history = [{'role': m.role, 'content': m.content} for m in dialogue]
-        with self.session.state._lock:
-            emotion = self.session.state.emotion_state
-            emotion_state = deepcopy(emotion.as_dict()) if emotion else None
+        dialogue = [m for m in self.session.history_snapshot() if m.role in {'user', 'assistant'} and m.content and not m.tool_calls]
+        history = [{'role': m.role, 'content': m.content} for m in dialogue]
+        emotion_state = self.session.state.emotion_snapshot()
         payload = {'rule_instruction': rule['instruction'], 'event_type': event.get('type', ''),
                    'emotion': emotion_state,
                    'model_state': {'generating': False, 'speaking': False, 'user_speaking': False,
@@ -321,7 +321,7 @@ class Initiative:
             for _ in range(3):
                 if cancelled(): return False
                 from ..kernel.background_budget import check_budget
-                provider = getattr(chat, 'initiative_provider', chat.provider)
+                provider = chat.deps.initiative_provider or chat.provider
                 check_budget(provider, messages, read_tools, settings['context_window_tokens'], settings['max_output_tokens'])
                 response = provider.generate(messages, tools=read_tools or None,
                     max_output_tokens=settings['max_output_tokens'], context_limit=settings['context_window_tokens'], on_delta=delta, cancelled=cancelled)
@@ -360,9 +360,10 @@ class Initiative:
             self.wake.clear()
             try:
                 self.poll()
+                idle = self.available()  # before self.lock: a component lock never waits for the session's _voice_lock
                 with self.lock:
                     job = next(iter(self.pending.values()), None)
-                    if job and not self.busy and self.available():
+                    if job and not self.busy and idle:
                         rule, event, queued = job
                         self.pending.pop(rule['id'], None)
                         self.busy = True
@@ -376,7 +377,7 @@ class Initiative:
                 event_bus.publish('initiative.error', error=str(exc))
             with self.lock:
                 deadlines = [self.last_tick + self.settings['interval_seconds']] if self.settings['enabled'] else []
-                task_store = getattr(self.session.chat, 'task_store', None)
+                task_store = self.session.chat.deps.task_store
                 external_tasks = task_store and not getattr(task_store, 'events_managed', False)
                 if self.settings['enabled'] and (self.settings['observe_idle'] or self.settings['observe_active_app'] or external_tasks):
                     deadlines.append(self.last_sample + 2)

@@ -5,6 +5,8 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 
+from process.app_core.conversation.chat import ChatDeps
+from process.app_core.conversation.history import ConversationHistory
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import EventBus, event_bus
 from process.app_core.events.outbox import Outbox
@@ -68,7 +70,7 @@ def test_wake_calibration_timeout_does_not_deadlock_with_runtime_snapshot(monkey
             voice_held.wait(2)
     unsubscribe = event_bus.subscribe(gate)
     monkeypatch.setattr(session_module, 'SpeechQueue', FakeSpeech)
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
     config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
     session = session_module.SessionManager(config, chat, DesktopState())
     session.wake.recording = WakeCapture(max_seconds=0.01)  # next frame times out the sample

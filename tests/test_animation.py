@@ -10,6 +10,7 @@ from process.app_core.animation.library import AnimationLibrary, inspect_vrma, m
 from process.app_core.animation.policy import AnimationState, eligible_intents, motion_intent
 from process.app_core.animation.runtime import AnimationRuntime
 from process.app_core.desktop.state import DesktopState
+from process.app_core.kernel.turns import RuntimeStatus
 from process.app_core.emotion.julia import JuliaEmotionEngine
 
 
@@ -94,8 +95,7 @@ def test_eligibility_and_low_confidence_fallback(tmp_path):
 
 def runtime(tmp_path):
     session = SimpleNamespace(config=SimpleNamespace(root=tmp_path, raw={}), chat=SimpleNamespace(),
-        state=DesktopState(), actions=ActionController(), _voice_lock=threading.RLock(),
-        _voice_status='ready', _user_speaking=False, _playing=None, _generation_active=False, _speech_pending=0)
+        state=DesktopState(), actions=ActionController(), status=lambda: RuntimeStatus(listening=True, voice_status='ready'))
     service = AnimationRuntime(session, start=False)
     service.report_capabilities(['head'], [])
     return service, session

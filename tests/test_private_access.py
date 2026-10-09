@@ -17,25 +17,11 @@ RIKO = {'process', 'desktop_server', 'discord_bot', 'run_server', 'task_mcp_serv
 REFLECTION = {'getattr', 'setattr', 'hasattr', 'delattr'}  # getattr(session, '_closed', False) is the same coupling
 
 PRIVATE = {
-    ('desktop_server.py', '_closed'): 2, ('desktop_server.py', '_emit'): 2, ('desktop_server.py', '_generation_active'): 2, ('desktop_server.py', '_lock'): 3,
-    ('desktop_server.py', '_playing'): 1,
-    ('process/app_core/animation/runtime.py', '_generation_active'): 1, ('process/app_core/animation/runtime.py', '_playing'): 1,
-    ('process/app_core/animation/runtime.py', '_speech_pending'): 1, ('process/app_core/animation/runtime.py', '_user_speaking'): 1,
-    ('process/app_core/animation/runtime.py', '_voice_lock'): 1, ('process/app_core/animation/runtime.py', '_voice_status'): 1,
-    ('process/app_core/audio/voice_input.py', '_assertive_until'): 1, ('process/app_core/audio/voice_input.py', '_user_speaking'): 2,
-    ('process/app_core/audio/voice_input.py', '_voice_lock'): 2, ('process/app_core/audio/voice_input.py', '_voice_phase'): 1,
+    ('desktop_server.py', '_emit'): 2, ('desktop_server.py', '_lock'): 3,
     ('process/app_core/emotion/compat.py', '_julia_original_forward'): 1, ('process/app_core/emotion/compat.py', '_update_attention_mask'): 1,  # a transformers encoder it patches
     ('process/app_core/emotion/probe.py', '_load_model'): 1, ('process/app_core/emotion/probe.py', '_lock'): 1,
     ('process/app_core/emotion/probe.py', '_questions'): 1, ('process/app_core/emotion/probe.py', '_resolved_source'): 1,
-    ('process/app_core/integrations/discord/api.py', '_active_turn'): 1, ('process/app_core/integrations/discord/api.py', '_closed'): 1,
-    ('process/app_core/integrations/discord/api.py', '_generation_active'): 1, ('process/app_core/integrations/discord/api.py', '_voice_lock'): 1,
-    ('process/app_core/runtime/initiative.py', '_closed'): 1, ('process/app_core/runtime/initiative.py', '_generation_active'): 1,
-    ('process/app_core/runtime/initiative.py', '_interaction_revision'): 2, ('process/app_core/runtime/initiative.py', '_lock'): 1,
-    ('process/app_core/runtime/initiative.py', '_playing'): 1, ('process/app_core/runtime/initiative.py', '_speech_pending'): 1,
-    ('process/app_core/runtime/initiative.py', '_user_speaking'): 1, ('process/app_core/runtime/initiative.py', '_voice_lock'): 1,
-    ('process/app_core/runtime/session.py', '_save_history'): 3,
-    ('process/app_core/runtime/warmup.py', '_backend'): 1, ('process/app_core/runtime/warmup.py', '_closed'): 2,
-    ('process/app_core/runtime/warmup.py', '_embed'): 1, ('process/app_core/runtime/warmup.py', '_interpret'): 1,
+    ('process/app_core/runtime/warmup.py', '_backend'): 1, ('process/app_core/runtime/warmup.py', '_embed'): 1, ('process/app_core/runtime/warmup.py', '_interpret'): 1,
     ('process/app_core/tools/registry.py', '_call'): 2,  # BaseTool._call: the built-in tool signature local_definition reads
     ('process/app_core/tools/registry.py', '_counter'): 1, ('process/app_core/tools/registry.py', '_lock'): 1,
     ('process/app_core/tools/registry.py', '_responses'): 1,  # StdioMCPClient.call adopting its own restarted replacement

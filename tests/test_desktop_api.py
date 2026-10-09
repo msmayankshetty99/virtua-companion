@@ -7,7 +7,14 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from process.app_core.conversation.chat import ChatDeps
+from process.app_core.conversation.history import ConversationHistory
 from process.app_core.desktop.state import DesktopState
+
+
+def chat_stub(**fields):
+    """create_chat_service's result as the lifespan and SessionManager use it: the history and the factory's collaborators."""
+    return SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), **fields)
 
 
 def client_for(backend, **options):
@@ -26,7 +33,7 @@ def backend(monkeypatch, tmp_path):
     monkeypatch.setattr(server, 'config', config)
     monkeypatch.setattr(server, 'state', DesktopState())
     monkeypatch.setattr(server, 'chat', None)
-    monkeypatch.setattr(server, 'session', SimpleNamespace(runtime_snapshot=lambda: {'runtime': {}}))
+    monkeypatch.setattr(server, 'session', SimpleNamespace(is_open=True, runtime_snapshot=lambda: {'runtime': {}}))
     monkeypatch.setattr(server, '_desktop_settings_loaded', False)
     monkeypatch.setattr(server, 'conversation_store', None)
     monkeypatch.setattr(server, 'startup_error', '')
@@ -35,7 +42,7 @@ def backend(monkeypatch, tmp_path):
 
 def test_server_lifespan_owns_workers_and_removes_subscriptions(backend, monkeypatch):
     calls = []
-    monkeypatch.setattr(backend, 'create_chat_service', lambda config: calls.append('create') or SimpleNamespace())
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: calls.append('create') or chat_stub())
     class Session:
         def __init__(self, *args): pass
         def runtime_snapshot(self): return {'runtime': {}}
@@ -176,9 +183,9 @@ def test_animation_library_api_import_assignment_preview_and_interaction(backend
     import threading
     from process.app_core.runtime.actions import ActionController
     from process.app_core.animation.runtime import AnimationRuntime
+    from process.app_core.kernel.turns import RuntimeStatus
     session = SimpleNamespace(config=backend.config, chat=SimpleNamespace(), state=backend.state,
-        actions=ActionController(), _voice_lock=threading.RLock(), _voice_status='ready',
-        _user_speaking=False, _playing=None, _generation_active=False, _speech_pending=0)
+        actions=ActionController(), status=lambda: RuntimeStatus(listening=True, voice_status='ready'))
     service = AnimationRuntime(session, start=False)
     session.animation = service
     monkeypatch.setattr(backend, 'session', session)
@@ -264,7 +271,7 @@ def test_corrupt_saved_desktop_settings_do_not_abort_startup(backend, monkeypatc
     path.parent.mkdir()
     path.write_text('{"avatar_geometry":{"width":0}}', encoding='utf-8')
     original = path.read_bytes()
-    monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace())
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub())
     monkeypatch.setattr(backend, 'SessionManager', lambda *args: SimpleNamespace(
         runtime_snapshot=lambda: {'runtime': {}}, close=lambda: None))
     monkeypatch.setattr(backend, 'Initiative', lambda session: None)
@@ -287,7 +294,7 @@ def test_surface_api_rejects_empty_bounds_and_noninteger_geometry(backend):
 
 def test_failed_session_start_closes_constructed_chat(backend,monkeypatch):
     closed=[]
-    monkeypatch.setattr(backend,'create_chat_service',lambda config:SimpleNamespace(close=lambda:closed.append('chat')))
+    monkeypatch.setattr(backend,'create_chat_service',lambda config:chat_stub(close=lambda:closed.append('chat')))
     def fail(*args): raise RuntimeError('session startup failed')
     monkeypatch.setattr(backend,'SessionManager',fail)
     with pytest.raises(RuntimeError,match='session startup failed'):
@@ -298,7 +305,7 @@ def test_failed_session_start_closes_constructed_chat(backend,monkeypatch):
 def test_a_multi_word_companion_name_starts_the_real_session(backend, monkeypatch):
     """Regression: WakeWord refused a two-word name such as the fixture's 'Test character' in every mode, which the
     packaged setup accepts, and the lifespan aborted after the model had loaded."""
-    monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace(provider=SimpleNamespace(close=lambda: None)))
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub(provider=SimpleNamespace(close=lambda: None)))
     monkeypatch.setattr(backend, 'Initiative', lambda session: None)
     with client_for(backend) as client:
         wake = client.get('/api/voice/status').json()['wake']
@@ -312,7 +319,7 @@ def test_setup_mode_survives_a_session_that_cannot_start(backend, monkeypatch):
     backend.config.raw.update(desktop={'setup_on_startup_error': True}, voice={'mode': 'push_to_talk'})
     (backend.config.root / 'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n')
     closed = []
-    monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace(close=lambda: closed.append('chat'), provider=None))
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub(close=lambda: closed.append('chat'), provider=None))
     listeners = len(backend.event_bus._listeners)
     with client_for(backend) as client:
         assert 'voice.mode must be' in client.get('/api/status').json()['startup_error']
@@ -524,15 +531,15 @@ def test_secrets_are_fresh_each_start_and_never_inherited_by_children(tmp_path, 
 
 def test_stop_turn_cancels_the_live_session_before_the_drain(backend, monkeypatch):
     calls = []
-    monkeypatch.setattr(backend, 'session', SimpleNamespace(_closed=False, cancel=lambda: calls.append('cancel')))
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(is_open=True, cancel=lambda: calls.append('cancel')))
     backend.stop_turn()
     assert calls == ['cancel']
-    monkeypatch.setattr(backend, 'session', SimpleNamespace(_closed=True, cancel=lambda: calls.append('closed')))
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(is_open=False, cancel=lambda: calls.append('closed')))
     backend.stop_turn()
     monkeypatch.setattr(backend, 'session', None)  # setup mode: nothing to stop
     backend.stop_turn()
     stuck = threading.Event()
-    monkeypatch.setattr(backend, 'session', SimpleNamespace(_closed=False, cancel=lambda: stuck.wait(5)))
+    monkeypatch.setattr(backend, 'session', SimpleNamespace(is_open=True, cancel=lambda: stuck.wait(5)))
     started = time.monotonic()
     try: backend.stop_turn()
     finally: stuck.set()
@@ -549,14 +556,14 @@ def test_chat_while_another_turn_runs_is_a_conflict_not_a_server_error(backend, 
         def close(self): pass
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
-    session = SessionManager(config, SimpleNamespace(history=[], _save_history=lambda: None, close=lambda: None), backend.state)
+    session = SessionManager(config, chat_stub(close=lambda: None), backend.state)
     monkeypatch.setattr(backend, 'session', session)
     client = client_for(backend, raise_server_exceptions=False)
-    session._turn_lock.acquire()  # a voice or Discord turn, or a reply still stopping
+    session._turns.begin()  # a voice or Discord turn, or a reply still stopping
     try:
         response = client.post('/api/chat', json={'text': 'hello'})
         assert response.status_code == 409 and 'still handling another reply' in response.json()['detail']
-    finally: session._turn_lock.release(); session.close()
+    finally: session._turns.end(); session.close()
     def fail(*args): raise RuntimeError('model exploded')
     monkeypatch.setattr(backend, 'session', SimpleNamespace(respond=fail))
     assert client.post('/api/chat', json={'text': 'hello'}).status_code == 500  # any other failure is still a server error
@@ -564,7 +571,7 @@ def test_chat_while_another_turn_runs_is_a_conflict_not_a_server_error(backend, 
 
 def test_lifespan_stops_discord_while_the_session_closes(backend, monkeypatch):
     closing, calls = threading.Event(), []
-    monkeypatch.setattr(backend, 'create_chat_service', lambda config: SimpleNamespace())
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub())
     class Session:
         def __init__(self, *args): pass
         def runtime_snapshot(self): return {'runtime': {}}

@@ -151,7 +151,7 @@ def estimate(config, telemetry, metadata=None):
             suggested_live = max(0, maximum_pool - (pool - runtime.n_ctx))
         else:
             suggested_live = maximum_pool // runtime.parallel_slots
-            if suggested_live < max(getattr(runtime, 'initiative_n_ctx', 4096), getattr(runtime, 'reflection_n_ctx', 4096)): suggested_live = 0
+            if suggested_live < max(runtime.initiative_n_ctx, runtime.reflection_n_ctx): suggested_live = 0
         model_limit = meta.get('context_length')
         if model_limit: suggested_live = min(suggested_live, model_limit)
         suggested_live = min(suggested_live, 1048576)
@@ -171,8 +171,8 @@ def estimate(config, telemetry, metadata=None):
         'confidence': 'low',
         'confidence_basis': 'Model/KV metadata is used where available; compute, recurrent state, ASR and graphics reserves remain heuristic, not a native backend dry-run allocation report.',
         'warnings': warnings, 'suggestion': suggestion, 'kv': {'unified': runtime.kv_unified, 'pool_tokens': pool,
-        'live_context_tokens': runtime.n_ctx, 'initiative_context_tokens': getattr(runtime, 'initiative_n_ctx', 4096),
-        'reflection_context_tokens': getattr(runtime, 'reflection_n_ctx', 4096), 'slots': runtime.parallel_slots},
+        'live_context_tokens': runtime.n_ctx, 'initiative_context_tokens': runtime.initiative_n_ctx,
+        'reflection_context_tokens': runtime.reflection_n_ctx, 'slots': runtime.parallel_slots},
         'managed': managed,
         'projection': projection,
         'note': 'Estimated peak residency, not measured allocations. Ranges and unknowns are intentional. Recommendations never modify settings.'}

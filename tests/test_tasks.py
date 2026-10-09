@@ -8,7 +8,7 @@ import pytest
 from process.app_core.persistence.tasks import TaskStore, TaskMCP, TaskConflict
 from process.app_core.tools import registry as tool_registry
 from process.app_core.tools.registry import ToolRegistry, StdioMCPClient
-from process.app_core.conversation.chat import ChatService
+from process.app_core.conversation.chat import ChatDeps, ChatService
 from process.app_core.kernel.messages import ChatMessage, ModelResponse, ToolCall
 
 
@@ -106,8 +106,7 @@ def test_tasks_are_requested_by_tools_not_preloaded(tmp_path):
             assert messages[-1].role == 'tool'
             assert 'Build app' in messages[-1].content
             return ModelResponse(ChatMessage('assistant', 'Task recorded.'))
-    chat = ChatService(Provider(), system_prompt='Riko', tool_registry=registry)
-    chat.task_store = store
+    chat = ChatService(Provider(), system_prompt='Riko', tool_registry=registry, deps=ChatDeps(task_store=store))
     store.create('Build app')
     chat.respond('What is my app project status?')
 

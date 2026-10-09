@@ -130,11 +130,11 @@ def test_factory_rolls_back_resources_after_partial_construction_failure(tmp_pat
     from process.app_core.configuration.config import AppConfig
     closed=[]
     monkeypatch.setattr(factory,'create_provider',lambda config:SimpleNamespace(close=lambda:closed.append('provider')))
-    monkeypatch.setattr(factory.ToolRegistry,'from_config',lambda config, activity=None:SimpleNamespace(
+    monkeypatch.setattr(factory.ToolRegistry,'from_config',lambda config, activity=None, desktop=None:SimpleNamespace(
         register_mcp=lambda client:None, close=lambda:closed.append('registry')))
     def fail(*args,**kwargs): raise RuntimeError('memory failure')
     monkeypatch.setattr(factory,'MemoryStore',fail)
-    # Keep one shared desktop state for the factory's effect-directory lookups.
+    # The shared desktop state the factory hands the desktop tools (through DesktopServices) and the emotion bridge.
     state=SimpleNamespace();monkeypatch.setattr(factory,'get_desktop_state',lambda:state)
     config=AppConfig(root=tmp_path)
     with pytest.raises(RuntimeError,match='memory failure'): factory.create_chat_service(config)

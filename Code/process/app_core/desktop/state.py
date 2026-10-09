@@ -27,6 +27,12 @@ class WhiteboardCommand:
 
 class DesktopState:
     """Thread-safe bridge between model tools and the desktop UI."""
+    # Declared state only (tests/test_declared_attributes.py); the desktop tools' collaborators are in DesktopServices.
+    __slots__ = ('_lock', '_listeners', 'whiteboard', 'whiteboard_visible', 'whiteboard_clear', 'whiteboard_pages', 'whiteboard_page',
+                 'surface_condition', 'last_effect', 'speech_bubble', 'speech_until', '_speech_timer', 'avatar_geometry',
+                 'whiteboard_geometry', 'mic_enabled', 'audio_enabled', 'audio_volume', 'sleep_mode', 'emotion_state', 'active_effect',
+                 'tool_activity', 'actions', 'displays', '_board_file', 'board_persistence_error', 'notifications', 'incoming', 'discord')
+
     def __init__(self):
         self._lock = threading.RLock()
         self._listeners: list[Callable[[str, Any], None]] = []
@@ -71,10 +77,13 @@ class DesktopState:
             try: listener(event, value)
             except Exception: logging.getLogger(__name__).exception('Desktop state listener %r failed on %s', listener, event)
 
+    def emotion_snapshot(self):
+        with self._lock: return self.emotion_state.as_dict() if self.emotion_state else None
+
     def snapshot(self):
         with self._lock:
             return {
-                "emotion": self.emotion_state.as_dict() if self.emotion_state else None,
+                "emotion": self.emotion_snapshot(),
                 "speech": self.speech_bubble if self.speech_until > time.time() else "",
                 "mic": self.mic_enabled, "audio": self.audio_enabled, "audio_volume": self.audio_volume,
                 "sleep": self.sleep_mode, "effect": dict(self.active_effect) if self.active_effect else None,

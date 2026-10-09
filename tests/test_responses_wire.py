@@ -126,3 +126,16 @@ def test_turn_recall_folds_into_the_input_even_when_no_past_turn_precedes_it():
     messages = [ChatMessage('system', 'Stable'), ChatMessage('system', 'Relevant memories: blue', context_kind='optional'), ChatMessage('user', 'Hi')]
     system, user = template_messages(messages)
     assert system.content == 'Stable' and 'Relevant memories: blue' in user.content and user.content.endswith('Hi')
+
+
+def test_consecutive_turns_of_one_role_are_joined_for_strict_templates():
+    # History keeps the user's message of a stopped, failed or unheard turn, so two user messages can follow each other;
+    # Gemma and older Mistral templates raise unless roles alternate. A tool-calling assistant message is never merged.
+    call = ChatMessage('assistant', '', tool_calls=[ToolCall('c1', 'lookup', {})])
+    messages = [ChatMessage('system', 'Stable'), ChatMessage('user', 'User: Say hello'), ChatMessage('user', 'User: Never mind, a story?'),
+        ChatMessage('assistant', 'Once upon'), ChatMessage('assistant', 'a time.'), ChatMessage('user', 'User: Look it up'),
+        call, ChatMessage('tool', 'found', tool_call_id='c1'), ChatMessage('assistant', 'Here it is.')]
+    roles = [(message.role, message.content) for message in template_messages(messages)]
+    assert roles == [('system', 'Stable'), ('user', 'User: Say hello\n\nUser: Never mind, a story?'), ('assistant', 'Once upon\n\na time.'),
+        ('user', 'User: Look it up'), ('assistant', ''), ('tool', 'found'), ('assistant', 'Here it is.')]
+    assert [message.content for message in messages[1:3]] == ['User: Say hello', 'User: Never mind, a story?']  # originals untouched

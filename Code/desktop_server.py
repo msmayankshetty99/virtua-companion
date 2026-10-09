@@ -20,7 +20,7 @@ from process.app_core.factory import create_chat_service
 from process.app_core.desktop.state import get_desktop_state
 from process.app_core.events.bus import event_bus
 from process.app_core.runtime.session import SessionManager
-from process.app_core.kernel.cancellation import TurnCancelled
+from process.app_core.kernel.cancellation import TurnBusy, TurnCancelled
 from process.app_core.runtime.initiative import Initiative
 from process.app_core.persistence.tasks import TaskConflict
 from process.app_core.events.stream import stream_events
@@ -78,7 +78,7 @@ async def lifespan(_app):
         chat = await run_in_threadpool(create_chat_service, config)
         # Voice, wake and speech settings are checked here, after the model has loaded; a mistake in them takes the
         # same fallback, so Settings can repair it instead of every launch failing.
-        try: session = SessionManager(config, chat, state, getattr(chat, 'action_controller', None))
+        try: session = SessionManager(config, chat, state, chat.deps.action_controller)
         except BaseException:
             await run_in_threadpool(close_bounded, chat, 6)
             raise
@@ -102,7 +102,7 @@ async def lifespan(_app):
             from process.app_core.runtime.warmup import warm_session
             await run_in_threadpool(warm_session, session)
         conversation_store = ConversationStore(config.root / 'persistent_memories' / 'conversations.sqlite3',
-            provider=config.runtime.provider, legacy=getattr(chat, 'history', []))
+            provider=config.runtime.provider, legacy=chat.conversation.snapshot())
         unsubscribe_history = event_bus.subscribe(conversation_store.observe)
         unsubscribers.append(unsubscribe_history)
         state.configure_board_store(config.root / 'persistent_memories' / 'whiteboard.json')
@@ -118,7 +118,7 @@ async def lifespan(_app):
         from process.app_core.events.resources import ResourceEvents
         resource_events = ResourceEvents(event_bus, resource_getters())
         from process.app_core.persistence.task_file_events import TaskFileEvents
-        if getattr(chat, 'task_store', None): task_file_events = TaskFileEvents(chat.task_store, event_bus)
+        if chat.deps.task_store: task_file_events = TaskFileEvents(chat.deps.task_store, event_bus)
         event_bus.publish("runtime.ready", provider=config.runtime.provider)
         yield
     finally:
@@ -137,8 +137,7 @@ async def lifespan(_app):
 def stop_turn():
     """run_server calls this before uvicorn drains requests, so an in-flight chat returns now instead of generating
     through the drain. Bounded: a stuck cancel must not hold up the rest of shutdown."""
-    cancel = getattr(session, 'cancel', None)
-    if cancel and not getattr(session, '_closed', False): run_bounded(cancel, 1, 'SessionManager.cancel')
+    if session is not None and session.is_open: run_bounded(session.cancel, 1, 'SessionManager.cancel')
 
 _dev = os.environ.get('RIKO_DEV') == '1'  # The API map is published only while developing.
 app = FastAPI(title="Riko Local Desktop Runtime", lifespan=lifespan,
@@ -179,7 +178,7 @@ def security_sensitive(key, value=None):
             or name.endswith(('_path', '_dir', '_directory', '_folder', '_root', '_file', '_url', '_model_id', '_library', '_config', '_executable'))):
         return True
     return isinstance(value, str) and key != 'avatar.model' and bool(LOCATION.match(value))  # the avatar endpoint serves only .vrm files
-from process.app_core.integrations.discord.api import create_router as discord_router
+from process.app_core.integrations.discord.api import create_router as discord_router, client_event_filter
 app.include_router(discord_router(lambda: session, lambda: discord_launcher))
 
 @app.get('/api/discord/process')
@@ -187,7 +186,7 @@ def discord_process(): return discord_launcher.status()
 
 @app.post('/api/discord/start')
 def start_discord():
-    if session is None or getattr(session, '_closed', False): raise HTTPException(503, 'Start the companion runtime before Discord')
+    if session is None or not session.is_open: raise HTTPException(503, 'Start the companion runtime before Discord')
     try: return discord_launcher.start()
     except (ValueError, RuntimeError) as exc: raise HTTPException(400, str(exc)) from exc
 
@@ -313,21 +312,12 @@ async def discord_client(websocket: WebSocket, instance: str):
     except (ValueError, TypeError):
         await websocket.accept(); await websocket.close(code=1008, reason='A Discord client is already connected or the instance ID is invalid'); return
     async def report(value): await run_in_threadpool(discord_launcher.report, instance, value)
-    # The Discord process sees only what it acts on: its own turns, approvals, Discord and
-    # initiative messages and whiteboard updates. Local transcripts, chats and desktop state stay local.
-    discord_turns = set()
-    def relevant(event):
-        if event.payload.get('source') == 'discord' and event.turn_id:
-            discord_turns.add(event.turn_id)
-            if len(discord_turns) > 256: discord_turns.clear(); discord_turns.add(event.turn_id)
-        if event.type in {'resource.discord', 'resource.approvals', 'tool.approval_finished', 'tool.approval_resolved',
-                          'initiative.presented', 'whiteboard.changed', 'whiteboard.image'}: return True
-        return event.turn_id in discord_turns and event.type in {'chat.delta', 'model.reasoning', 'tool.approval_requested'}
     def resources():
         values = resource_events.snapshot() if resource_events else {'discord': discord_launcher.status()}
         return {key: values[key] for key in ('discord', 'approvals') if key in values}
     try:
-        await stream_events(websocket, event_bus, lambda: {}, initial=resources, event_filter=relevant, on_message=report)
+        # Only what bot.py acts on (client_event_filter): local transcripts, chats and desktop state stay local.
+        await stream_events(websocket, event_bus, lambda: {}, initial=resources, event_filter=client_event_filter(), on_message=report)
     finally:
         # Shielded: detach must still free the client slot if this handler is being cancelled.
         await asyncio.shield(run_in_threadpool(discord_launcher.detach, instance))
@@ -461,7 +451,7 @@ def save_settings(request: SettingsPatch, x_riko_confirmation: str | None = Head
             provider = getattr(chat, 'provider', None)
             if hasattr(provider, 'set_pause_background'): provider.set_pause_background(enabled)
             memory = getattr(chat, 'memory_store', None)
-            if memory: memory.set_foreground(bool(enabled and getattr(session, '_generation_active', False)))
+            if memory: memory.set_foreground(bool(enabled and session is not None and session.status().generating))
         if result.get('saved') and any(key.startswith('avatar.') for key in request.changes):
             from copy import deepcopy
             from process.app_core.configuration.settings_store import LOCK
@@ -697,7 +687,7 @@ def board_surface(request: BoardSurface):
 
 @app.get('/api/tasks')
 def tasks(include_closed: bool = True, query: str = ''):
-    return {'tasks': chat.task_store.list(include_closed=include_closed, query=query, limit=100)}
+    return {'tasks': chat.deps.task_store.list(include_closed=include_closed, query=query, limit=100)}
 
 class DisplayBounds(BaseModel):
     x: StrictInt
@@ -741,7 +731,7 @@ def avatar_surface(request: dict[str, StrictInt]):
 
 @app.get('/api/tasks/{task_id}')
 def get_task(task_id: str):
-    try: return chat.task_store.get(task_id)
+    try: return chat.deps.task_store.get(task_id)
     except KeyError: raise HTTPException(404, 'Task not found')
 
 class TaskCreateRequest(BaseModel):
@@ -751,7 +741,7 @@ class TaskCreateRequest(BaseModel):
 
 @app.post('/api/tasks')
 def create_task(request: TaskCreateRequest):
-    try: return chat.task_store.create(**request.model_dump(), actor='user_api', reason='Explicit user creation')
+    try: return chat.deps.task_store.create(**request.model_dump(), actor='user_api', reason='Explicit user creation')
     except (ValueError, TypeError) as exc: raise HTTPException(400, str(exc))
 
 class TaskUpdateRequest(BaseModel):
@@ -761,7 +751,7 @@ class TaskUpdateRequest(BaseModel):
 
 @app.patch('/api/tasks/{task_id}')
 def update_task(task_id: str, request: TaskUpdateRequest):
-    try: return chat.task_store.update(task_id, **request.model_dump(), actor='user_api')
+    try: return chat.deps.task_store.update(task_id, **request.model_dump(), actor='user_api')
     except TaskConflict as exc: raise HTTPException(409, str(exc))
     except KeyError: raise HTTPException(404, 'Task not found')
     except (ValueError, TypeError) as exc: raise HTTPException(400, str(exc))
@@ -810,6 +800,8 @@ def delete_memory(record_id: str):
     except KeyError: raise HTTPException(404, "Memory not found")
     return {"deleted": record_id}
 
+BUSY = 'Riko is still handling another reply; send again when it finishes'
+
 @app.post("/api/chat")
 def chat_endpoint(request: ChatRequest):
     # Plain def: FastAPI runs it in the thread pool, so the state/snapshot calls below
@@ -818,10 +810,9 @@ def chat_endpoint(request: ChatRequest):
         response = session.respond(request.text, request.user_name)
     except TurnCancelled:
         return {"cancelled": True}
-    except RuntimeError as exc:
+    except TurnBusy as exc:
         # Another turn (voice, Discord, a reply still stopping) holds the session: a conflict, not a server failure.
-        if str(exc) == 'Riko is already handling another turn': raise HTTPException(409, 'Riko is still handling another reply; send again when it finishes') from exc
-        raise
+        raise HTTPException(409, BUSY) from exc
     state.set_speech(response.message.content)
     return {"text": response.message.content, "emotion": snapshot()["emotion"]}
 
@@ -891,7 +882,7 @@ def resource_getters():
     return {'approvals': tool_approvals, 'initiative': initiative_status,
         'animation': animation_status, 'voice': voice_status,
         'avatar_models': avatar_models, 'discord': discord_launcher.status,
-        'tasks': lambda: {'tasks': chat.task_store.list(include_closed=True)}}
+        'tasks': lambda: {'tasks': chat.deps.task_store.list(include_closed=True)}}
 
 @app.websocket('/ws/resources/gpu')
 async def gpu_events(websocket: WebSocket):
@@ -942,7 +933,8 @@ def voice_calibration(request: CalibrationRequest):
                   "threshold": lambda: session.wake.set_threshold(request.threshold)}
     try:
         if request.action not in operations: raise ValueError("Unknown calibration operation")
-        if request.action in {"begin", "test"} and (session._generation_active or session._playing):
+        # Also between sentences of a reply: Riko's own voice must never become a wake-word sample.
+        if request.action in {"begin", "test"} and session.status().replying():
             raise ValueError("Stop the current reply before calibration or testing")
         operations[request.action]()
         return session.wake.status()
@@ -966,7 +958,11 @@ async def chat_stream(websocket: WebSocket):
             await websocket.send_json({"type": "chat.started"})
             # Tool-enabled turns use the reliable completion path; this endpoint
             # is reserved for providers that support token streaming.
-            response = await run_in_threadpool(session.respond, text, request.get("user_name", "User"))
+            try: response = await run_in_threadpool(session.respond, text, request.get("user_name", "User"))
+            except TurnBusy:  # the socket's 409: say so and keep the connection for the next message
+                await websocket.send_json({"type": "chat.busy", "payload": {"status": 409, "detail": BUSY}}); continue
+            except TurnCancelled:
+                await websocket.send_json({"type": "chat.cancelled", "payload": {}}); continue
             await websocket.send_json({"type": "chat.completed", "payload": {"text": response.message.content}})
     except (WebSocketDisconnect, RuntimeError):
         return

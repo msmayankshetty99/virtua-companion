@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from process.app_core.conversation.chat import ChatDeps
 from process.app_core.runtime.actions import ActionController
 from process.app_core.events.bus import event_bus
 from process.app_core.audio.wake_feedback import WakeFeedback, select_rule, validate_settings
@@ -77,7 +78,7 @@ def test_only_keyword_activation_triggers_session_feedback(tmp_path):
     from process.app_core.desktop.state import DesktopState
     from process.app_core.runtime.session import SessionManager
     config = SimpleNamespace(root=tmp_path, character_name='Riko', raw={})
-    chat = SimpleNamespace(provider=SimpleNamespace(close=lambda: None))
+    chat = SimpleNamespace(deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None))
     session = SessionManager(config, chat, DesktopState())
     calls = []
     session.wake_feedback.trigger = lambda *a, **k: calls.append((a, k))
@@ -118,7 +119,7 @@ def test_invalid_feedback_settings_leave_no_session_worker_or_listener(tmp_path,
     config = SimpleNamespace(root=tmp_path, character_name='Riko', raw={'wake_feedback': {'volume': 5}})
     listeners = len(event_bus._listeners)
     with pytest.raises(ValueError, match='wake_feedback.volume'):
-        SessionManager(config, SimpleNamespace(provider=SimpleNamespace(close=lambda: None)), DesktopState())
+        SessionManager(config, SimpleNamespace(deps=ChatDeps(), provider=SimpleNamespace(close=lambda: None)), DesktopState())
     assert closed == ['speech'] and len(event_bus._listeners) == listeners
 
 

@@ -362,7 +362,8 @@ class ToolRegistry:
             return ToolResult(call_id or str(uuid.uuid4()), name, str(exc), True)
 
     @classmethod
-    def from_config(cls, config, activity=None):
+    def from_config(cls, config, activity=None, desktop=None):
+        """The built-in, desktop and configured MCP tools. desktop is the DesktopServices the desktop tools act through."""
         raw = json.loads(config.tools.mcp_config.read_text(encoding='utf-8')) if config.tools.mcp_config and config.tools.mcp_config.exists() else {}
         registry = cls(timeout_seconds=config.tools.timeout_seconds, require_approval=config.tools.require_approval, activity=activity)
         from .approval import ToolApprovals
@@ -371,7 +372,7 @@ class ToolRegistry:
             from .builtin import iter_tools
             for tool in iter_tools(): registry.register_local(tool)
             from ..desktop.tools import iter_tools as desktop_tools
-            for tool in desktop_tools(): registry.register_local(tool)
+            for tool in desktop_tools(desktop): registry.register_local(tool)
             for name, server in raw.get('mcpServers', raw.get('servers', {})).items():
                 client = None
                 try:

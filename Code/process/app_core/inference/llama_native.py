@@ -288,8 +288,8 @@ class InProcessLlamaProvider(LlamaContextProvider):
             if not Path(self.config.native_library).is_file():
                 raise RuntimeError(f'runtime.native_library does not exist: {self.config.native_library}. Build or select a compatible riko-native library before loading the model.')
             model = resolve_model(self.config)
-            budgets = {'runtime.n_ctx': self.config.n_ctx, 'initiative.context_window_tokens': getattr(self.config, 'initiative_n_ctx', 4096),
-                'memory.reflection_context_window_tokens': getattr(self.config, 'reflection_n_ctx', 4096)}
+            budgets = {'runtime.n_ctx': self.config.n_ctx, 'initiative.context_window_tokens': self.config.initiative_n_ctx,
+                'memory.reflection_context_window_tokens': self.config.reflection_n_ctx}
             limit = training_context(model)
             if limit and max(budgets.values()) > limit:
                 over = ', '.join(f'{key} ({value})' for key, value in budgets.items() if value > limit)
