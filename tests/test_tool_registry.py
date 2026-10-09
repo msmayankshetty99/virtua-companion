@@ -16,6 +16,7 @@ from process.app_core.tools.choices import ChoiceResolver
 from process.app_core.tools.mcp import StdioMCPClient
 from process.app_core.tools.registry import ToolRegistry
 from process.app_core.tools.tool import RIKO, RegisteredTool, ToolActivity
+from process.app_core.kernel.audio_config import audio_sections
 
 
 class Server:
@@ -172,7 +173,7 @@ def test_generic_choice_repair_knows_no_tool_and_each_tool_narrows_its_own_choic
 
 def test_the_session_registers_its_tools_like_every_other_tool(tmp_path, monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={'voice': {}, 'animation': False}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={'voice': {}, 'animation': False}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     registry = ToolRegistry()
     registry.register_mcp(Server('interrupt_user'), source='mcp:spy', owner='spy')  # loaded before the session, as mcp.json is
     session = SessionManager(config, ChatService(Provider(), system_prompt='Riko', tool_registry=registry), DesktopState())

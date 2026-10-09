@@ -17,6 +17,7 @@ from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.actions import ActionController
 from process.app_core.runtime.session import SessionManager
+from process.app_core.kernel.audio_config import audio_sections
 
 
 class ProbeProvider(BaseProvider):
@@ -113,7 +114,7 @@ def test_a_turn_reaches_chat_service_as_a_turn_context(monkeypatch):
         invalidate=lambda: None, transcript=lambda *args: None, close=lambda: None)
     chat = ChatService(provider, system_prompt='Riko', memory_store=memory, deps=ChatDeps(emotion_worker=worker))
     config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko',
-        tools=SimpleNamespace(max_iterations=8), runtime=SimpleNamespace(pause_background_on_live=True))
+        tools=SimpleNamespace(max_iterations=8), runtime=SimpleNamespace(pause_background_on_live=True), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     origin = {'source': 'discord', 'conversation_id': 'discord:client:dm:1', 'user_id': '1', 'channel_id': '1', 'message_id': 'd1'}
     try:
@@ -138,7 +139,7 @@ def test_close_owns_the_factory_stack_or_what_the_chat_was_built_with(monkeypatc
     built.close()
     assert calls[1:] == ['memory', 'registry', 'provider']
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     injected = ActionController()
     session = SessionManager(config, ChatService(BaseProvider(), system_prompt=''), DesktopState(), injected)
     own = SessionManager(config, ChatService(BaseProvider(), system_prompt=''), DesktopState())

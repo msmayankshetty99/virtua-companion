@@ -4,13 +4,23 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import urlsplit
 
-KV_TYPES = {'f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'}
+from ..kernel.schema import Rule
+
+KV_TYPES = ('f16', 'f32', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl')  # in the order Settings offers them
+FULL_PRECISION = ('f16', 'f32', 'bf16')
 EXTRA_SETTINGS = ('hf_repo_id', 'hf_filename', 'hf_revision', 'hf_local_files_only',
     'n_ubatch', 'n_threads', 'n_threads_batch', 'flash_attn', 'type_k', 'type_v',
     'offload_kqv', 'use_mmap', 'use_mlock', 'main_gpu', 'split_mode', 'tensor_split',
     'chat_format', 'cache_size_mb', 'verbose', 'parallel_slots',
     'startup_timeout_seconds', 'warmup', 'kv_unified', 'kv_pool_auto', 'kv_pool_tokens', 'pause_background_on_live')
 FLASH_ATTENTION = ('auto', 'on', 'off')
+NATIVE = (('runtime.provider', ('llama_cpp',)),)
+# The checks across llama.cpp settings that validate_runtime enforces and Settings returns to the UI (/api/settings 'rules').
+RULES = (Rule('runtime.n_ubatch', 'runtime.n_ubatch must not exceed n_batch', when=NATIVE, at_most='runtime.n_batch'),
+    Rule('runtime.type_v', 'Quantized runtime.type_v requires flash_attn auto or on', when=(*NATIVE, ('runtime.type_v', tuple(t for t in KV_TYPES if t not in FULL_PRECISION))),
+        one_of=(('runtime.flash_attn', ('auto', 'on')),)),
+    Rule('runtime.hf_repo_id', 'llama_cpp requires runtime.model_path or both hf_repo_id and hf_filename', when=NATIVE,
+        any_set=(('runtime.model_path',), ('runtime.hf_repo_id', 'runtime.hf_filename'))))
 
 
 def flash_attention(value):
@@ -84,7 +94,6 @@ def validate_runtime(config):
         if type(value) is not int or value < minimum: raise ValueError(f'runtime.{key} must be an integer >= {minimum}')
     if type(config.n_gpu_layers) is not int or config.n_gpu_layers < -2:
         raise ValueError('runtime.n_gpu_layers must be -1 (fit to free GPU memory), -2 (all layers) or a layer count >= 0')
-    if config.n_ubatch > config.n_batch: raise ValueError('runtime.n_ubatch must not exceed n_batch')
     for key in ('n_threads', 'n_threads_batch'):
         value = getattr(config, key)
         if value is not None and (type(value) is not int or value < 1): raise ValueError(f'runtime.{key} must be null or a positive integer')
@@ -93,8 +102,6 @@ def validate_runtime(config):
     config.flash_attn = flash_attention(config.flash_attn)
     for key in ('type_k', 'type_v'):
         if getattr(config, key) not in KV_TYPES: raise ValueError(f'runtime.{key} must be one of {sorted(KV_TYPES)}')
-    if config.type_v not in {'f16', 'f32', 'bf16'} and config.flash_attn == 'off':
-        raise ValueError('Quantized runtime.type_v requires flash_attn auto or on')
     # 'row' still loads from YAML so Settings can open and fix it; check_native_build rejects it at startup.
     if config.split_mode not in {'none', 'layer', 'row'}: raise ValueError('runtime.split_mode must be layer or none')
     if config.tensor_split is not None:
@@ -105,8 +112,9 @@ def validate_runtime(config):
         value = getattr(config, key)
         if value is not None and (not isinstance(value, str) or not value.strip()): raise ValueError(f'runtime.{key} must be null or a nonempty string')
     if not isinstance(config.hf_revision, str) or not config.hf_revision.strip(): raise ValueError('runtime.hf_revision must be a nonempty string')
-    if not config.model_path and not (config.hf_repo_id and config.hf_filename):
-        raise ValueError('llama_cpp requires runtime.model_path or both hf_repo_id and hf_filename')
+    settings = {'runtime.provider': 'llama_cpp', **{f'runtime.{key}': getattr(config, key) for key in ('n_ubatch', 'n_batch', 'type_v', 'flash_attn', 'model_path', 'hf_repo_id', 'hf_filename')}}
+    for rule in RULES:
+        if rule.broken(settings): raise ValueError(rule.message)
     if config.hf_filename:
         filename = PurePosixPath(config.hf_filename)
         if filename.is_absolute() or '..' in filename.parts or '\\' in config.hf_filename or any(c in config.hf_filename for c in '*?[]') or filename.suffix.lower() != '.gguf':

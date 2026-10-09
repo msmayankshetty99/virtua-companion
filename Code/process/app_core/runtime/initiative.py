@@ -11,16 +11,50 @@ import time
 from ..kernel.workers import DaemonExecutor
 
 from ..events.bus import event_bus
+from ..kernel.background_budget import validate_budget
 from ..kernel.messages import ChatMessage, conversation_sections
+from ..kernel.schema import Section, Setting, register
+from ..kernel.validation import section
 from ..persistence.atomic import atomic_write
 
 
-DEFAULTS = {'enabled': False, 'observe_idle': False, 'observe_active_app': False,
-            'max_output_tokens': 1024, 'context_window_tokens': 4096,
-            'interval_seconds': 120, 'idle_seconds': 300, 'cooldown_seconds': 300,
-            'spoken_enabled': False, 'allow_urgent_spoken': False,
-            'rules': [{'id': 'periodic', 'enabled': True, 'event': 'initiative.tick', 'instruction': 'Offer relevant help or start a considerate conversation only if useful.', 'presentation': 'bubble', 'cooldown_seconds': 300},
-                       {'id': 'return', 'enabled': True, 'event': 'environment.user_returned', 'instruction': 'Consider welcoming the user back or offering to resume an ongoing task.', 'presentation': 'bubble', 'cooldown_seconds': 300}]}
+DEFAULT_RULES = [{'id': 'periodic', 'enabled': True, 'event': 'initiative.tick', 'instruction': 'Offer relevant help or start a considerate conversation only if useful.', 'presentation': 'bubble', 'cooldown_seconds': 300},
+                 {'id': 'return', 'enabled': True, 'event': 'environment.user_returned', 'instruction': 'Consider welcoming the user back or offering to resume an ongoing task.', 'presentation': 'bubble', 'cooldown_seconds': 300}]
+
+
+def yaml_settings(raw):
+    """initiative.* as load_config reads it: DEFAULTS and the YAML's known keys (it reports the rest), budgets checked."""
+    settings = {**deepcopy(DEFAULTS), **{key: value for key, value in section('initiative', raw).items() if key in DEFAULTS}}
+    validate_budget(settings['context_window_tokens'], settings['max_output_tokens'], 'initiative')
+    return settings
+
+
+def review_budgets(candidate, draft, changes):
+    """Settings: saving also writes the edited budgets into initiative_settings.json, which overrides the YAML, so the
+    candidate takes them before the KV pool is sized from it (inference/settings.py)."""
+    runtime = candidate.runtime
+    runtime.initiative_n_ctx = changes.get('initiative.context_window_tokens', runtime.initiative_n_ctx)
+    runtime.initiative_max_output_tokens = changes.get('initiative.max_output_tokens', runtime.initiative_max_output_tokens)
+    validate_budget(runtime.initiative_n_ctx, runtime.initiative_max_output_tokens, 'initiative')
+    return {}
+
+
+def effective_budgets(config, values):  # Settings shows the budgets in force: initiative_settings.json overrides the YAML
+    values['initiative.context_window_tokens'] = config.runtime.initiative_n_ctx
+    values['initiative.max_output_tokens'] = config.runtime.initiative_max_output_tokens
+
+
+BUDGET = dict(group='models', section='Token budgets', live='initiative_budgets')  # applied to the running initiative; the KV pool needs a restart
+SETTINGS = register(Section('initiative', group='initiative', title='Settings', strict=True, check=yaml_settings, review=review_budgets,
+    effective=effective_budgets, settings=(
+        Setting('enabled', False), Setting('observe_idle', False), Setting('observe_active_app', False),
+        Setting('max_output_tokens', 1024, range=(1, 1048575), **BUDGET,
+            help='Output budget including reasoning. Invalid/empty/truncated decisions fail the attempt; no repair inference.'),
+        Setting('context_window_tokens', 4096, range=(256, 1048576), **BUDGET,
+            help='Total initiative context including output/tools. Older recent dialogue is token-trimmed while character/emotion state stays. Restart to resize the managed KV pool.'),
+        Setting('interval_seconds', 120), Setting('idle_seconds', 300), Setting('cooldown_seconds', 300),
+        Setting('spoken_enabled', False), Setting('allow_urgent_spoken', False), Setting('rules', DEFAULT_RULES))))
+DEFAULTS = SETTINGS.defaults()
 
 
 class InitiativeDecisionError(ValueError):
@@ -118,8 +152,9 @@ class Initiative:
         self.app_identity = None
         self.task_version = None
         self.version = 0
-        settings = {**deepcopy(DEFAULTS), **session.config.raw.get('initiative', {})}
         try:
+            # A YAML key DEFAULTS lacks keeps no value (load_config reports it); the app-written JSON stays strict.
+            settings = {**deepcopy(DEFAULTS), **{key: value for key, value in (session.config.raw.get('initiative') or {}).items() if key in DEFAULTS}}
             if self.path.exists(): settings.update(json.loads(self.path.read_text(encoding='utf-8')))
             self.settings = self.validate(settings)
         except (ValueError, TypeError, OSError) as exc:
@@ -141,7 +176,6 @@ class Initiative:
 
     def validate(self, settings):
         if set(settings) - set(DEFAULTS): raise ValueError('Unknown initiative setting')
-        from ..kernel.background_budget import validate_budget
         validate_budget(settings['context_window_tokens'], settings['max_output_tokens'], 'initiative')
         for key in ('enabled', 'observe_idle', 'observe_active_app', 'spoken_enabled', 'allow_urgent_spoken'):
             if not isinstance(settings[key], bool): raise ValueError(f'{key} must be boolean')

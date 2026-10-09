@@ -13,6 +13,7 @@ from process.app_core.events.outbox import Outbox
 from process.app_core.events.resources import ResourceEvents
 from process.app_core.runtime.actions import ActionController
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
 
 ROOT = Path(__file__).resolve().parents[1] / 'Code'
 EMITTERS = {'publish', 'emit', '_emit', 'notify', 'on_prediction', 'on_fallback', 'callback'}
@@ -72,7 +73,7 @@ def test_wake_calibration_timeout_does_not_deadlock_with_runtime_snapshot(monkey
     unsubscribe = event_bus.subscribe(gate)
     monkeypatch.setattr(session_module, 'SpeechQueue', FakeSpeech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
-    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = session_module.SessionManager(config, chat, DesktopState())
     session.wake.recording = WakeCapture(max_seconds=0.01)  # next frame times out the sample
     def vad():

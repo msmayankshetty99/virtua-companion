@@ -30,7 +30,7 @@ from process.app_core.kernel.lifecycle import close_bounded, run_bounded
 from process.app_core.desktop.media import resolve_media
 from fastapi.responses import FileResponse
 
-config = load_config()
+config = load_config(recover='setup')  # a broken section leaves Settings up to repair it (lifespan)
 chat = None
 state = get_desktop_state()
 session = None
@@ -49,7 +49,8 @@ board_images = WhiteboardImages()
 def settings_store():
     import os
     from process.app_core.configuration.settings_store import SettingsStore
-    return SettingsStore(os.environ.get('RIKO_CONFIG', str(config.root / 'character_config.yaml')))
+    # The config this backend started with, so Settings can say which saved settings still wait for a restart.
+    return SettingsStore(os.environ.get('RIKO_CONFIG', str(config.root / 'character_config.yaml')), running=config)
 
 def _state_event(event_type, value):
     # Publish a complete state after every mutation so clients never need to
@@ -75,9 +76,11 @@ async def lifespan(_app):
     startup_error = ''
     session = None
     try:
+        # A section load_config could not read (recover='setup') would otherwise run with its defaults: repair it first.
+        if config.load_errors: raise ValueError('; '.join(config.load_errors))
         chat = await run_in_threadpool(create_chat_service, config)
-        # Voice, wake and speech settings are checked here, after the model has loaded; a mistake in them takes the
-        # same fallback, so Settings can repair it instead of every launch failing.
+        # load_config has checked the voice, speech and GPT-SoVITS values; whatever else fails building the session
+        # (after the model has loaded) takes the same fallback, so Settings can repair it instead of every launch failing.
         try: session = SessionManager(config, chat, state, chat.deps.action_controller)
         except BaseException:
             await run_in_threadpool(close_bounded, chat, 6)
@@ -423,33 +426,43 @@ def save_settings(request: SettingsPatch, x_riko_confirmation: str | None = Head
         if security_sensitive(key, value) and current.get(key) != value}, x_riko_confirmation)
     try:
         result = settings_store().save(request.changes, request.revision)
-        if result.get('saved') and 'emotion.probe.interval_tokens' in request.changes:
-            interval = result['values']['emotion.probe.interval_tokens']
-            config.emotion.probe['interval_tokens'] = interval
-            host = probe_host()
-            if host: host.set_probe_interval(interval)
-        if result.get('saved') and 'runtime.pause_background_on_live' in request.changes:
-            enabled = result['values']['runtime.pause_background_on_live']
-            config.runtime.pause_background_on_live = enabled
-            if chat is not None: chat.provider.set_pause_background(enabled)
-            memory = getattr(chat, 'memory_store', None)
-            if memory: memory.set_foreground(bool(enabled and session is not None and session.status().generating))
-        if result.get('saved') and any(key.startswith('avatar.') for key in request.changes):
-            from copy import deepcopy
-            from process.app_core.configuration.settings_store import LOCK
-            with LOCK:
-                config.avatar = deepcopy(load_config(settings_store().path).avatar)
-                config.raw['avatar'] = deepcopy(config.avatar)
-            event_bus.publish('state.snapshot', **snapshot())
-        initiative = getattr(session, 'initiative', None)
-        if result.get('saved') and initiative:
-            budgets = {key.split('.')[-1]: result['values'][key] for key in ('initiative.context_window_tokens', 'initiative.max_output_tokens')}
-            if any(key in request.changes for key in ('initiative.context_window_tokens', 'initiative.max_output_tokens')):
-                initiative.update(budgets)
+        if result.get('saved'):
+            from process.app_core.configuration.schema import live_hooks
+            for name, paths in live_hooks(request.changes).items(): LIVE[name](result['values'], paths)
         return result
     except SettingsConflict as exc: raise HTTPException(409, str(exc))
     except (ValueError, TypeError) as exc: raise HTTPException(400, str(exc))
     except OSError as exc: raise HTTPException(500, 'Could not write YAML. Check file permissions or close another editor holding the file.') from exc
+
+# Saved settings that apply without a restart, by the hook their schema entry names (Setting.live, restart scope 'none'
+# unless noted): each takes the saved values and the changed paths.
+def live_probe_interval(values, paths):
+    interval = values['emotion.probe.interval_tokens']
+    config.emotion.probe['interval_tokens'] = interval
+    host = probe_host()
+    if host: host.set_probe_interval(interval)
+
+def live_background_pause(values, paths):
+    enabled = values['runtime.pause_background_on_live']
+    config.runtime.pause_background_on_live = enabled
+    if chat is not None: chat.provider.set_pause_background(enabled)
+    memory = getattr(chat, 'memory_store', None)
+    if memory: memory.set_foreground(bool(enabled and session is not None and session.status().generating))
+
+def live_avatar(values, paths):
+    from copy import deepcopy
+    from process.app_core.configuration.settings_store import LOCK
+    with LOCK:
+        config.avatar = deepcopy(load_config(settings_store().path).avatar)
+        config.raw['avatar'] = deepcopy(config.avatar)
+    event_bus.publish('state.snapshot', **snapshot())
+
+def live_initiative_budgets(values, paths):  # the running initiative takes them; resizing the KV pool still needs a restart
+    initiative = getattr(session, 'initiative', None)
+    if initiative: initiative.update({key.split('.')[-1]: values[key] for key in ('initiative.context_window_tokens', 'initiative.max_output_tokens')})
+
+LIVE = {'probe_interval': live_probe_interval, 'background_pause': live_background_pause, 'avatar': live_avatar,
+    'initiative_budgets': live_initiative_budgets}
 
 class PathCheck(BaseModel):
     value: str

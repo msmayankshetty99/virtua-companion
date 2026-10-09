@@ -11,6 +11,7 @@ from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 from process.app_core.desktop.state import DesktopState
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
 
 
 class FakeSpeech:
@@ -22,7 +23,7 @@ class FakeSpeech:
 
 def make_session(monkeypatch, chat):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', FakeSpeech)
-    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     return SessionManager(config, chat, DesktopState())
 
 

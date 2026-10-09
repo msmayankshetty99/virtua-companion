@@ -25,10 +25,7 @@ class SpeechQueue:
         self.config, self.state = config, state
         self.queue = queue.Queue(maxsize=64)
         self.closed = threading.Event()
-        concurrency = config.raw.get("sovits_ping_config", {}).get("max_in_flight_requests", 4)
-        if type(concurrency) is not int or concurrency < 1:
-            raise ValueError("sovits_ping_config.max_in_flight_requests must be a positive integer")
-        self.requests = DaemonExecutor(max_workers=concurrency, thread_name_prefix="tts-request")
+        self.requests = DaemonExecutor(max_workers=config.sovits.max_in_flight_requests, thread_name_prefix="tts-request")
         self._submit_lock = threading.Lock()
         self._interrupt = threading.Event()
         self._futures = set()
@@ -199,7 +196,7 @@ class SpeechQueue:
                 raise RuntimeError('GPT-SoVITS returned no audio')
             interrupt.wait(.02)
         import sounddevice as sd
-        rate = int(self.config.raw.get("sovits_ping_config", {}).get("sample_rate", 32000))
+        rate = self.config.sovits.sample_rate
         with sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16") as output:
             with self._response_lock: self._output = (output, interrupt)
             try:

@@ -78,7 +78,7 @@ def test_julia_gpu_option_does_not_enable_gpu_probe():
     assert field('emotion.device', 'cpu')['options'] == ['cpu', 'auto', 'cuda', 'cuda:0']
     assert field('memory.device', 'cpu')['options'] == ['cpu', 'auto', 'cuda', 'cuda:0', 'mps']
     from process.app_core.emotion.probe import ProbeConfig
-    with pytest.raises(ValueError): ProbeConfig.from_raw({'device': 'cuda'})
+    assert not hasattr(ProbeConfig.from_raw({'device': 'cuda'}), 'device')  # ignored (load_config reports it), never a GPU probe
 
 
 def test_probe_cannot_silently_use_stock_http_server(tmp_path):

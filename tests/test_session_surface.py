@@ -29,6 +29,7 @@ from process.app_core.runtime import warmup
 from process.app_core.runtime.initiative import Initiative
 from process.app_core.runtime.session import SessionManager
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
 from test_desktop_api import backend, client_for  # noqa: F401 (backend is a fixture)
 from test_private_access import CODE, private_access
 
@@ -48,7 +49,7 @@ def session(monkeypatch, tmp_path):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
     config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko',
-        tools=SimpleNamespace(max_iterations=8), runtime=SimpleNamespace(startup_timeout_seconds=5))
+        tools=SimpleNamespace(max_iterations=8), runtime=SimpleNamespace(startup_timeout_seconds=5), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     try: yield session
     finally: session.close()

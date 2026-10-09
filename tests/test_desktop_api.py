@@ -11,6 +11,7 @@ from process.app_core.conversation.chat import ChatDeps
 from process.app_core.conversation.history import ConversationHistory
 from process.app_core.desktop.state import DesktopState
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
 
 
 def chat_stub(**fields):
@@ -28,8 +29,8 @@ def backend(monkeypatch, tmp_path):
     # Load settings with the real loader before the server-import startup stub.
     # Otherwise isolated API tests capture the no-argument stub in settings_store.
     importlib.import_module('process.app_core.configuration.settings_store')
-    config = SimpleNamespace(root=tmp_path, raw={}, avatar={}, character_name='Test character', runtime=SimpleNamespace(provider='fake', warmup=False))
-    monkeypatch.setattr('process.app_core.configuration.config.load_config', lambda: config)
+    config = SimpleNamespace(root=tmp_path, raw={}, avatar={}, character_name='Test character', runtime=SimpleNamespace(provider='fake', warmup=False), load_errors=(), **audio_sections({}))
+    monkeypatch.setattr('process.app_core.configuration.config.load_config', lambda **options: config)
     server = importlib.import_module('desktop_server')
     monkeypatch.setattr(server, 'config', config)
     monkeypatch.setattr(server, 'state', DesktopState())
@@ -159,6 +160,33 @@ def test_background_pause_setting_applies_live_without_restart(backend,monkeypat
     result=client_for(backend).put('/api/settings',json={'revision':store.snapshot()['revision'],'changes':{'runtime.pause_background_on_live':False}})
     assert result.status_code==200 and result.json()['saved'] and not result.json()['restart_required']
     assert calls==[('pause',False),('memory',False)]
+
+
+def test_settings_apply_live_through_the_hook_their_schema_entry_names(backend, monkeypatch):
+    """Regression: a setting applied live had to be listed in field(), in save() and in an if-chain in save_settings; one
+    missing left it reported as restart-only, or applied without Settings saying so. Each live setting now names its hook."""
+    from process.app_core.configuration import schema as settings
+    from process.app_core.configuration.settings_store import SettingsStore
+    from process.app_core.kernel import schema
+    named = {item.live for item in settings.sections()} | {spec.live for item in settings.sections() for spec in item.settings}
+    assert named - {None} == set(backend.LIVE)
+    for item in settings.sections():
+        for spec in item.settings:
+            if settings.restart_scope(item.path_of(spec.key)) == 'none': assert settings.resolve(item.path_of(spec.key), 'live'), spec.key
+    registry = schema.Registry()
+    registry.register(*schema.REGISTRY.sections(), schema.Section('demo', restart='none', live='demo', settings=(schema.Setting('speed', 2.5),)))
+    monkeypatch.setattr(schema, 'REGISTRY', registry)
+    calls = []
+    monkeypatch.setitem(backend.LIVE, 'demo', lambda values, paths: calls.append((values['demo.speed'], paths)))
+    path = backend.config.root / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: lm_studio\n')
+    store = SettingsStore(path)
+    monkeypatch.setattr(backend, 'settings_store', lambda: store)
+    client = client_for(backend)
+    result = client.put('/api/settings', json={'revision': store.snapshot()['revision'], 'changes': {'demo.speed': 3}}).json()
+    assert result['saved'] and not result['restart_required'] and calls == [(3, ['demo.speed'])]
+    result = client.put('/api/settings', json={'revision': result['revision'], 'changes': {'runtime.temperature': .5}}).json()
+    assert result['saved'] and result['restart_required'] and len(calls) == 1
 
 
 def test_gpu_draft_feedback_can_estimate_budget_mismatch_without_fixing_values(backend,monkeypatch):
@@ -316,18 +344,41 @@ def test_a_multi_word_companion_name_starts_the_real_session(backend, monkeypatc
 
 
 def test_setup_mode_survives_a_session_that_cannot_start(backend, monkeypatch):
-    """Voice settings are checked only after the model has loaded; their errors keep Settings up like a model error."""
-    backend.config.raw.update(desktop={'setup_on_startup_error': True}, voice={'mode': 'push_to_talk'})
+    """A session that fails to build after the model has loaded keeps Settings up like a model error. (load_config has
+    checked the voice values already; wake feedback is checked again as the session builds it.)"""
+    backend.config.raw.update(desktop={'setup_on_startup_error': True}, wake_feedback={'volume': 5})
     (backend.config.root / 'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n')
     closed = []
     monkeypatch.setattr(backend, 'create_chat_service', lambda config: chat_stub(close=lambda: closed.append('chat')))
     listeners = len(backend.event_bus._listeners)
     with client_for(backend) as client:
-        assert 'voice.mode must be' in client.get('/api/status').json()['startup_error']
+        assert 'wake_feedback.volume must be' in client.get('/api/status').json()['startup_error']
         assert client.get('/api/settings').status_code == 200
         assert client.get('/api/voice/status').status_code == 503
         assert closed == ['chat'] and backend.chat is None and backend.session is None  # the loaded model is released
     assert len(backend.event_bus._listeners) == listeners
+
+
+def test_a_voice_value_load_config_could_not_read_starts_setup_mode_instead_of_killing_the_backend(backend, monkeypatch, tmp_path):
+    """Regression: voice and GPT-SoVITS values are checked by load_config, which runs at import, before the lifespan's
+    setup fallback. With desktop.setup_on_startup_error the section loads with its defaults and the lifespan starts in setup
+    mode, without loading the model, so Settings can repair it, as when the session used to reject the value."""
+    from process.app_core.configuration.settings_store import load_config as real_load_config  # the fixture stubs config's
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: lm_studio\ndesktop:\n  setup_on_startup_error: true\nvoice:\n  mode: push_to_talk\n'
+        'sovits_ping_config:\n  max_in_flight_requests: 0\n', encoding='utf-8')
+    loaded = real_load_config(path, recover='setup')
+    assert loaded.voice.mode == 'wake_word' and len(loaded.load_errors) == 2 and 'voice.mode must be' in '; '.join(loaded.load_errors)
+    with pytest.raises(ValueError, match='(voice.mode|sovits_ping_config.max_in_flight_requests) must be'): real_load_config(path)  # Settings validation stays strict
+    path.write_text(path.read_text(encoding='utf-8').replace('  setup_on_startup_error: true', '  setup_on_startup_error: false'), encoding='utf-8')
+    with pytest.raises(ValueError, match='(voice.mode|sovits_ping_config.max_in_flight_requests) must be'): real_load_config(path, recover='setup')  # no setup mode: fail fast
+    backend.config.raw.update(desktop={'setup_on_startup_error': True})
+    backend.config.load_errors = loaded.load_errors
+    (backend.config.root / 'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n')
+    monkeypatch.setattr(backend, 'create_chat_service', lambda config: pytest.fail('the model must not load with a broken section'))
+    with client_for(backend) as client:
+        assert 'voice.mode must be' in client.get('/api/status').json()['startup_error']
+        assert client.get('/api/settings').status_code == 200
 
 
 def test_setup_mode_keeps_settings_accessible_with_cors(backend,monkeypatch):
@@ -586,7 +637,7 @@ def test_chat_while_another_turn_runs_is_a_conflict_not_a_server_error(backend, 
         def cancel(self): pass
         def close(self): pass
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, chat_stub(close=lambda: None), backend.state)
     monkeypatch.setattr(backend, 'session', session)
     client = client_for(backend, raise_server_exceptions=False)

@@ -5,7 +5,6 @@ import re
 import threading
 import time
 import uuid
-import math
 from dataclasses import replace
 
 from ..events.bus import event_bus
@@ -38,11 +37,11 @@ class SessionManager:
         self._capture_lock = threading.Lock()
         self._closed = False
         self._cancel = threading.Event()
-        self.asr = AsrService(config.raw.get('voice', {}))  # the one Whisper model: microphone, warmup and Discord
+        self.asr = AsrService(config.raw.get('voice') or {})  # the one Whisper model: microphone, warmup and Discord
         self.warmed_vad = None  # warm_session's Silero model, which each VoiceInput copies
         self._turn_speak = True
-        # Validate wake configuration before starting audio workers, and wake feedback before subscribing, so a
-        # failed construction leaves no worker or bus listener behind (desktop_server then keeps Settings up).
+        # Build the wake word before starting audio workers, and wake feedback before subscribing, so a failed
+        # construction leaves no worker or bus listener behind (desktop_server then keeps Settings up).
         self.wake = WakeWord(config)
         try:
             self.speech = SpeechQueue(config, state)
@@ -136,20 +135,15 @@ class SessionManager:
         raise ValueError('Use list, preview or stop')
 
     def interruption_threshold(self):
-        settings = self.config.raw.get('voice', {})
-        normal = float(settings.get('interruption_seconds', 1.5))
-        return max(normal, float(settings.get('assertive_interruption_seconds', 6.0))) if time.monotonic() < self._assertive_until else normal
+        voice = self.config.voice
+        return max(voice.interruption_seconds, voice.assertive_interruption_seconds) if time.monotonic() < self._assertive_until else voice.interruption_seconds
 
     def interrupt_user(self, reason):
         if not isinstance(reason, str) or not reason.strip(): raise ValueError('A reason is required')
         with self._voice_lock:
             if not self._generation_active or self._cancel.is_set(): raise RuntimeError('No active reply to grant speaking priority')
             if self._assertive_used: return {'granted': False, 'reason': 'Speaking priority was already used this turn'}
-            settings = self.config.raw.get('voice', {})
-            duration = float(settings.get('assertive_window_seconds', 15.0))
-            threshold = float(settings.get('assertive_interruption_seconds', 6.0))
-            if not math.isfinite(duration) or not 0 < duration <= 60 or not math.isfinite(threshold) or not 0 < threshold <= 30:
-                raise ValueError('Assertive window must be 0–60 seconds and threshold 0–30 seconds (exclusive zero)')
+            duration = self.config.voice.assertive_window_seconds  # 0-60 s and its threshold 0-30 s (VoiceConfig.from_raw)
             self._assertive_used = True
             self._assertive_until = time.monotonic() + duration
             self._assertive_reason = reason.strip()
@@ -256,12 +250,11 @@ class SessionManager:
         try:
             with self._voice_lock:
                 if guard() or not self._read_status().idle_for_background(): return False
-                # Validate voice and speech settings before committing: a bad value fails this presentation without leaving
-                # a message nobody saw or heard in history (and another on every retry).
-                voice = self.config.raw.get('voice', {})
-                interjections = Interjections(self.cancel, float(voice.get('interruption_seconds', 1.5)),
-                    float(voice.get('interjection_debounce_seconds', 1.0))) if spoken else None
-                sentences = SpeechChunks(self.config.raw.get('speech', {})) if spoken else None
+                # Build the speech helpers before committing: a failure fails this presentation without leaving a message
+                # nobody saw or heard in history (and another on every retry).
+                voice = self.config.voice
+                interjections = Interjections(self.cancel, voice.interruption_seconds, voice.interjection_debounce_seconds) if spoken else None
+                sentences = SpeechChunks(self.config.speech) if spoken else None
                 self._input_history_base = None  # No later speech may rewrite the input of a reply this message follows.
                 start = self.chat.conversation.append([ChatMessage('assistant', message)])
                 if spoken:
@@ -386,7 +379,7 @@ class SessionManager:
         # playing segment only; never count synthesized-but-unplayed segments.
         playing = self._playing
         age = max(0, time.monotonic() - playing["started_at"])
-        speed = float(self.config.raw.get("voice", {}).get("playback_words_per_second", 2.5))
+        speed = self.config.voice.playback_words_per_second
         words = list(re.finditer(r"\S+", playing["text"]))
         count = min(len(words), int(age * speed))
         start = playing.get("start_offset", self._spoken_offset)
@@ -539,12 +532,10 @@ class SessionManager:
             self._turns.end() # A leaked turn would refuse every later one until restart.
             raise
         try:
-            settings = self.config.raw.get("voice", {})
-            # Validate voice settings before touching turn state: a bad value must fail this turn
+            voice = self.config.voice
+            # Build interjections before touching turn state: a failure must fail this turn
             # cleanly, not leave the previous turn's interjections attached to the new one.
-            interjections = Interjections(self.cancel,
-                float(settings.get("interruption_seconds", 1.5)),
-                float(settings.get("interjection_debounce_seconds", 1.0)))
+            interjections = Interjections(self.cancel, voice.interruption_seconds, voice.interjection_debounce_seconds)
             with self._voice_lock:
                 base = len(self.chat.conversation)  # measured as this turn takes over: a late transcript for the last one can no longer move it
                 self._cancel.clear()
@@ -571,8 +562,7 @@ class SessionManager:
             if record_user:
                 event_bus.publish("chat.input", turn_id=turn_id, text=text, user_name=user_name, **origin)
             event_bus.publish("model.started", turn_id=turn_id, **origin)
-            settings = self.config.raw.get('speech', {})
-            sentences = SpeechChunks(settings)
+            sentences = SpeechChunks(self.config.speech)
 
             def send_sentence(sentence):
                 if not speak: return # Remote clients render/export audio themselves.

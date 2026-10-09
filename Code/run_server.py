@@ -11,8 +11,8 @@ RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'f
     'discord_bot', 'uvicorn')
 # kernel/, which code imports partly inside functions (chat's metrics, the background budgets): the release check imports
 # each by name, as it loads every name of the lazy process.app_core facade. tests/test_release_build.py keeps it equal to kernel/.
-KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('background_budget', 'cancellation', 'lifecycle', 'messages',
-    'metrics', 'output_filter', 'streaming', 'torch_device', 'turns', 'workers'))
+KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('audio_config', 'background_budget', 'cancellation', 'lifecycle',
+    'messages', 'metrics', 'output_filter', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
 # Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
 DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
 
@@ -152,7 +152,7 @@ def main():
         return
     this = sys.modules[__name__]  # uvicorn, Server and load_config resolve through __getattr__ (and tests replace them there)
     os.chdir(Path(os.environ.get('RIKO_DATA_DIR', Path(__file__).resolve().parents[1])))
-    config = this.load_config()
+    config = this.load_config(recover='setup')  # desktop_server's lifespan reports a broken section in setup mode
     from process.app_core.configuration.debug_logging import configure_logging
     configure_logging(config)
     # Debug our application, not WebSocket frames. Uvicorn DEBUG dumps every

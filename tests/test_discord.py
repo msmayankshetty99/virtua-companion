@@ -19,6 +19,7 @@ from process.app_core.integrations.discord.replies import StreamReply
 from process.app_core.integrations.discord.voice import VoiceCapture, MAX_CALL_BYTES, downsample_call
 from process.app_core.audio.tts_http import request_payload, synthesize_wav
 from process.app_core.tools.approval import ToolApprovals, approval_turn
+from process.app_core.kernel.audio_config import audio_sections
 
 
 def test_discord_policy_fails_closed_and_separates_admins(tmp_path):
@@ -220,7 +221,7 @@ def test_audio_export_failure_does_not_disable_subsequent_requests(monkeypatch):
 
 
 def test_exported_tts_reuses_http_payload_and_never_opens_sound_device(tmp_path, monkeypatch):
-    config = SimpleNamespace(root=tmp_path, raw={'sovits_ping_config':{'sample_rate':16000, 'text_lang':'en'}})
+    config = SimpleNamespace(root=tmp_path, **audio_sections({'sovits_ping_config':{'sample_rate':16000, 'text_lang':'en'}}))
     url, payload = request_payload(config, 'hello')
     assert payload['media_type'] == 'raw' and payload['text_lang'] == 'en'
     class Response:

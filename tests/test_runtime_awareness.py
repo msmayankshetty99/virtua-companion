@@ -15,6 +15,7 @@ from process.app_core.tools.registry import ToolRegistry
 from process.app_core.audio.voice_input import VoiceInput
 from process.app_core.audio.voice_segments import Segment
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import VoiceConfig, audio_sections
 
 
 class Speech:
@@ -26,7 +27,7 @@ class Speech:
 
 def make_session(monkeypatch, provider=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={'voice': {}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={'voice': {}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     chat = ChatService(provider or BaseProvider(), system_prompt='Riko', tool_registry=ToolRegistry())
     return SessionManager(config, chat, DesktopState())
 
@@ -35,6 +36,25 @@ def activate(session):
     session._active_turn = 'turn'
     session._generation_active = True
     session._interjections = Interjections(session.cancel)
+
+
+class NoRaw(dict):
+    def get(self, *args): raise AssertionError('voice settings must come from config.voice, checked once by load_config')
+    __getitem__ = get
+
+
+def test_interruption_thresholds_come_from_the_typed_voice_section(monkeypatch):
+    session = make_session(monkeypatch)
+    session.config.voice = VoiceConfig.from_raw({'interruption_seconds': 2, 'assertive_interruption_seconds': 8, 'assertive_window_seconds': 30})
+    session.config.raw = NoRaw()
+    try:
+        activate(session)
+        assert session.interruption_threshold() == 2
+        result = session.interrupt_user('Let me finish')
+        assert (result['window_seconds'], result['interruption_seconds'], session.interruption_threshold()) == (30, 8, 8)
+        session._playing = {'text': 'one two three', 'started_at': 0, 'start_offset': 0}  # barge-in estimates read words/second too
+        assert session.voice_anchor()[1] == len('one two three')
+    finally: session.close()
 
 
 def test_legacy_todo_contents_are_not_automatically_injected(monkeypatch):

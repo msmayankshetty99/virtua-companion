@@ -3,6 +3,7 @@ import logging
 import time
 
 from ..events.bus import event_bus
+from ..kernel.audio_config import FRAME_SAMPLES, SAMPLE_RATE
 from ..kernel.workers import DaemonExecutor
 
 
@@ -38,7 +39,7 @@ def warm_session(session):
         import torch
         from silero_vad import load_silero_vad
         model = load_silero_vad()
-        model(torch.zeros(512), 16000)
+        model(torch.zeros(FRAME_SAMPLES), SAMPLE_RATE)
         model.reset_states()
         if session.is_open: session.warmed_vad = model
     def wake():

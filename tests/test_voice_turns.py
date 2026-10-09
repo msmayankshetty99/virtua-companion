@@ -4,6 +4,7 @@ Every step runs on the test thread (or behind explicit events), so nothing depen
 import queue
 import threading
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ from process.app_core.events.bus import event_bus
 from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
 
 DISCORD = {'source': 'discord', 'conversation_id': 'discord:client:dm:1', 'user_id': '1', 'channel_id': '1', 'message_id': 'd1'}
 
@@ -35,7 +37,7 @@ class Speech:
 def parts(monkeypatch, tmp_path):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), calls=[], provider=BaseProvider())
-    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     events = []
     unsubscribe = event_bus.subscribe(events.append)
@@ -384,7 +386,7 @@ def test_sustained_speech_after_stop_cuts_nothing_and_starts_a_turn_of_its_own(p
 @pytest.mark.parametrize('animation', [False, None, 'off'])
 def test_an_animation_setting_that_is_not_a_section_disables_animation_without_failing_the_session(monkeypatch, tmp_path, animation):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={'animation': animation}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={'animation': animation}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider()), DesktopState())
     try: assert session.animation is None and (session.animation_error == '' if animation is False else 'must be a mapping' in session.animation_error)
     finally: session.close()
@@ -421,7 +423,7 @@ def test_an_empty_reply_is_not_visible_output_that_speech_could_be_over(parts):
 
 def test_a_spoken_initiative_with_bad_voice_settings_commits_nothing(parts):
     session, chat, _ = parts
-    session.config.raw['voice'] = {'interjection_debounce_seconds': 0}
+    session.config.voice = replace(session.config.voice, interjection_debounce_seconds=0)  # load_config rejects this; built another way
     for _ in range(2):
         with pytest.raises(ValueError): session.present_initiative('Time for a stretch?', spoken=True)
     assert contents(chat) == []  # neither attempt left a message nobody saw or heard

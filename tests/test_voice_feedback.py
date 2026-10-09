@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from process.app_core.audio.wake_word import WakeWord
 from process.app_core.events.bus import event_bus
 from process.app_core.audio.voice_segments import VoiceSegments, Segment
+from process.app_core.kernel.audio_config import audio_sections
 
 
 def test_activation_and_expiry_publish_status_without_polling(tmp_path,monkeypatch):
@@ -13,7 +14,7 @@ def test_activation_and_expiry_publish_status_without_polling(tmp_path,monkeypat
         def cancel(self):self.cancelled=True
     monkeypatch.setattr('process.app_core.audio.wake_word.threading.Timer',Timer)
     monkeypatch.setattr('process.app_core.audio.wake_word.time.monotonic',lambda:now[0])
-    config=SimpleNamespace(root=tmp_path,character_name='Riko',raw={'voice':{'mode':'manual','follow_up_seconds':10}})
+    config=SimpleNamespace(root=tmp_path,character_name='Riko',**audio_sections({'voice':{'mode':'manual','follow_up_seconds':10}}))
     wake=WakeWord(config)
     off=event_bus.subscribe(events.append)
     try:
@@ -51,7 +52,7 @@ def test_partial_asr_revisions_replace_text_and_never_dispatch_a_reply_early(mon
     voice.closed=threading.Event();voice.jobs=queue.Queue()
     voice._partial_lock=threading.Lock();voice._partial_pending=set();voice._parts={}
     outputs=iter(['hel','hello','hello there'])
-    voice.session=SimpleNamespace(wake=SimpleNamespace(calibrating=False,testing=False),config=SimpleNamespace(raw={}),transcribe=lambda pcm,**options:next(outputs))
+    voice.session=SimpleNamespace(wake=SimpleNamespace(calibrating=False,testing=False),config=SimpleNamespace(raw={},**audio_sections({})),transcribe=lambda pcm,**options:next(outputs))
     replies=[]
     def submit(fn,text,segment):replies.append(text);voice.closed.set()
     voice.responses=SimpleNamespace(submit=submit)

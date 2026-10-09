@@ -12,6 +12,7 @@ from ..kernel.messages import ChatMessage, ModelResponse, ToolCall
 from ..kernel.streaming import WordDeltas
 from .provider import BaseProvider
 from .responses import response_input, response_tools, template_messages
+from .settings import OPENAI_COMPATIBLE
 
 
 class OpenAIProvider(BaseProvider):
@@ -265,7 +266,7 @@ def create_provider(config):
     if provider == "llama_server":
         from .llama_server import LlamaServerProvider
         return LlamaServerProvider(config)
-    if provider in {"openai", "lm_studio", "openai_compatible", "ollama", "local_http"}:
+    if provider in OPENAI_COMPATIBLE:
         return OpenAIProvider(config)
     raise ValueError(
         f"Unsupported provider '{config.provider}'. Use llama_cpp, llama_server, openai, lm_studio, "

@@ -9,6 +9,7 @@ from process.app_core.runtime.initiative import Initiative, DEFAULTS, Initiative
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
 
 
 class Speech:
@@ -18,9 +19,9 @@ class Speech:
     def close(self): pass
 
 
-def engine(tmp_path, monkeypatch, *, adapter=None, generate=None):
+def engine(tmp_path, monkeypatch, *, adapter=None, generate=None, raw=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(root=tmp_path, raw={}, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(root=tmp_path, raw=raw or {}, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     provider = BaseProvider()
     provider.generate = generate or (lambda *args, **kwargs: ModelResponse(ChatMessage('assistant', json.dumps({'initiate': True, 'message': 'Would you like a hand?', 'urgent': False}))))
     chat = ChatService(provider, system_prompt='Riko')
@@ -172,6 +173,14 @@ def test_corrupt_optional_settings_fail_closed_without_overwriting(tmp_path, mon
     assert 'unable to load settings' in initiative.error
     assert path.read_text() == 'broken JSON'
     initiative.session.close()
+
+
+def test_an_unknown_yaml_key_is_ignored_instead_of_disabling_initiative(tmp_path, monkeypatch):
+    initiative = engine(tmp_path, monkeypatch, raw={'initiative': {'enabled': True, 'interval_secs': 30}})  # load_config reports it
+    try:
+        assert initiative.settings['enabled'] and not initiative.error and 'interval_secs' not in initiative.settings
+        with pytest.raises(ValueError, match='Unknown'): initiative.update({'interval_secs': 30})  # a request is still checked strictly
+    finally: initiative.session.close()
 
 
 def test_idle_check_requests_tasks_through_read_only_tool(tmp_path, monkeypatch):

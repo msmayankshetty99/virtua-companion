@@ -74,13 +74,15 @@ def loaded_after(*modules):
 
 
 def test_leaf_imports_load_only_their_own_modules():
-    # The task MCP server, each tool worker and kernel/ used to load ~40 app_core modules through the eager facade.
+    # The task MCP server, each tool worker and kernel/ used to load ~40 app_core modules through the eager facade. The
+    # facade holds only the settings registry (kernel/schema.py, standard library only), whose sections load on first read.
     kernel = {f'process.app_core.kernel.{path.stem}' for path in (CORE / 'kernel').glob('*.py') if path.stem != '__init__'}
-    assert loaded_after('process.app_core') == {'process.app_core'}
-    assert loaded_after(*kernel) == {'process.app_core', 'process.app_core.kernel', *kernel}
-    assert loaded_after('process.app_core.persistence.tasks') == {'process.app_core', 'process.app_core.persistence', 'process.app_core.persistence.tasks'}
+    facade = {'process.app_core', 'process.app_core.kernel', 'process.app_core.kernel.schema'}
+    assert loaded_after('process.app_core') == facade
+    assert loaded_after(*kernel) == {*facade, *kernel}
+    assert loaded_after('process.app_core.persistence.tasks') == {*facade, 'process.app_core.persistence', 'process.app_core.persistence.tasks'}
     tool = 'process.app_core.tools.builtin.scientific_calculator'
-    assert loaded_after(tool) == {'process.app_core', 'process.app_core.tools', 'process.app_core.tools.builtin', 'process.app_core.tools.builtin.base', tool}
+    assert loaded_after(tool) == {*facade, 'process.app_core.tools', 'process.app_core.tools.builtin', 'process.app_core.tools.builtin.base', tool}
 
 
 def test_tool_registry_reports_to_the_activity_observer_it_is_given():

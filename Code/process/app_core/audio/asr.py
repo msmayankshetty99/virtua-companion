@@ -5,6 +5,9 @@ from functools import lru_cache
 import logging
 import threading
 
+from ..kernel.audio_config import SAMPLE_RATE
+from ..kernel.schema import Section, Setting, register
+
 logger = logging.getLogger(__name__)
 MODEL = 'distil-small.en'
 # Fastest first, matching CTranslate2's own 'auto'. CPU 'int8' runs as int8_float32.
@@ -36,6 +39,28 @@ def resolve(voice):
     if precision in ('default', 'auto'): precision = best
     elif precision not in supported[device]: notes.append(f'{device} does not support {precision}'); precision = best
     return device, precision, '; '.join(notes)
+
+
+def review_pair(candidate, draft, changes):
+    """Settings' check of the speech recognition pair, only when it is edited: a pair this machine cannot run falls back at
+    startup, so one already in the file never blocks saving other settings. It names the field whose value cannot run
+    here, which may be the one the user did not edit."""
+    if not {'voice.asr_device', 'voice.asr_compute_type'} & changes.keys(): return {}
+    voice, errors = candidate.raw.get('voice') or {}, {}
+    device, _, note = resolve(voice)
+    for part in filter(None, note.split('; ')):
+        if ' does not support ' in part: errors['voice.asr_compute_type'] = f'{device} cannot run {voice.get("asr_compute_type")} here; choose default'
+        else: errors['voice.asr_device'] = f'Not available on this machine ({part}); choose auto or cpu'
+    return errors
+
+
+ASR = dict(group='models', section='Speech recognition model')
+register(Section('voice', review=review_pair, settings=(  # the rest of voice is kernel/audio_config.py's
+    Setting('asr_model', MODEL, label='Speech recognition model', **ASR),
+    Setting('asr_device', 'auto', options=('auto', 'cuda', 'cpu'), label='Speech recognition device', **ASR,
+        help='auto uses CUDA when CTranslate2 sees a supported GPU (NVIDIA, or AMD with a HIP-built CTranslate2), otherwise the CPU. CTranslate2 has no Metal backend, so Macs transcribe on the CPU. Packaged builds bundle no CUDA libraries for speech recognition; keep cpu there. Save and restart Python.'),
+    Setting('asr_compute_type', 'default', options=('default', 'int8_float16', 'float16', 'int8', 'float32'), label='Speech recognition precision', **ASR,
+        help='default picks the fastest precision the device supports: int8_float16 on recent NVIDIA GPUs, int8 on the CPU. float16 and int8_float16 need a GPU. A pair this machine cannot run is refused here; one already in the file is replaced at startup with a logged warning. Save and restart Python.'))))
 
 
 def create_whisper(voice):
@@ -72,7 +97,7 @@ class AsrService:
 
     def warm(self):
         import numpy as np
-        self.transcribe(np.zeros(16000, dtype='float32'), beam_size=1, vad_filter=False)
+        self.transcribe(np.zeros(SAMPLE_RATE, dtype='float32'), beam_size=1, vad_filter=False)  # one second of silence
 
     def close(self):  # never waits for a decode in progress
         self.closed, self.model = True, None

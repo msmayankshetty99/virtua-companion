@@ -19,6 +19,7 @@ from process.app_core.inference.llama_native import InProcessLlamaProvider, Nati
 from process.app_core.inference.provider import BaseProvider, InferenceProvider, Lane, ProviderCapabilities, ROLES
 from process.app_core.kernel.cancellation import BackgroundPreempted
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.audio_config import audio_sections
 from test_desktop_api import backend, client_for  # noqa: F401 (backend is a fixture)
 from test_llama_native import fake_runtime
 from test_private_access import CODE
@@ -102,7 +103,7 @@ def test_the_session_drives_the_provider_through_its_declared_members(monkeypatc
         def set_foreground(self, active): calls.append(('foreground', active))
         def cancel(self): calls.append('cancel')
     provider = Recorder()
-    config = SimpleNamespace(raw={'animation': False}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={'animation': False}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, ChatService(provider, system_prompt='Riko'), DesktopState())
     try:
         assert provider.expression_idle() is True  # the session's quiet check, declared rather than assigned

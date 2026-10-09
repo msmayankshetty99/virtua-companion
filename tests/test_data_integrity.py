@@ -3,6 +3,7 @@ failed or interrupted turns keep the user's message, and unreadable stores fail 
 import asyncio
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
 from process.app_core.tools.approval import ToolApprovals
 from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
 
 
 class FakeSpeech:
@@ -35,7 +37,7 @@ class FakeSpeech:
 def session_parts(monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', FakeSpeech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
-    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     events = []
     unsubscribe = event_bus.subscribe(lambda event: events.append(event.type))
@@ -102,7 +104,8 @@ def test_shutdown_during_a_reply_keeps_the_users_message(session_parts):
 
 def test_a_bad_voice_setting_fails_the_turn_with_the_real_error_and_keeps_the_message(session_parts):
     session, chat, events = session_parts
-    session.config.raw['voice'] = {'interjection_debounce_seconds': 0}  # hand-edited YAML
+    # load_config rejects this value (tests/test_config.py); a voice section built another way must still fail the turn cleanly.
+    session.config.voice = replace(session.config.voice, interjection_debounce_seconds=0)
     with pytest.raises(ValueError, match='debounce'): session.respond('hello')
     assert contents(chat) == [('user', 'User: hello')]
     assert 'model.error' in events

@@ -90,7 +90,7 @@ def estimate(config, telemetry, metadata=None):
     if managed and metadata is None:
         try: meta = model_metadata(runtime)
         except Exception as exc: warnings.append('LLM metadata unavailable: ' + str(exc))
-    pool = context_capacity(runtime)
+    pool = context_capacity(runtime) if managed else None  # only the in-process provider allocates a KV pool
     kv_per_token = None
     if managed and runtime.n_gpu_layers != 0:
         layers, embedding, heads, kv_heads = (meta.get(k) for k in ('layers', 'embedding', 'heads', 'kv_heads'))
@@ -120,7 +120,7 @@ def estimate(config, telemetry, metadata=None):
             add('llm_compute', 'LLM compute workspace', 128, 768, 'Heuristic; missing architecture details')
     else:
         add('llm_weights', 'LLM', 0, 0, 'CPU-only owned model' if managed else 'External provider excluded (any local GPU use appears in Other)')
-    voice = config.raw.get('voice', {})
+    voice = config.raw.get('voice') or {}
     from ..audio.asr import MODEL, resolve
     device, precision, note = resolve(voice)
     model = str(voice.get('asr_model', MODEL)).lower()

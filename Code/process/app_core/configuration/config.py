@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..kernel.audio_config import SovitsConfig, SpeechConfig, VoiceConfig
+from ..kernel.background_budget import validate_budget
+from . import schema
+
 try:
     import yaml
 except ImportError:  # Keep core imports usable for tooling/tests before dependencies are installed.
@@ -58,7 +62,7 @@ class RuntimeConfig:
     pause_background_on_live: bool = True
     native_library: Path | None = None
     # Background lanes' budgets, set by load_config from initiative.* (initiative_settings.json overrides them) and
-    # memory.reflection_context_window_tokens; Settings edits them under those keys, not as runtime.* (RUNTIME_DERIVED).
+    # memory.reflection_context_window_tokens; Settings edits them under those keys, not as runtime.* (configuration/schema.py TYPED).
     initiative_n_ctx: int = 4096
     initiative_max_output_tokens: int = 1024
     reflection_n_ctx: int = 4096
@@ -122,6 +126,11 @@ class AppConfig:
     tools: ToolConfig = field(default_factory=ToolConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
+    speech: SpeechConfig = field(default_factory=SpeechConfig)
+    sovits: SovitsConfig = field(default_factory=SovitsConfig)  # sovits_ping_config
+    unknown_settings: tuple = ()  # section.key paths no typed section declares: logged once and flagged in Settings
+    load_errors: tuple = ()  # sections loaded with their defaults by load_config(recover=...): the lifespan starts in setup mode
     character_name: str = "Riko"
     system_prompt: str = "You are a helpful local assistant."
     raw: dict[str, Any] = field(default_factory=dict)
@@ -135,7 +144,9 @@ def _path(root: Path, value: str | Path | None) -> Path | None:
     return path if path.is_absolute() else root / path
 
 
-def load_config(path: str | Path | None = None) -> AppConfig:
+def load_config(path: str | Path | None = None, *, recover: bool | str = False) -> AppConfig:
+    """recover: True (Settings' snapshot) or 'setup' (startup, only with desktop.setup_on_startup_error) loads a section
+    whose check fails with its defaults and lists the message in load_errors, so the backend stays up to repair it."""
     config_path = Path(path or os.getenv("RIKO_CONFIG", "character_config.yaml")).expanduser()
     if not config_path.is_absolute():
         config_path = Path.cwd() / config_path
@@ -145,18 +156,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise RuntimeError("PyYAML is required to load character_config.yaml")
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     root = config_path.parent
-    sovits = raw.get('sovits_ping_config', {})
-    if type(sovits.get('auto_start', False)) is not bool:
-        raise ValueError('sovits_ping_config.auto_start must be boolean')
-    arguments = sovits.get('arguments', [])
-    if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
-        raise ValueError('sovits_ping_config.arguments must be a list of strings')
-    from ..audio.speech_chunks import validate_settings
-    validate_settings(raw.get('speech', {}))
-    from ..audio.wake_feedback import validate_settings as validate_wake_feedback
-    validate_wake_feedback(raw.get('wake_feedback', {}))
-    from ..animation.library import validate_settings as validate_animation
-    validate_animation(raw.get('animation', {}))
+    # Every registered section's check (configuration/schema.py): voice, speech and sovits_ping_config become AppConfig's
+    # typed sections, checked now instead of at every turn or frame; animation, wake_feedback, emotion.probe, initiative,
+    # memory and tools are checked here too.
+    errors = [] if recover is True or recover == 'setup' and (raw.get('desktop') or {}).get('setup_on_startup_error') else None
+    checked = schema.checked(raw, errors)
     preset = raw.get("presets", {}).get("default", {})
     params = preset.get("model_params", {})
     runtime_raw = raw.get("runtime", {})
@@ -185,26 +189,10 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     )
     if not math.isfinite(runtime.request_timeout_seconds) or runtime.request_timeout_seconds <= 0:
         raise ValueError('runtime.request_timeout_seconds must be positive and finite')
-    from ..inference.llama_runtime import configure_runtime
-    configure_runtime(runtime, runtime_raw)
     tools_raw = raw.get("tools", {})
-    if type(tools_raw.get('best_fit_inputs', True)) is not bool: raise ValueError('tools.best_fit_inputs must be boolean')
-    for key, default, low, high in [('best_fit_timeout_seconds', .4, .05, 2), ('best_fit_min_confidence', .85, .5, 1)]:
-        value = tools_raw.get(key, default)
-        if type(value) not in (int,float) or not math.isfinite(value) or not low <= value <= high: raise ValueError(f'tools.{key} must be between {low} and {high}')
     memory_raw = raw.get("memory", {})
     emotion_raw = raw.get("emotion", {})
-    from ..emotion.probe import ProbeConfig
-    probe_config = ProbeConfig.from_raw(emotion_raw.get('probe', {}))
-    if probe_config.enabled and (runtime.provider != 'llama_cpp' or not emotion_raw.get('enabled', False)):
-        raise ValueError('emotion.probe requires emotion.enabled and runtime.provider: llama_cpp with a probe-enabled native library')
-    if probe_config.enabled and not runtime.native_library:
-        raise ValueError('emotion.probe requires runtime.native_library pointing to the in-process probe DLL')
-    from ..kernel.background_budget import validate_budget
-    from ..runtime.initiative import DEFAULTS as INITIATIVE_DEFAULTS
-    initiative_raw = {**INITIATIVE_DEFAULTS, **raw.get('initiative', {})}
-    validate_budget(initiative_raw['context_window_tokens'], initiative_raw['max_output_tokens'], 'initiative')
-    validate_budget(memory_raw.get('reflection_context_window_tokens', 4096), memory_raw.get('reflection_max_output_tokens', 1024), 'reflection')
+    initiative_raw = checked['initiative']  # runtime/initiative.py: its defaults and the YAML's, with the budgets checked
     runtime.initiative_n_ctx = initiative_raw['context_window_tokens']
     runtime.initiative_max_output_tokens = initiative_raw['max_output_tokens']
     # Live initiative preferences survive restart and override YAML defaults.
@@ -223,10 +211,9 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     live_prompt = max(1, runtime.n_ctx - runtime.max_output_tokens) if native else 8192
     # The legacy preset key sets n_ctx; as a prompt budget it would leave no room for the reply.
     legacy_prompt = params.get('context_window_token_limit', live_prompt)
-    from ..inference.kv_budget import pool_capacity
-    if runtime.kv_pool_auto: runtime.kv_pool_tokens = pool_capacity(runtime)
-    return AppConfig(
+    config = AppConfig(
         root=root,
+        load_errors=tuple(errors or ()),
         runtime=runtime,
         tools=ToolConfig(
             mcp_config=_path(root, tools_raw.get("mcp_config")),
@@ -275,6 +262,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         character_name=preset.get("name", raw.get("character_name", "Riko")),
         system_prompt=preset.get("system_prompt", raw.get("system_prompt", "You are a helpful local assistant.")),
+        voice=checked['voice'], speech=checked['speech'], sovits=checked['sovits_ping_config'],
+        unknown_settings=schema.unknown_settings(raw),
         raw=raw,
         avatar=dict(raw.get("avatar", {})),
     )
+    # Checks across sections on the assembled config: the provider's own (inference/settings.py), which also sizes the
+    # in-process KV pool from the background budgets, and the emotion probe's needs (emotion/probe.py).
+    schema.configure(config, raw)
+    return config

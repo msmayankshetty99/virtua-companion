@@ -3,10 +3,11 @@ from types import SimpleNamespace
 import pytest
 
 from process.app_core.audio.wake_word import WakeWord, profile_key, wake_phrase
+from process.app_core.kernel.audio_config import audio_sections
 
 
 def config(root, name='Riko', **voice):
-    return SimpleNamespace(root=root, character_name=name, raw={'voice': voice})
+    return SimpleNamespace(root=root, character_name=name, **audio_sections({'voice': voice}))
 
 
 def test_profile_key_changes_for_phrase_or_actual_device():
@@ -160,7 +161,7 @@ def test_warmup_skips_the_detector_model_for_an_unusable_wake_word(tmp_path, mon
     for value in ('Riko', 'Riko Chan'):
         wake = WakeWord(config(tmp_path, wake_word=value))
         session = SimpleNamespace(wake=wake, state=SimpleNamespace(audio_enabled=False), _closed=False,
-            config=SimpleNamespace(raw={}, runtime=SimpleNamespace(startup_timeout_seconds=1)))
+            config=SimpleNamespace(raw={}, runtime=SimpleNamespace(startup_timeout_seconds=1), **audio_sections({})))
         try: warmup.warm_session(session)
         finally: wake.close()
     assert jobs == [['asr', 'vad', 'wake_detector'], ['asr', 'vad']]

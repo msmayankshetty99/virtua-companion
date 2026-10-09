@@ -5,6 +5,7 @@ import threading
 import time
 from ..kernel.workers import DaemonExecutor
 
+from ..kernel.audio_config import FRAME_BYTES, FRAME_SAMPLES, SAMPLE_RATE
 from ..kernel.cancellation import TurnCancelled
 from ..events.bus import event_bus
 from .voice_segments import VoiceSegments
@@ -29,15 +30,15 @@ class VoiceInput:
     def _capture(self):
         try:
             import sounddevice as sd
-            settings = self.session.config.raw.get("voice", {})
-            device = sd.query_devices(settings.get("input_device"), 'input')
+            device_id = self.session.config.voice.input_device
+            device = sd.query_devices(device_id, 'input')
             hostapi = sd.query_hostapis(device['hostapi'])['name']
             self.session.wake.bind_device({'name': device['name'], 'hostapi': hostapi,
-                                          'channels': device['max_input_channels'], 'sample_rate': 16000})
+                                          'channels': device['max_input_channels'], 'sample_rate': SAMPLE_RATE})
             def callback(data, frames, timing, status):
                 self.feed(bytes(data))
-            with sd.RawInputStream(samplerate=16000, channels=1, dtype="int16", blocksize=512,
-                                   device=settings.get("input_device"), callback=callback):
+            with sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=FRAME_SAMPLES,
+                                   device=device_id, callback=callback):
                 self.closed.wait()
         except Exception as exc:
             if not self.closed.is_set(): event_bus.publish("voice.error", error=f"Microphone capture failed: {exc}")
@@ -74,7 +75,7 @@ class VoiceInput:
             import numpy as np
             import torch
             from silero_vad import load_silero_vad
-            settings = self.session.config.raw.get("voice", {})
+            voice = self.session.config.voice  # checked once by load_config (VoiceConfig.from_raw), not per frame
             from copy import deepcopy
             warmed = getattr(self.session, 'warmed_vad', None)
             vad = deepcopy(warmed) if warmed is not None else load_silero_vad()
@@ -85,12 +86,9 @@ class VoiceInput:
             def activity(seconds, anchor):
                 if self.session.status().voice_phase != 'capturing': event_bus.publish('voice.resumed', utterance_id=segmenter.utterance_id)
                 if anchor is not None: self.session.voice_activity(seconds, anchor)
-            segmenter = VoiceSegments(self._enqueue, on_start, activity,
-                pre_roll=float(settings.get("pre_roll_seconds", 1.0)),
-                gap=float(settings.get("transcription_gap_seconds", 0.3)),
-                endpoint=float(settings.get("utterance_end_seconds", 1.0)),
-                max_segment=float(settings.get("max_segment_seconds", 15.0)),
-                partial_interval=float(settings.get('live_transcript_interval_seconds', 2.0)))
+            segmenter = VoiceSegments(self._enqueue, on_start, activity, pre_roll=voice.pre_roll_seconds,
+                gap=voice.transcription_gap_seconds, endpoint=voice.utterance_end_seconds, max_segment=voice.max_segment_seconds,
+                partial_interval=voice.live_transcript_interval_seconds)
             last_level = overflow = 0.0
             if self.closed.is_set(): return
             event_bus.publish("voice.ready")
@@ -102,8 +100,8 @@ class VoiceInput:
                     segmenter.reset()
                     vad.reset_states()
                     event_bus.publish("voice.error", error="Microphone processing fell behind; recording resumed")
-                for index in range(0, len(data) - 1023, 1024):
-                    frame = data[index:index + 1024]
+                for index in range(0, len(data) - FRAME_BYTES + 1, FRAME_BYTES):
+                    frame = data[index:index + FRAME_BYTES]
                     samples = np.frombuffer(frame, dtype='<i2').astype('float32') / 32768
                     if timestamp - last_level >= 0.05:
                         event_bus.publish("voice.level", rms=float(np.sqrt(np.mean(samples ** 2))), peak=float(np.max(np.abs(samples))))
@@ -113,8 +111,8 @@ class VoiceInput:
                         segmenter.reset()
                         vad.reset_states()
                         continue
-                    with torch.inference_mode(): probability = float(vad(torch.from_numpy(samples), 16000))
-                    speaking = probability >= float(settings.get("vad_threshold", 0.5))
+                    with torch.inference_mode(): probability = float(vad(torch.from_numpy(samples), SAMPLE_RATE))
+                    speaking = probability >= voice.vad_threshold
                     self.session.set_user_speaking(speaking)
                     # A tool may claim speaking priority while an utterance that
                     # began before the reply is still being captured.

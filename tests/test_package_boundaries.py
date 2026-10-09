@@ -20,8 +20,8 @@ ENTRY_POINTS = {'desktop_server', 'discord_bot', 'run_server', 'task_mcp_server'
 EDGES = {
     'animation': {'events': 'load', 'kernel': 'load', 'persistence': 'load'},
     'audio': {'desktop': 'load', 'events': 'load', 'kernel': 'load', 'persistence': 'load'},
-    'configuration': {'animation': 'lazy', 'audio': 'lazy', 'desktop': 'lazy', 'emotion': 'lazy', 'inference': 'lazy',
-        'kernel': 'lazy', 'persistence': 'load', 'runtime': 'lazy'},
+    # Features register their settings sections (kernel/schema.py); app_core/__init__.py, not configuration, imports them.
+    'configuration': {'kernel': 'load', 'persistence': 'load'},
     'conversation': {'emotion': 'lazy', 'kernel': 'load', 'persistence': 'load'},
     'emotion': {'kernel': 'load'},
     'inference': {'events': 'lazy', 'kernel': 'load'},

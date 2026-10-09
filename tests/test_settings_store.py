@@ -54,6 +54,48 @@ def test_round_trip_save_preserves_comments_and_unknown_settings(store):
     assert store.path.with_suffix('.yaml.previous').read_text() == before
 
 
+def test_unknown_keys_are_warnings_that_never_block_validation_or_saving(store):
+    from process.app_core.configuration.settings_store import UNKNOWN
+    assert 'warnings' not in store.validate({}) and 'warnings' not in store.snapshot()  # unchanged for a file without any
+    store.path.write_text(store.path.read_text().replace('  wake_threshold: 0.9\n', '  wake_threshold: 0.9\n  wake_treshold: 0.5\n'))
+    snapshot = store.snapshot()
+    fields = {item['path']: item for item in snapshot['fields']}
+    assert snapshot['warnings'] == {'voice.wake_treshold': UNKNOWN}
+    assert fields['voice.wake_treshold']['unknown'] and fields['voice.wake_treshold']['help'] == UNKNOWN
+    assert 'unknown' not in fields['voice.wake_threshold'] and 'unknown' not in fields['custom_extension.untouched']  # only the typed sections
+    assert store.validate({}) == {'valid': True, 'errors': {}, 'warnings': {'voice.wake_treshold': UNKNOWN}}
+    result = store.save({'voice.wake_threshold': .8}, snapshot['revision'])
+    assert result['saved'] and result['warnings'] == {'voice.wake_treshold': UNKNOWN} and 'wake_treshold: 0.5' in store.path.read_text()
+
+
+def test_wake_threshold_says_an_enrolled_wake_word_keeps_its_own(store):
+    help = {item['path']: item for item in store.snapshot()['fields']}['voice.wake_threshold']['help']
+    assert 'enrolled wake word keeps the threshold saved with it' in help and 'overrides this value' in help
+
+
+def test_every_numeric_voice_speech_and_sovits_setting_has_an_editing_range_load_config_accepts():
+    from dataclasses import fields
+    from process.app_core.configuration.schema import setting
+    from process.app_core.kernel.audio_config import SovitsConfig, SpeechConfig, VoiceConfig
+    partners = {'voice.transcription_gap_seconds': {'utterance_end_seconds': 10}, 'voice.utterance_end_seconds': {'transcription_gap_seconds': .0005},
+        'speech.split_window_words': {'max_words': 1000}, 'speech.max_words': {'split_window_words': 0}}  # load_config also checks each pair
+    for section, cls in (('voice', VoiceConfig), ('speech', SpeechConfig), ('sovits_ping_config', SovitsConfig)):
+        for item in fields(cls):
+            path = f'{section}.{item.name}'
+            if type(item.default) not in (int, float) and path != 'voice.input_device': continue
+            assert setting(path).range, path
+            for value in setting(path).range:  # None: no upper bound, as the loader has none
+                if value is not None: cls.from_raw({item.name: value, **partners.get(path, {})})
+
+
+def test_other_providers_neither_size_nor_write_a_kv_pool(store):
+    store.path.write_text(store.path.read_text().replace('  n_ctx: 8192\n', "  n_ctx: 8192\n  parallel_slots: '3'\n"))
+    snapshot = store.snapshot()
+    assert snapshot['values']['runtime.kv_pool_tokens'] is None
+    result = store.save({'memory.reflection_context_window_tokens': 8192}, snapshot['revision'])
+    assert result['saved'] and 'kv_pool_tokens' not in store.path.read_text()
+
+
 def test_background_budgets_are_edited_under_their_sections_not_as_runtime_fields(store):
     """RuntimeConfig declares initiative_n_ctx and the rest, but Settings keeps showing them as the YAML keys they come from."""
     snapshot = store.snapshot()
@@ -160,7 +202,13 @@ def test_resource_fields_are_grouped_with_models(store):
     assert fields['voice.wake_threshold']['group'] == 'voice'
 
 
+def native(store):  # only llama_cpp allocates a KV pool, so only it has one to size
+    store.path.write_text(store.path.read_text().replace('provider: lm_studio', 'provider: llama_cpp').replace('  model_path: null\n', '  model_path: test.gguf\n'))
+    return store
+
+
 def test_automatic_pool_is_recalculated_and_saved_with_other_settings(store):
+    native(store)
     before = store.snapshot()
     result = store.save({'memory.reflection_context_window_tokens':8192,'runtime.kv_pool_auto':True}, before['revision'])
     assert result['saved']
@@ -174,7 +222,7 @@ def test_saved_pool_and_initiative_budget_preserve_live_preferences(store):
     preferences = store.path.parent / 'persistent_memories' / 'initiative_settings.json'
     preferences.parent.mkdir()
     preferences.write_text(json.dumps({'enabled':True,'context_window_tokens':8192,'max_output_tokens':1536}))
-    before = store.snapshot()
+    before = native(store).snapshot()
     assert before['values']['initiative.context_window_tokens'] == 8192
     result = store.save({'initiative.context_window_tokens':6144}, before['revision'])
     assert result['saved']
@@ -344,3 +392,34 @@ def test_legacy_preset_context_leaves_room_for_the_reply(tmp_path):
     config = load_config(path)
     assert config.runtime.n_ctx == 8192 and config.memory.context_window_tokens == 7168
     assert SettingsStore(path).validate({'runtime.max_output_tokens': 512})['valid']
+
+
+def test_stored_values_the_backend_accepts_never_block_saving_other_settings(tmp_path):
+    """Regression: Settings ranges narrower than load_config's, or integer inferred from a whole-number default, made a
+    working stored value an error the Settings page shows on open, which disables Save for every setting."""
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: lm_studio\nvoice:\n  max_segment_seconds: 180\n  vad_threshold: 0.97\n'
+        '  interjection_debounce_seconds: 0.05\n  playback_words_per_second: 12\ninitiative:\n  interval_seconds: 90.5\n', encoding='utf-8')
+    store = SettingsStore(path)
+    fields = {field['path']: field for field in store.snapshot()['fields']}
+    for key, value in (('voice.max_segment_seconds', 180), ('voice.vad_threshold', .97), ('voice.interjection_debounce_seconds', .05), ('voice.playback_words_per_second', 12)):
+        field = fields[key]
+        assert (field.get('min') is None or field['min'] <= value) and (field.get('max') is None or value <= field['max']), key
+    assert fields['initiative.interval_seconds']['integer'] is False
+    assert store.validate({'runtime.temperature': .5})['valid'] and store.validate({'initiative.interval_seconds': 45.5})['valid']
+
+
+def test_a_section_whose_keys_are_all_commented_out_can_be_edited(tmp_path):
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: lm_studio\nspeech:\n#  max_words: 40\n', encoding='utf-8')  # PyYAML reads speech: null
+    store = SettingsStore(path)
+    assert store.validate({'speech.max_words': 30}) == {'valid': True, 'errors': {}}
+    store.save({'speech.max_words': 30}, store.snapshot()['revision'])
+    assert 'max_words: 30' in path.read_text(encoding='utf-8')
+
+
+def test_settings_lists_the_avatar_model_above_the_animation_engine(tmp_path):
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: lm_studio\n', encoding='utf-8')  # neither section in the file, as after first setup
+    sections = [field['section'] for field in SettingsStore(path).snapshot()['fields'] if field['section'] in ('Avatar model', 'Animation engine')]
+    assert sections.index('Avatar model') < sections.index('Animation engine')
