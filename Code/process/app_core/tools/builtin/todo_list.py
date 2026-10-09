@@ -10,7 +10,7 @@ class Tool(BaseTool):
     TOOL_NAME = "todo_list"
     TOOL_DESCRIPTION = "Manage a persistent to-do list: add, remove, list, complete, and clear tasks."
 
-    # Persistent storage
+    # Persistent storage: config['data_directory'] (DataPaths.todo_list, from the registry); standalone, the cwd's folder.
     DATA_DIR = pathlib.Path("./persistent_memories/mcp_modules/todo_list")
     DATA_FILE = DATA_DIR / "tasks.json"
 
@@ -136,5 +136,8 @@ class Tool(BaseTool):
     # (Optional) Initialisation: ensure directory exists
     # ------------------------------------------------------------------
     def _setup(self):
-        """Ensure the storage directory exists on startup."""
+        """Use the configured folder, and ensure the storage directory exists on startup."""
+        if self.config.get("data_directory"):
+            self.DATA_DIR = pathlib.Path(self.config["data_directory"])
+            self.DATA_FILE = self.DATA_DIR / "tasks.json"
         self._ensure_storage()

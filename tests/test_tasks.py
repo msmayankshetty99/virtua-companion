@@ -10,6 +10,7 @@ from process.app_core.tools.mcp import stdio as mcp_stdio
 from process.app_core.tools.registry import ToolRegistry, StdioMCPClient
 from process.app_core.conversation.chat import ChatDeps, ChatService
 from process.app_core.kernel.messages import ChatMessage, ModelResponse, ToolCall
+from process.app_core.configuration.paths import DataPaths
 
 
 def test_tasks_survive_restart_and_preserve_provenance(tmp_path):
@@ -178,11 +179,11 @@ def test_unloadable_mcp_server_is_reported_to_the_desktop(tmp_path):
     from types import SimpleNamespace
     from process.app_core.desktop.state import DesktopState
     (tmp_path / 'mcp.json').write_text('{"mcpServers": {"broken": {"command": "riko-missing-mcp"}}}', encoding='utf-8')
-    config = SimpleNamespace(root=tmp_path, tools=SimpleNamespace(mcp_config=tmp_path / 'mcp.json', timeout_seconds=5, require_approval=True))
-    state = DesktopState()  # what the factory injects: the registry itself no longer reaches for the desktop singleton
-    registry = ToolRegistry.from_config(config, activity=state)
+    config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), tools=SimpleNamespace(mcp_config=tmp_path / 'mcp.json', timeout_seconds=5, require_approval=True))
+    state = DesktopState()
+    registry = ToolRegistry.from_config(config, activity=state.activity)  # what the factory injects: the desktop's ActivityLog
     try:
-        notice = state.notifications[0]
+        notice = state.snapshot()['notifications'][0]
         assert notice['source'] == 'tools' and notice['level'] == 'error' and 'broken' in notice['text'] and 'riko-missing-mcp' in notice['text']
     finally: registry.close()
 

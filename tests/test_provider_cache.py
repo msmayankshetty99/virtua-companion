@@ -187,7 +187,8 @@ def test_stock_tools_fit_default_budget_and_strict_templates_get_one_leading_sys
     from process.app_core.tools.registry import ToolRegistry
     (tmp_path / 'character_config.yaml').write_text('runtime:\n  provider: lm_studio\n', encoding='utf-8')
     config = load_config(tmp_path / 'character_config.yaml')
-    registry = ToolRegistry.from_config(config)
+    from process.app_core.desktop.tools import iter_tools as desktop_tools
+    registry = ToolRegistry.from_config(config, local_tools={'desktop': desktop_tools()})  # the stock tools, as the factory registers them
     try:
         registry.register_mcp(TaskMCP(TaskStore(tmp_path / 'tasks.sqlite3')), source='riko')
         assert len(json.dumps(registry.definitions('openai'))) > 7000  # its schemas alone exceeded the byte budget

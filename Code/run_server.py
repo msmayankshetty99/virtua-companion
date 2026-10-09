@@ -11,7 +11,7 @@ RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'f
     'discord_bot', 'uvicorn')
 # kernel/, which code imports partly inside functions (chat's metrics, the background budgets): the release check imports
 # each by name, as it loads every name of the lazy process.app_core facade. tests/test_release_build.py keeps it equal to kernel/.
-KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('audio_config', 'background_budget', 'cancellation', 'lifecycle',
+KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('audio_config', 'background_budget', 'cancellation', 'code_paths', 'lifecycle',
     'messages', 'metrics', 'output_filter', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
 # Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
 DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
@@ -114,11 +114,13 @@ def release_check(library=None):
     Resnet50_Arc_loss(); load_silero_vad()  # wake words and voice activity: both models are package data files
     previous = os.getcwd()
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as data:
-        # desktop_server loads the config on import: the defaults, in an empty data root, never a developer's files.
+        # The app over the defaults, in an empty data root, never a developer's files.
         os.environ.update(RIKO_DATA_DIR=data, RIKO_CONFIG=str(Path(data) / 'character_config.yaml'))
         os.chdir(data)
         try:
-            import desktop_server  # the FastAPI app and the whole app_core import graph
+            import desktop_server  # the FastAPI app, every router and the whole app_core import graph
+            from process.app_core.configuration.config import load_config
+            desktop_server.create_app(load_config(recover='setup'))  # builds the routes and the Backend; starts nothing
             from process.app_core.tools.builtin.scientific_calculator import Tool
             from process.app_core.tools.registry import ToolRegistry
             registry = ToolRegistry(timeout_seconds=300)  # through the real worker: --tool-worker when frozen
@@ -128,9 +130,8 @@ def release_check(library=None):
             finally: registry.close()
             if result.is_error or result.content != '1024': raise SystemExit(f'A built-in tool failed in its worker: {result.content}')
             # As DiscordLauncher starts it, but --dry-run stops before the credentials check and the login.
-            script = Path(__file__).with_name('discord_bot.py')
-            command = [sys.executable, '--discord-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(script)]
-            worker = subprocess.run([*command, '--dry-run'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
+            from process.app_core.kernel.code_paths import CodePaths
+            worker = subprocess.run([*CodePaths.current().discord_command(), '--dry-run'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
             if worker.returncode or 'RIKO_DISCORD_DRY_RUN_OK' not in worker.stdout:
                 raise SystemExit(f'The Discord worker failed its dry run (exit {worker.returncode}):\n{worker.stdout}{worker.stderr}')
         finally: os.chdir(previous)
@@ -151,8 +152,13 @@ def main():
         runpy.run_module('discord_bot', run_name='__main__')
         return
     this = sys.modules[__name__]  # uvicorn, Server and load_config resolve through __getattr__ (and tests replace them there)
-    os.chdir(Path(os.environ.get('RIKO_DATA_DIR', Path(__file__).resolve().parents[1])))
-    config = this.load_config(recover='setup')  # desktop_server's lifespan reports a broken section in setup mode
+    from process.app_core.configuration.paths import working_directory
+    data = working_directory().absolute()  # RIKO_DATA_DIR, else the checkout
+    # Explicit, and absolute, for load_config (earlier releases kept the to-do list in this cwd) and every child: tool
+    # workers, MCP servers and the task MCP server find the same data root.
+    os.environ['RIKO_DATA_DIR'] = str(data)
+    os.chdir(data)
+    config = this.load_config(recover='setup')  # the app's lifespan reports a broken section in setup mode
     from process.app_core.configuration.debug_logging import configure_logging
     configure_logging(config)
     # Debug our application, not WebSocket frames. Uvicorn DEBUG dumps every
@@ -161,6 +167,8 @@ def main():
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='backslashreplace')
     print("Riko AI server: http://127.0.0.1:8765 — Ctrl+C to stop", flush=True)
     import desktop_server
+    app = desktop_server.create_app(config)  # this config, loaded once; the lifespan builds the services once uvicorn starts
+    backend = app.state.backend
     # Hold the port before the model loads, so no other process (or account) can listen on it and
     # collect the API token Electron sends. In development this start's token is minted only now, so a
     # squatter could only have seen the previous one; packaged Electron sends its token only after the
@@ -177,10 +185,10 @@ def main():
                 raise SystemExit(f'Port 8765 is already in use ({exc}); stop the other process and try again.') from None
             time.sleep(.5)
     listener.listen(2048)
-    desktop_server.api_secrets()
+    backend.api_secrets()
     if os.environ.get('RIKO_MANAGED') == '1': print('RIKO_BACKEND_LISTENING', flush=True)  # see electron/release.cjs
-    server = this.Server(this.uvicorn.Config(desktop_server.app, host="127.0.0.1", port=8765,
-                log_level="info", timeout_graceful_shutdown=2), desktop_server.stop_turn)
+    server = this.Server(this.uvicorn.Config(app, host="127.0.0.1", port=8765,
+                log_level="info", timeout_graceful_shutdown=2), backend.stop_turn)
     if os.environ.get('RIKO_MANAGED') == '1':
         import faulthandler
         import threading

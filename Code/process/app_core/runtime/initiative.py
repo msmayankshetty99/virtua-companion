@@ -4,7 +4,6 @@ from datetime import datetime
 import json
 import math
 import os
-from pathlib import Path
 import re
 import threading
 import time
@@ -129,7 +128,7 @@ class Initiative:
     def __init__(self, session, *, adapter=None, triggers=None, start_worker=True):
         self.session = session
         self.adapter = adapter or WindowsActivity()
-        self.path = Path(session.config.root) / 'persistent_memories' / 'initiative_settings.json'
+        self.path = session.config.paths.initiative_settings
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.closed = threading.Event()

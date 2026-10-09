@@ -10,6 +10,7 @@ from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 class Speech:
@@ -21,7 +22,7 @@ class Speech:
 
 def engine(tmp_path, monkeypatch, *, adapter=None, generate=None, raw=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(root=tmp_path, raw=raw or {}, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), raw=raw or {}, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     provider = BaseProvider()
     provider.generate = generate or (lambda *args, **kwargs: ModelResponse(ChatMessage('assistant', json.dumps({'initiate': True, 'message': 'Would you like a hand?', 'urgent': False}))))
     chat = ChatService(provider, system_prompt='Riko')
@@ -72,7 +73,7 @@ def test_bubble_default_cooldown_and_settings_persistence(tmp_path, monkeypatch)
     initiative.update({'enabled': True})
     rule = initiative.settings['rules'][0]
     assert initiative.evaluate(rule, {'type': 'initiative.tick'})
-    assert initiative.session.state.speech_bubble == 'Would you like a hand?'
+    assert initiative.session.state.snapshot()['speech'] == 'Would you like a hand?'
     assert initiative.session.chat.history[-1].role == 'assistant'
     assert not initiative.session.speech.items
     assert not initiative.evaluate(rule, {'type': 'initiative.tick'})
@@ -129,7 +130,7 @@ def test_spoken_requires_permission_and_sleep_blocks_all_initiative(tmp_path, mo
     assert initiative.evaluate(rule, {})
     assert initiative.session.speech.items
     initiative.session._speech_pending = 0
-    initiative.session.state.sleep_mode = True
+    initiative.session.state.set_sleep(True)
     assert not initiative.evaluate(rule, {})
     initiative.session.close()
 

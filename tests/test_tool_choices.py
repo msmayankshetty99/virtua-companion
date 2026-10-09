@@ -38,7 +38,7 @@ def test_effect_catalog_relative_asset_is_resolved_before_exact_approval(tmp_pat
     directory = tmp_path/'effects'/'greenscreens'
     directory.mkdir(parents=True)
     asset = directory/'stars.mp4';asset.write_bytes(b'video')
-    services = DesktopServices(state, effect_library=EffectLibrary(directory, rules=[]), media_resolver=lambda value:resolve_media(tmp_path,value))
+    services = DesktopServices.of(state, effect_library=EffectLibrary(directory, rules=[]), media_resolver=lambda value:resolve_media(tmp_path,value))
     registry = ToolRegistry()
     registry.choice_resolver = ChoiceResolver()
     registry.register_local(EffectTool(services))
@@ -57,7 +57,7 @@ def test_move_avatar_uses_walk_cycle_by_default_and_preserves_explicit_teleport(
     state = DesktopState()
     walked=[]
     motion=SimpleNamespace(walk_to=lambda x,y:walked.append((x,y)) or SimpleNamespace(id='walk'),stop_movement=lambda:None)
-    tool=AvatarWindowTool(DesktopServices(state, avatar_motion=motion))
+    tool=AvatarWindowTool(DesktopServices.of(state, avatar_motion=motion))
     before=state.snapshot()['avatar_geometry']['x']
     assert 'Walk queued' in tool.execute(x=200,y=100)
     assert walked==[(200,100)] and state.snapshot()['avatar_geometry']['x']==before

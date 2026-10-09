@@ -28,7 +28,9 @@ SIGNATURE = re.compile(r'[0-9a-f]{64}')
 SECRET = re.compile(r'[A-Za-z0-9_-]{32,256}')  # what Electron and secrets.token_urlsafe produce
 
 
-def secret_path(root, name): return Path(root) / 'persistent_memories' / name
+def secret_path(root, name):
+    """A client's view of DataPaths.api_token and .confirm_key (configuration/paths.py), from the data root alone."""
+    return Path(root) / 'persistent_memories' / name
 
 
 def write_secret(path, value):
@@ -46,8 +48,9 @@ def write_secret(path, value):
         raise
 
 
-def issue_secrets(root):
-    """Fresh (token, confirmation key) for this backend start; call once the port is bound.
+def issue_secrets(paths):
+    """Fresh (token, confirmation key) for this backend start; call once the port is bound. paths: the backend's DataPaths
+    (configuration/paths.py), whose api_token and confirm_key files electron/main.cjs reads in development.
 
     Values passed by packaged Electron are used as given. Both are removed from os.environ
     so tool workers, MCP servers and other children never inherit them.
@@ -55,8 +58,8 @@ def issue_secrets(root):
     token, key = os.environ.pop('RIKO_API_TOKEN', ''), os.environ.pop('RIKO_CONFIRM_KEY', '')
     if SECRET.fullmatch(token) and SECRET.fullmatch(key) and token != key: return token, key
     token, key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-    write_secret(secret_path(root, 'api_token'), token)
-    write_secret(secret_path(root, 'confirm_key'), key)
+    write_secret(paths.api_token, token)
+    write_secret(paths.confirm_key, key)
     return token, key
 
 

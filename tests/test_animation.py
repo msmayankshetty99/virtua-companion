@@ -207,7 +207,7 @@ def test_expired_julia_result_keeps_rule_fallback(tmp_path, monkeypatch):
 
 def test_walk_clamps_and_user_hold_cancels(tmp_path):
     service, session = runtime(tmp_path)
-    session.state.displays = [{'index': 0, 'bounds': {'width': 1920, 'height': 1080}}]
+    session.state.set_displays([{'index': 0, 'primary': True, 'bounds': {'width': 1920, 'height': 1080}}])
     try:
         action = service.walk_to(10000, -50)
         assert action.payload['target']['y'] == 0

@@ -24,12 +24,18 @@ EDGES = {
     'configuration': {'kernel': 'load', 'persistence': 'load'},
     'conversation': {'emotion': 'lazy', 'kernel': 'load', 'persistence': 'load'},
     'emotion': {'kernel': 'load'},
+    # ResourceEvents computes resource.<topic> on a kernel DaemonExecutor, so a publisher's thread never runs a getter.
+    'events': {'kernel': 'load'},
+    # The HTTP layer (wave 5: create_app and one router per URL domain, formerly Code/desktop_server.py, an entry point the
+    # scan skipped) serves every feature; no package imports it.
+    'http': {'configuration': 'load', 'desktop': 'load', 'emotion': 'lazy', 'events': 'load', 'integrations': 'load', 'kernel': 'load',
+        'persistence': 'load', 'resources': 'load', 'runtime': 'load'},
     'inference': {'events': 'lazy', 'kernel': 'load'},
     'integrations': {'audio': 'load', 'desktop': 'lazy', 'events': 'load', 'kernel': 'load', 'persistence': 'load'},
     'persistence': {'emotion': 'lazy', 'events': 'lazy', 'kernel': 'load'},
     'resources': {'audio': 'lazy', 'events': 'lazy', 'inference': 'load'},
     'runtime': {'animation': 'lazy', 'audio': 'load', 'events': 'load', 'kernel': 'load', 'persistence': 'load', 'tools': 'lazy'},
-    'tools': {'desktop': 'lazy', 'events': 'load', 'kernel': 'load', 'persistence': 'load'},
+    'tools': {'events': 'load', 'kernel': 'load', 'persistence': 'load'},  # the factory registers the desktop tools
 }
 
 

@@ -21,6 +21,7 @@ from process.app_core.persistence.memory import MemoryStore
 from process.app_core.tools.approval import ToolApprovals
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 @pytest.fixture(autouse=True)
@@ -151,7 +152,7 @@ def test_a_history_save_that_fails_after_the_reply_keeps_the_finished_turn_and_t
     monkeypatch.setattr(session_module, 'SpeechQueue', FakeSpeech)
     path = tmp_path / 'chat_history.json'
     chat = ChatService(provider('A complete answer.'), system_prompt='test', history_file=path)
-    config = SimpleNamespace(raw={}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={}, root=tmp_path, paths=DataPaths.at(tmp_path), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = session_module.SessionManager(config, chat, DesktopState())
     events, real = [], os.replace
     unsubscribe = event_bus.subscribe(lambda event: events.append(event.type))

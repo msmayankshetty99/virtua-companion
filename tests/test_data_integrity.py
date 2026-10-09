@@ -22,6 +22,7 @@ from process.app_core.runtime.session import SessionManager
 from process.app_core.tools.approval import ToolApprovals
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 class FakeSpeech:
@@ -37,7 +38,7 @@ class FakeSpeech:
 def session_parts(monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', FakeSpeech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
-    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     events = []
     unsubscribe = event_bus.subscribe(lambda event: events.append(event.type))
@@ -122,7 +123,7 @@ def test_only_real_speech_failures_count_as_not_heard(session_parts):
 
 def test_muted_voice_continuation_drops_the_cut_reply_fragment(session_parts):
     session, chat, _ = session_parts
-    session.state.audio_enabled = False
+    session.state.toggle_audio()  # muted
     def respond(text, user_name, **kwargs):
         anchor = session.voice_anchor()  # the user is still talking; nothing is visible yet
         kwargs['on_delta']('Sure, the capital of')

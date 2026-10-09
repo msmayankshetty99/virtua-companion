@@ -1,8 +1,6 @@
 """User-started, managed Discord transport. Never loads a second model."""
 import os
-from pathlib import Path
 import subprocess
-import sys
 import threading
 from uuid import UUID
 import time
@@ -10,18 +8,22 @@ import time
 from .access import DiscordAccess
 from ...events.bus import event_bus
 from ...events.outbox import Outbox
+from ...kernel.code_paths import CodePaths
 
 
 class DiscordLauncher:
-    def __init__(self, root, state=None):
-        self.root = Path(root)
+    def __init__(self, paths, activity=None):
+        """paths: the backend's DataPaths (configuration/paths.py): the access file, the .env and the data root the worker shares.
+        The worker itself is code (CodePaths), never looked for under the data root. activity: the desktop's ActivityLog
+        (desktop/activity.py), which shows the client's status, notifications and allowed messages."""
+        self.paths = paths
         self.lock = threading.RLock()
-        self.token = lambda: ''  # The backend's API token accessor; desktop_server sets it.
+        self.token = lambda: ''  # The backend's API token accessor; http/backend.Backend sets it.
         self.outbox = Outbox(event_bus)  # status/notifications reach the session; never emit under self.lock
         self.process = None
         self.error = ''
-        self.access = DiscordAccess(root)
-        self.state = state
+        self.access = DiscordAccess(paths)
+        self.activity = activity
         self.client_id = None
         self.ready = False
         self.bot_name = ''
@@ -44,10 +46,10 @@ class DiscordLauncher:
     def publish(self):
         value = self.status()
         event_bus.publish('resource.discord', **value)
-        if self.state: self.state.set_discord({key: value[key] for key in ('running', 'ready', 'status', 'error', 'bot_name', 'received')})
+        if self.activity: self.activity.set_discord({key: value[key] for key in ('running', 'ready', 'status', 'error', 'bot_name', 'received')})
 
     def notify(self, text, level='info'):
-        if self.state: self.state.notify('discord', text, level)
+        if self.activity: self.activity.notify('discord', text, level)
         else: event_bus.publish('discord.notification', text=text, level=level, source='discord')
 
     def attach(self, client_id):
@@ -108,8 +110,8 @@ class DiscordLauncher:
             self.received += 1
             self.inbox = [item, *self.inbox[:255]]
         event_bus.publish('discord.message_seen', **item)
-        if allowed and self.state:
-            self.state.observe_input('discord', item['text'], message_id=message_id,
+        if allowed and self.activity:
+            self.activity.observe_input('discord', item['text'], message_id=message_id,
                 context={key: item[key] for key in ('user_id', 'channel_id', 'guild_id', 'user_name')})
 
     def configure(self, values, revision):
@@ -132,13 +134,14 @@ class DiscordLauncher:
                 except ValueError as exc: raise ValueError('Discord configuration is invalid. Check local access IDs and the backend URL.') from exc
                 if not settings.token: raise ValueError('Configure Discord_bot_token in the local .env before starting Discord')
                 if not settings.admins: raise ValueError('Configure Discord administrators in Settings → Discord or Discord_admins in the local .env')
-                script = self.root / 'Code' / 'discord_bot.py'
-                if not getattr(sys, 'frozen', False) and not script.is_file(): raise ValueError('Discord client entry point is missing')
-                command = [sys.executable, '--discord-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(script)]
+                code = CodePaths.current()
+                if not code.frozen and not code.discord_bot.is_file(): raise ValueError('Discord client entry point is missing')
                 # The worker exits when its stdin closes, i.e. when this backend exits however it exits,
-                # so a client holding a dead backend's token never outlives it.
-                env = {**os.environ, 'RIKO_API_TOKEN': self.token(), 'RIKO_DATA_DIR': str(self.root), 'RIKO_EXIT_WITH_BACKEND': '1'}
-                self.process = subprocess.Popen(command, cwd=self.root, env=env,
+                # so a client holding a dead backend's token never outlives it. It finds this backend's data root, .env and
+                # token from RIKO_CONFIG (absolute) and RIKO_DATA_DIR, whatever this process's environment held.
+                env = {**os.environ, 'RIKO_API_TOKEN': self.token(), 'RIKO_DATA_DIR': str(self.paths.root),
+                    'RIKO_CONFIG': str(self.paths.config_file), 'RIKO_EXIT_WITH_BACKEND': '1'}
+                self.process = subprocess.Popen(code.discord_command(), cwd=self.paths.root, env=env,
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 self.error = ''

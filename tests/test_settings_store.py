@@ -251,7 +251,7 @@ def test_concurrent_same_name_tool_results_update_the_correct_activity():
     first=state.tool_started('lookup', {'id':'first'})
     second=state.tool_started('lookup', {'id':'second'})
     state.tool_finished('lookup','first result',activity_id=first)
-    activities={item['id']:item for item in state.tool_activity}
+    activities={item['id']:item for item in state.snapshot()['tools']}
     assert activities[first]['status']=='complete'
     assert activities[second]['status']=='running'
     assert activities[first]['duration_ms']>=0

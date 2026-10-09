@@ -21,6 +21,7 @@ from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 DISCORD = {'source': 'discord', 'conversation_id': 'discord:client:dm:1', 'user_id': '1', 'channel_id': '1', 'message_id': 'd1'}
 
@@ -37,7 +38,7 @@ class Speech:
 def parts(monkeypatch, tmp_path):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), calls=[], provider=BaseProvider())
-    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, paths=DataPaths.at(tmp_path), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     events = []
     unsubscribe = event_bus.subscribe(events.append)
@@ -160,7 +161,7 @@ def test_a_continuation_transcribed_after_the_reply_finished_is_a_new_turn(parts
 
 def test_speech_during_a_redone_reply_never_rewrites_an_older_user_message(parts):
     session, chat, events = parts
-    session.state.audio_enabled = False  # muted: the cut keeps the text the user read
+    session.state.toggle_audio()  # muted: the cut keeps the text the user read
     voice = voice_for(session, ['Wait, Tuesday', 'and bring snacks'])
     def first(text, user_name, **kwargs):
         kwargs['on_delta']('Monday works. ')
@@ -298,7 +299,7 @@ def test_a_queued_voice_turn_waits_for_a_running_turn_and_stops_waiting_on_close
 
 def test_a_redo_queued_behind_another_turn_answers_the_words_as_a_new_turn(parts):
     session, chat, events = parts
-    session.state.audio_enabled = False
+    session.state.toggle_audio()  # muted
     voice = voice_for(session, ['Wait, Tuesday'])
     def first(text, user_name, **kwargs):
         kwargs['on_delta']('Monday works. ')
@@ -386,7 +387,7 @@ def test_sustained_speech_after_stop_cuts_nothing_and_starts_a_turn_of_its_own(p
 @pytest.mark.parametrize('animation', [False, None, 'off'])
 def test_an_animation_setting_that_is_not_a_section_disables_animation_without_failing_the_session(monkeypatch, tmp_path, animation):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={'animation': animation}, root=tmp_path, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={'animation': animation}, root=tmp_path, paths=DataPaths.at(tmp_path), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider()), DesktopState())
     try: assert session.animation is None and (session.animation_error == '' if animation is False else 'must be a mapping' in session.animation_error)
     finally: session.close()

@@ -256,7 +256,7 @@ def test_bot_import_and_command_registration_do_not_construct_models(tmp_path):
     from process.app_core.integrations.discord.bot import CompanionBot
     from process.app_core.integrations.discord.commands import CompanionCommands
     async def run():
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})))
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json')
         await bot.add_cog(CompanionCommands(bot))
         names = {command.name for command in bot.tree.get_commands()}
         assert {'chat','speak','transcribe','join','leave','listen','stop','settings','messages','tool_policy','camera','tasks','initiative','whiteboard','resources','animation','memory','memories','history','edit','task_create','task_update','status','reasoning'} <= names
@@ -275,7 +275,7 @@ def test_stop_is_scoped_to_user_and_turn_and_retains_other_queued_jobs(tmp_path)
             def __init__(self, *args): pass
             async def request(self, method, path, **kwargs): calls.append((path, kwargs['body']))
             async def close(self): pass
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         channel = SimpleNamespace(id=42)
         active = Job(channel, SimpleNamespace(id=1))
         active.task = asyncio.create_task(asyncio.Event().wait())
@@ -305,7 +305,7 @@ def test_approval_snapshots_do_not_relay_unrelated_desktop_turns(tmp_path):
             sent.append(content)
             return SimpleNamespace(edit=edit)
         async def edit(**kwargs): pass
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         job = Job(SimpleNamespace(id=42, send=send), SimpleNamespace(id=1))
         bot.active = job
         unrelated = {'id':'desktop', 'name':'tool', 'arguments':{}, 'turn_id':'desktop-turn', 'expires_at':time.time()+120}
@@ -329,7 +329,7 @@ def test_audio_attachments_are_rejected_before_download_and_pcm_cannot_bypass_pa
             def __init__(self, *args): self.ready = asyncio.Event(); self.ready.set()
             async def close(self): pass
         async def read(): raise AssertionError('Paused audio must never be downloaded')
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         channel, user = SimpleNamespace(id=42), SimpleNamespace(id=1)
         with pytest.raises(ValueError, match='paused'):
             await bot.process_job(Job(channel, user, attachment=SimpleNamespace(size=4, filename='recording.wav', read=read)))
@@ -371,7 +371,7 @@ def test_paused_calling_cannot_load_voice_dependencies_and_text_chat_still_works
             return SimpleNamespace(edit=None)
         user = SimpleNamespace(id=1, display_name='Owner')
         channel = SimpleNamespace(id=42, guild=None, send=send)
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         monkeypatch.setattr('process.app_core.integrations.discord.bot.receive_extension', lambda: (_ for _ in ()).throw(AssertionError('Voice dependency loaded')))
         bot.preferences.set(42, 'audio', True) # Old preference cannot re-enable attachments.
         assert bot.voice_for(channel) is None
@@ -395,7 +395,7 @@ def test_whiteboard_changes_send_images_without_polling_or_audio(tmp_path):
                 return b'PNG'
             async def close(self): pass
         async def send(content=None, **kwargs): sent.append(kwargs['file'].filename)
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         bot.board_target = SimpleNamespace(id=42, guild=None, send=send)
         await bot.backend_event({'type':'whiteboard.changed','payload':{'revision':'a'}})
         worker = bot.board_update
@@ -429,7 +429,7 @@ def test_discord_transport_errors_never_end_the_turn_queue(tmp_path):
         async def deliver(content=None, **kwargs): sent.append(content); return SimpleNamespace(content=content)
         offline, online = SimpleNamespace(id=42, guild=None, send=drop), SimpleNamespace(id=42, guild=None, send=deliver)
         user = SimpleNamespace(id=1, display_name='Owner')
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         bot.processor = asyncio.create_task(bot.process_queue())
         for channel, text in ((offline, 'lost'), (online, 'busy'), (online, 'hello')): bot.queue.put_nowait(Job(channel, user, text))
         await asyncio.wait_for(bot.queue.join(), 10) # The bound only catches a dead queue; a passing run returns at once.
@@ -453,7 +453,7 @@ def test_turn_queue_restarts_after_an_unexpected_failure_and_stops_only_when_can
             async def close(self): pass
         async def deliver(content=None, **kwargs): sent.append(content); return SimpleNamespace(content=content)
         channel, user = SimpleNamespace(id=42, guild=None, send=deliver), SimpleNamespace(id=1, display_name='Owner')
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         finish_job = bot.finish_job
         async def bug(job): bot.finish_job = finish_job; raise RuntimeError('unexpected bug')
         bot.finish_job = bug

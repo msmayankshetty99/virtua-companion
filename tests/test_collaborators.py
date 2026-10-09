@@ -18,6 +18,7 @@ from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.actions import ActionController
 from process.app_core.runtime.session import SessionManager
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 class ProbeProvider(BaseProvider):
@@ -34,8 +35,8 @@ def build(root, monkeypatch, closed, **emotion):
     seen = {}
     provider = ProbeProvider(close=lambda: closed.append(('provider', root.name)))
     monkeypatch.setattr(factory, 'create_provider', lambda runtime: provider)
-    def registry(config, activity=None, desktop=None):
-        seen['desktop'] = desktop
+    def registry(config, activity=None, local_tools=None):
+        seen['local_tools'], seen['activity'] = local_tools, activity
         stub = SimpleNamespace(register_mcp=lambda client, **keys: None, choice_resolver=None)
         stub.close = lambda: (stub.choice_resolver.close(), closed.append(('registry', root.name)))
         return stub
@@ -43,9 +44,10 @@ def build(root, monkeypatch, closed, **emotion):
     monkeypatch.setattr(factory, 'MemoryStore', lambda *args, **kwargs: seen.setdefault('memory', kwargs) and SimpleNamespace(close=lambda: closed.append(('memory', root.name))))
     config = AppConfig(root=root)
     config.runtime.warmup = False
-    config.memory.history_file = root / 'persistent_memories' / 'chat_history.json'  # never the cwd's (user data)
+    assert config.paths.chat_history == config.memory.history_file == root / 'persistent_memories' / 'chat_history.json'  # never the cwd's (user data)
     for key, value in emotion.items(): setattr(config.emotion, key, value)
-    return factory.create_chat_service(config), provider, seen
+    seen['state'] = factory.create_desktop_state(config.paths)  # as desktop_server builds it and hands it over
+    return factory.create_chat_service(config, desktop_state=seen['state']), provider, seen
 
 
 def test_the_factory_passes_collaborators_explicitly_and_close_owns_them(tmp_path, monkeypatch):
@@ -56,7 +58,14 @@ def test_the_factory_passes_collaborators_explicitly_and_close_owns_them(tmp_pat
     second, _, _ = build(second_root, monkeypatch, closed)
     try:
         deps = first.deps
-        assert seen['desktop'] is deps.desktop and deps.desktop.state is get_desktop_state() and deps.desktop.actions is deps.action_controller
+        state = seen['state']  # the tools change the state the server serves, through its components, never the module's
+        # The factory registers the desktop tools (tools/ never imports desktop/), each acting through this service's DesktopServices.
+        assert list(seen['local_tools']) == ['desktop'] and {type(tool).__name__ for tool in seen['local_tools']['desktop']} == {
+            'WhiteboardTool', 'AvatarWindowTool', 'WhiteboardWindowTool', 'EffectTool', 'AvatarGestureTool'}
+        assert all(tool.services is deps.desktop for tool in seen['local_tools']['desktop'])
+        assert deps.desktop.actions is deps.action_controller and seen['activity'] is state.activity
+        assert (deps.desktop.board, deps.desktop.geometry, deps.desktop.effects) == (state.board, state.geometry, state.effects)
+        assert deps.desktop.board is not get_desktop_state().board
         assert isinstance(deps.action_controller, ActionController) and isinstance(deps.cleanup, ExitStack)
         assert deps.initiative_provider is provider and deps.task_mcp.store is deps.task_store  # provider.lanes: one lane without slots
         assert seen['memory']['reflection_provider'] is provider and seen['memory']['parallelism'] == 1 and seen['memory']['token_counter'] == provider.count_text_tokens
@@ -113,7 +122,7 @@ def test_a_turn_reaches_chat_service_as_a_turn_context(monkeypatch):
     worker = SimpleNamespace(submit=lambda kind, *args, **kwargs: submitted.append(kind), generation=lambda *args, **kwargs: None,
         invalidate=lambda: None, transcript=lambda *args: None, close=lambda: None)
     chat = ChatService(provider, system_prompt='Riko', memory_store=memory, deps=ChatDeps(emotion_worker=worker))
-    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko',
+    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko',
         tools=SimpleNamespace(max_iterations=8), runtime=SimpleNamespace(pause_background_on_live=True), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     origin = {'source': 'discord', 'conversation_id': 'discord:client:dm:1', 'user_id': '1', 'channel_id': '1', 'message_id': 'd1'}
@@ -139,7 +148,7 @@ def test_close_owns_the_factory_stack_or_what_the_chat_was_built_with(monkeypatc
     built.close()
     assert calls[1:] == ['memory', 'registry', 'provider']
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     injected = ActionController()
     session = SessionManager(config, ChatService(BaseProvider(), system_prompt=''), DesktopState(), injected)
     own = SessionManager(config, ChatService(BaseProvider(), system_prompt=''), DesktopState())
@@ -150,9 +159,9 @@ def test_close_owns_the_factory_stack_or_what_the_chat_was_built_with(monkeypatc
 
 
 def test_desktop_tools_act_through_the_services_they_are_given(tmp_path):
-    services = DesktopServices(DesktopState(), media_resolver=lambda path: tmp_path / path)
+    services = DesktopServices.of(DesktopState(), media_resolver=lambda path: tmp_path / path)
     tools = iter_tools(services)
-    assert all(tool.services is services and tool.state is services.state for tool in tools)
-    bare = EffectTool()  # no services: the shared state, and nothing to resolve media with
-    assert bare.state is get_desktop_state() and bare.services.media_resolver is None
+    assert all(tool.services is services for tool in tools)
+    bare = EffectTool()  # no services: the transitional shared state's components, and nothing to resolve media with
+    assert bare.services.effects is get_desktop_state().effects and bare.services.media_resolver is None
     with pytest.raises(RuntimeError, match='Media resolver unavailable'): bare.execute(action='play', name='rain.mp4')

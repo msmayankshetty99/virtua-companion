@@ -1,11 +1,13 @@
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 import pytest
 from process.app_core.integrations.discord import launcher
+from process.app_core.configuration.paths import DataPaths
 
 
 def test_launcher_is_explicit_idempotent_and_uses_only_the_transport(tmp_path, monkeypatch):
-    (tmp_path / 'Code').mkdir()
-    (tmp_path / 'Code' / 'discord_bot.py').write_text('# test stub')
+    # The data root is outside the checkout and holds no Code/: the worker is code, found where this code is (V106).
     monkeypatch.setattr(launcher.os, 'environ', {'Discord_bot_token': 'fake-token', 'Discord_admins': '1'})
     monkeypatch.setattr('dotenv.dotenv_values', lambda path: {})
     monkeypatch.setattr(launcher.threading, 'Thread', lambda **kwargs: SimpleNamespace(start=lambda: None))
@@ -17,20 +19,24 @@ def test_launcher_is_explicit_idempotent_and_uses_only_the_transport(tmp_path, m
         def wait(self, timeout=None): return self.code
     process = Process()
     monkeypatch.setattr(launcher.subprocess, 'Popen', lambda command, **kwargs: calls.append((command, kwargs)) or process)
-    service = launcher.DiscordLauncher(tmp_path)
+    paths = DataPaths.at(tmp_path / 'data')
+    service = launcher.DiscordLauncher(paths)
     service.token = lambda: 'x' * 43  # desktop_server hands the launcher this backend start's token
     assert not service.status()['running']
     assert calls == []
     assert service.start()['running']
     assert service.start()['running']
     assert len(calls) == 1
-    assert calls[0][0] == [launcher.sys.executable, str(tmp_path / 'Code' / 'discord_bot.py')]
+    script = Path(launcher.__file__).resolve().parents[4] / 'discord_bot.py'
+    assert calls[0][0] == [sys.executable, str(script)] and script.is_file() and not script.is_relative_to(tmp_path)
     assert 'fake-token' not in str(calls[0][0])  # credentials never on the command line
-    # The child inherits the environment as before, plus only the backend API token, data root and exit rule.
+    # The child inherits the environment as before, plus only the backend API token, data root, config and exit rule: it
+    # loads this backend's .env and access file whatever RIKO_DATA_DIR and RIKO_CONFIG held here.
     env = calls[0][1]['env']
-    assert set(env) - set(launcher.os.environ) == {'RIKO_API_TOKEN', 'RIKO_DATA_DIR', 'RIKO_EXIT_WITH_BACKEND'}
+    assert set(env) - set(launcher.os.environ) == {'RIKO_API_TOKEN', 'RIKO_DATA_DIR', 'RIKO_CONFIG', 'RIKO_EXIT_WITH_BACKEND'}
     assert calls[0][1]['stdin'] == launcher.subprocess.PIPE  # closes when this backend exits
-    assert env['RIKO_API_TOKEN'] == 'x' * 43 and env['RIKO_DATA_DIR'] == str(tmp_path)
+    assert env['RIKO_API_TOKEN'] == 'x' * 43 and env['RIKO_DATA_DIR'] == str(paths.root) == str(calls[0][1]['cwd'])
+    assert env['RIKO_CONFIG'] == str(tmp_path / 'data' / 'character_config.yaml')
     assert not calls[0][1].get('shell')
     service.stop()
     assert process.code == 0
@@ -41,7 +47,7 @@ def test_launcher_configuration_failures_never_spawn_or_expose_values(tmp_path, 
     monkeypatch.setattr('dotenv.dotenv_values', lambda path: {})
     monkeypatch.setattr(launcher.subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('Unexpected process launch'))
     monkeypatch.setattr(launcher.os, 'environ', {})
-    service = launcher.DiscordLauncher(tmp_path)
+    service = launcher.DiscordLauncher(DataPaths.at(tmp_path))
     with pytest.raises(ValueError, match='Discord_bot_token'): service.start()
     monkeypatch.setattr(launcher.os, 'environ', {'Discord_bot_token': 'private-test-token', 'Discord_admins': 'invalid-private-id'})
     with pytest.raises(ValueError, match='configuration is invalid'): service.start()
@@ -49,7 +55,7 @@ def test_launcher_configuration_failures_never_spawn_or_expose_values(tmp_path, 
 
 
 def test_launcher_reports_exit_without_exposing_child_output(tmp_path):
-    service = launcher.DiscordLauncher(tmp_path)
+    service = launcher.DiscordLauncher(DataPaths.at(tmp_path))
     process = SimpleNamespace(wait=lambda: 1)
     service.process = process
     service._watch(process)

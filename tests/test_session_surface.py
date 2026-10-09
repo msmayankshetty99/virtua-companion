@@ -21,6 +21,7 @@ from process.app_core.conversation.chat import ChatDeps
 from process.app_core.conversation.history import ConversationHistory
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import RuntimeEvent, event_bus
+from process.app_core.http.chat import BUSY
 from process.app_core.integrations.discord import api as discord_api
 from process.app_core.kernel.cancellation import TurnBusy, TurnCancelled
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
@@ -30,7 +31,8 @@ from process.app_core.runtime.initiative import Initiative
 from process.app_core.runtime.session import SessionManager
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import audio_sections
-from test_desktop_api import backend, client_for  # noqa: F401 (backend is a fixture)
+from process.app_core.configuration.paths import DataPaths
+from conftest import client_for  # the backend fixture comes from conftest.py
 from test_private_access import CODE, private_access
 
 REFUSED = 'Stop the current reply before calibration or testing'
@@ -48,7 +50,7 @@ class Speech:
 def session(monkeypatch, tmp_path):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
-    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, character_name='Riko',
+    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=tmp_path, paths=DataPaths.at(tmp_path), character_name='Riko',
         tools=SimpleNamespace(max_iterations=8), runtime=SimpleNamespace(startup_timeout_seconds=5), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     try: yield session
@@ -99,7 +101,7 @@ def test_the_turn_gate_waits_only_when_asked_and_gives_up_when_the_waiter_does()
 
 
 def test_every_route_answers_turn_busy_with_409_and_only_the_type_counts(backend, monkeypatch, session):
-    monkeypatch.setattr(backend, 'session', session)
+    backend.session = session
     client = client_for(backend, raise_server_exceptions=False)
     router = FastAPI(); router.include_router(discord_api.create_router(lambda: session))
     remote = TestClient(router, raise_server_exceptions=False)
@@ -112,7 +114,7 @@ def test_every_route_answers_turn_busy_with_409_and_only_the_type_counts(backend
             assert remote.post('/api/discord/chat', json=message).status_code == 409
             socket.send_json({'text': 'hello'})
             assert socket.receive_json() == {'type': 'chat.started'}
-            assert socket.receive_json() == {'type': 'chat.busy', 'payload': {'status': 409, 'detail': backend.BUSY}}
+            assert socket.receive_json() == {'type': 'chat.busy', 'payload': {'status': 409, 'detail': BUSY}}
         finally: session._turns.end()
         socket.send_json({'text': 'hello'})  # the socket stays open for the next message
         assert socket.receive_json() == {'type': 'chat.started'}
@@ -131,7 +133,7 @@ def test_every_busy_and_idle_reader_agrees_through_one_runtime_status(backend, m
     animation = AnimationRuntime(session, start=False)
     feedback = []
     monkeypatch.setattr(session.wake_feedback, 'trigger', lambda emotion, model_state, **kwargs: feedback.append(model_state))
-    monkeypatch.setattr(backend, 'session', session)
+    backend.session = session
     client = client_for(backend)
     def verdicts():
         feedback.clear()
@@ -161,7 +163,7 @@ def test_every_busy_and_idle_reader_agrees_through_one_runtime_status(backend, m
         assert verdicts() == {'quiet': True, 'background': False, 'presented': False, 'anchor': False,
             'calibration_refused': False, 'avatar': 'idle', 'wake_feedback': ['idle']}
         session.wake.calibrating = False
-        session.state.sleep_mode = True
+        session.state.set_sleep(True)
         assert verdicts() == {'quiet': True, 'background': False, 'presented': False, 'anchor': False,
             'calibration_refused': False, 'avatar': 'sleeping', 'wake_feedback': ['sleeping']}
     finally:

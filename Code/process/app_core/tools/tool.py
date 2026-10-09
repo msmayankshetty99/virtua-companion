@@ -16,7 +16,7 @@ class ToolCancelled(RuntimeError): pass
 
 
 class ToolActivity:
-    """What ToolRegistry reports while tools run and load; DesktopState implements it for the UI. This one records nothing."""
+    """What ToolRegistry reports while tools run and load; desktop/activity.ActivityLog implements it for the UI. This one records nothing."""
     def tool_started(self, name, arguments): return None  # an id tool_finished receives back
     def tool_finished(self, name, result, error=False, activity_id=None): pass
     def notify(self, source, text, level='info'): pass

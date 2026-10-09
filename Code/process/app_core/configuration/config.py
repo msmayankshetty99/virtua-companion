@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import os
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from ..kernel.audio_config import SovitsConfig, SpeechConfig, VoiceConfig
 from ..kernel.background_budget import validate_budget
+from ..kernel.code_paths import CodePaths
 from . import schema
+from .paths import DataPaths, resolve
 
 try:
     import yaml
@@ -81,6 +83,7 @@ class ToolConfig:
 
 @dataclass
 class MemoryConfig:
+    # The three files are AppConfig.paths' chat_history, memory_store and memory_index once in an AppConfig (__post_init__).
     history_file: Path = Path("persistent_memories/chat_history.json")
     context_window_tokens: int = 8192
     store_file: Path = Path("persistent_memories/memory_store.json")
@@ -135,13 +138,14 @@ class AppConfig:
     system_prompt: str = "You are a helpful local assistant."
     raw: dict[str, Any] = field(default_factory=dict)
     avatar: dict[str, Any] = field(default_factory=dict)
+    paths: DataPaths | None = None  # every data location (configuration/paths.py); load_config builds it from the YAML
 
-
-def _path(root: Path, value: str | Path | None) -> Path | None:
-    if value is None:
-        return None
-    path = Path(value).expanduser()
-    return path if path.is_absolute() else root / path
+    def __post_init__(self):
+        if self.paths is None:  # built directly (tests, tools): the default layout under root, with the memory section's files
+            files = {'history_file': self.memory.history_file, 'store_file': self.memory.store_file, 'index_file': self.memory.index_file}
+            self.paths = DataPaths.build(Path(self.root) / 'character_config.yaml', {'memory': files})
+        # One location per store: the memory section's files are the paths' (relative defaults would follow the cwd).
+        self.memory = replace(self.memory, history_file=self.paths.chat_history, store_file=self.paths.memory_store, index_file=self.paths.memory_index)
 
 
 def load_config(path: str | Path | None = None, *, recover: bool | str = False) -> AppConfig:
@@ -156,6 +160,9 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
             raise RuntimeError("PyYAML is required to load character_config.yaml")
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     root = config_path.parent
+    # Every data location, once. RIKO_DATA_DIR: the backend's working directory (run_server sets it), where earlier
+    # releases kept the to-do list.
+    paths = DataPaths.build(config_path, raw, working=os.getenv('RIKO_DATA_DIR'))
     # Every registered section's check (configuration/schema.py): voice, speech and sovits_ping_config become AppConfig's
     # typed sections, checked now instead of at every turn or frame; animation, wake_feedback, emotion.probe, initiative,
     # memory and tools are checked here too.
@@ -167,15 +174,15 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
     library = runtime_raw.get('native_library')
     if isinstance(library, str) and library.startswith('bundled:'):
         from .native_backends import bundled_library  # electron/native_backends.json: shipped backends, library names
-        library = bundled_library(library.split(':', 1)[1], os.getenv('RIKO_BUNDLE_ROOT'))
+        library = bundled_library(library.split(':', 1)[1], CodePaths.current().bundle)
     runtime = RuntimeConfig(
         provider=runtime_raw.get("provider", "openai"),
         model=runtime_raw.get("model", raw.get("model", "")),
         base_url=runtime_raw.get("base_url", raw.get("base_url", "http://127.0.0.1:8080"
             if str(runtime_raw.get("provider", "")).lower().replace("-", "_") == "llama_server" else "http://localhost:1234/v1")),
         api_key=runtime_raw.get("api_key", raw.get("api_key", os.getenv("RIKO_API_KEY", "local"))),
-        model_path=_path(root, runtime_raw.get("model_path")),
-        native_library=_path(root, library),
+        model_path=resolve(root, runtime_raw.get("model_path")),
+        native_library=resolve(root, library),
         tokenizer_model=runtime_raw.get("tokenizer_model", raw.get("tokenizer_model")),
         n_ctx=int(runtime_raw.get("n_ctx", params.get("context_window_token_limit", 8192))),
         n_gpu_layers=int(runtime_raw.get("n_gpu_layers", -1)),
@@ -198,7 +205,7 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
     # Live initiative preferences survive restart and override YAML defaults.
     import json
     try:
-        persisted = json.loads((root / 'persistent_memories' / 'initiative_settings.json').read_text(encoding='utf-8'))
+        persisted = json.loads(paths.initiative_settings.read_text(encoding='utf-8'))
         persisted_context = persisted.get('context_window_tokens', initiative_raw['context_window_tokens'])
         persisted_output = persisted.get('max_output_tokens', initiative_raw['max_output_tokens'])
         validate_budget(persisted_context, persisted_output, 'initiative')
@@ -213,10 +220,11 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
     legacy_prompt = params.get('context_window_token_limit', live_prompt)
     config = AppConfig(
         root=root,
+        paths=paths,
         load_errors=tuple(errors or ()),
         runtime=runtime,
         tools=ToolConfig(
-            mcp_config=_path(root, tools_raw.get("mcp_config")),
+            mcp_config=resolve(root, tools_raw.get("mcp_config")),
             max_iterations=int(tools_raw.get("max_iterations", 8)),
             timeout_seconds=float(tools_raw.get("timeout_seconds", 30)),
             require_approval=bool(tools_raw.get("require_approval", False)),
@@ -225,10 +233,9 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
             best_fit_min_confidence=float(tools_raw.get('best_fit_min_confidence', .85)),
         ),
         memory=MemoryConfig(
-            history_file=_path(root, raw.get("history_file", memory_raw.get("history_file", "persistent_memories/chat_history.json"))) or root / "persistent_memories/chat_history.json",
+            history_file=paths.chat_history,
             context_window_tokens=int(memory_raw.get("context_window_tokens", min(legacy_prompt, live_prompt) if native else legacy_prompt)),
-            store_file=_path(root, memory_raw.get("store_file", "persistent_memories/memory_store.json")) or root / "persistent_memories/memory_store.json",
-            index_file=_path(root, memory_raw.get("index_file", "persistent_memories/faiss_index.index")) or root / "persistent_memories/faiss_index.index",
+            store_file=paths.memory_store, index_file=paths.memory_index,
             embedding_model=str(memory_raw.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")),
             embedding_dimension=int(memory_raw.get("embedding_dimension", 384)),
             max_results=int(memory_raw.get("max_results", 8)),
@@ -240,7 +247,7 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
             embeddings_enabled=bool(memory_raw.get("embeddings_enabled", True)),
             system1_enabled=bool(memory_raw.get("system1_enabled", True)),
             system1_model_id=str(memory_raw.get("system1_model_id", "SupersonicLabs/Julia-1")),
-            system1_cache_dir=_path(root, memory_raw.get("system1_cache_dir")),
+            system1_cache_dir=resolve(root, memory_raw.get("system1_cache_dir")),
             system1_max_length=int(memory_raw.get("system1_max_length", 8192)),
             device=str(memory_raw.get("device", "cpu")),
             minimum_importance=float(memory_raw.get("minimum_importance", 0.35)),
@@ -248,9 +255,9 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
         ),
         emotion=EmotionConfig(
             enabled=bool(emotion_raw.get("enabled", False)),
-            model_path=_path(root, emotion_raw.get("model_path")),
+            model_path=resolve(root, emotion_raw.get("model_path")),
             model_id=str(emotion_raw.get("model_id", "SupersonicLabs/Julia-1")),
-            cache_dir=_path(root, emotion_raw.get("cache_dir")),
+            cache_dir=resolve(root, emotion_raw.get("cache_dir")),
             device=str(emotion_raw.get("device", "cpu")),
             strict_encoding=bool(emotion_raw.get("strict_encoding", True)),
             max_length=int(emotion_raw.get("max_length", 8192)),

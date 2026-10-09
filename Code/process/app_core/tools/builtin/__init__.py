@@ -4,10 +4,11 @@ imports only that tool's module, so this package imports none of them (or pypdf)
 from .base import BaseTool
 
 
-def iter_tools():
+def iter_tools(todo_directory=None):
+    """todo_directory: where todo_list keeps its list (DataPaths.todo_list); its worker receives it in the tool's config."""
     from .todo_list import Tool as TodoListTool
     from .scientific_calculator import Tool as ScientificCalculatorTool
-    tools = [TodoListTool({}, {}), ScientificCalculatorTool({}, {})]
+    tools = [TodoListTool({'data_directory': str(todo_directory)} if todo_directory else {}, {}), ScientificCalculatorTool({}, {})]
     try:
         from .pdf_processor import Tool as PdfExtractorTool
     except ImportError:

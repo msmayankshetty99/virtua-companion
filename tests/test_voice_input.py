@@ -11,12 +11,13 @@ from process.app_core.audio.voice_segments import Segment
 from process.app_core.audio.wake_word import WakeWord
 from process.app_core.kernel.turns import RuntimeStatus
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 def test_capture_only_queues_post_keyword_request_for_asr(tmp_path, monkeypatch):
     now = [9.9]
     monkeypatch.setattr('process.app_core.audio.wake_word.time.monotonic', lambda: now[0])
-    config = SimpleNamespace(root=tmp_path, character_name='Riko', raw={'voice': {}}, **audio_sections({}))
+    config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), character_name='Riko', raw={'voice': {}}, **audio_sections({}))
     wake = WakeWord(config)
     keyword, activation, request, silence = (bytes([marker, 0]) * 512 for marker in (1, 2, 3, 0))
     monkeypatch.setattr(wake, 'feed', lambda frame, speaking: wake.activate(after_keyword=True) if frame == activation else None)
@@ -78,7 +79,7 @@ class NoRaw(dict):
 
 @pytest.mark.parametrize('threshold, heard', [(.5, True), (.75, False)])
 def test_each_frame_compares_speech_probability_with_the_typed_vad_threshold(tmp_path, monkeypatch, threshold, heard):
-    config = SimpleNamespace(root=tmp_path, character_name='Riko', raw=NoRaw(), **audio_sections({'voice': {'mode': 'continuous', 'vad_threshold': threshold}}))
+    config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), character_name='Riko', raw=NoRaw(), **audio_sections({'voice': {'mode': 'continuous', 'vad_threshold': threshold}}))
     wake = WakeWord(config)
     class VAD:
         def __call__(self, samples, rate): return .6 if samples[0] else 0.0

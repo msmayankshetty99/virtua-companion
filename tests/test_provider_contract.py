@@ -20,7 +20,8 @@ from process.app_core.inference.provider import BaseProvider, InferenceProvider,
 from process.app_core.kernel.cancellation import BackgroundPreempted
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.kernel.audio_config import audio_sections
-from test_desktop_api import backend, client_for  # noqa: F401 (backend is a fixture)
+from process.app_core.configuration.paths import DataPaths
+from conftest import client_for  # the backend fixture comes from conftest.py
 from test_llama_native import fake_runtime
 from test_private_access import CODE
 
@@ -103,7 +104,7 @@ def test_the_session_drives_the_provider_through_its_declared_members(monkeypatc
         def set_foreground(self, active): calls.append(('foreground', active))
         def cancel(self): calls.append('cancel')
     provider = Recorder()
-    config = SimpleNamespace(raw={'animation': False}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={'animation': False}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, ChatService(provider, system_prompt='Riko'), DesktopState())
     try:
         assert provider.expression_idle() is True  # the session's quiet check, declared rather than assigned
@@ -236,7 +237,7 @@ def test_neural_status_reports_why_the_probe_did_not_start(backend, monkeypatch,
         probe, probe_error, replay_lane = None, 'The emotion probe did not start: torch is missing', object()
         @property
         def probe_host(self): return self
-    monkeypatch.setattr(backend, 'chat', SimpleNamespace(provider=Host()))
+    backend.chat = SimpleNamespace(provider=Host())
     client = client_for(backend)
     status = client.get('/api/neural/status').json()
     assert status['available'] is False and status['probe_error'] == Host.probe_error and 'torch is missing. Chat works without it' in status['note']

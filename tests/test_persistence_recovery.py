@@ -71,13 +71,14 @@ def test_board_content_pages_bounds_and_geometry_survive_restart(tmp_path):
     board.surface_result('whiteboard',command,'rendered',bounds={'x':40,'y':40,'width':436,'height':240})
     board.update_geometry('whiteboard',width=1000)
     restored=DesktopState();restored.configure_board_store(path)
-    assert restored.whiteboard_page=='page-2'
-    assert restored.whiteboard[0].bounds['height']==240
-    assert restored.whiteboard[0].status=='queued' # Renderer must confirm again.
-    assert restored.whiteboard_geometry['width']==1000
+    saved=restored.snapshot()
+    assert saved['whiteboard_page']=='page-2'
+    assert saved['whiteboard'][0]['bounds']['height']==240
+    assert saved['whiteboard'][0]['status']=='queued' # Renderer must confirm again.
+    assert saved['whiteboard_geometry']['width']==1000
     restored.clear_whiteboard()
     third=DesktopState();third.configure_board_store(path)
-    assert third.whiteboard==[]
+    assert third.snapshot()['whiteboard']==[]
 
 
 def test_corrupt_board_preserved_and_recovery_file_resumes(tmp_path):
@@ -86,7 +87,7 @@ def test_corrupt_board_preserved_and_recovery_file_resumes(tmp_path):
     board.add_whiteboard('text',{'text':'Recovered board'})
     assert path.read_text()=='damaged'
     restored=DesktopState();restored.configure_board_store(path)
-    assert restored.whiteboard[0].payload['text']=='Recovered board'
+    assert restored.snapshot()['whiteboard'][0]['payload']['text']=='Recovered board'
 
 
 def test_daemon_worker_shutdown_cancels_queued_jobs():
@@ -132,12 +133,10 @@ def test_factory_rolls_back_resources_after_partial_construction_failure(tmp_pat
     closed=[]
     provider=BaseProvider();provider.close=lambda:closed.append('provider')
     monkeypatch.setattr(factory,'create_provider',lambda config:provider)
-    monkeypatch.setattr(factory.ToolRegistry,'from_config',lambda config, activity=None, desktop=None:SimpleNamespace(
+    monkeypatch.setattr(factory.ToolRegistry,'from_config',lambda config, activity=None, local_tools=None:SimpleNamespace(
         register_mcp=lambda client,**keys:None, close=lambda:closed.append('registry')))
     def fail(*args,**kwargs): raise RuntimeError('memory failure')
     monkeypatch.setattr(factory,'MemoryStore',fail)
-    # The shared desktop state the factory hands the desktop tools (through DesktopServices) and the emotion bridge.
-    state=SimpleNamespace();monkeypatch.setattr(factory,'get_desktop_state',lambda:state)
     config=AppConfig(root=tmp_path)
     with pytest.raises(RuntimeError,match='memory failure'): factory.create_chat_service(config)
     assert closed==['registry','provider']

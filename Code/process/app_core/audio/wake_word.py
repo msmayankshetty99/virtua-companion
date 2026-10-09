@@ -32,7 +32,7 @@ class WakeWord:
         # voice.wake_threshold starts each new enrollment; an enrolled profile keeps the threshold saved with it (bind_device).
         self.threshold = self.config_threshold = voice.wake_threshold
         self.followup = voice.follow_up_seconds
-        self.directory = config.root / "persistent_memories" / "wake_words"
+        self.directory = config.paths.wake_words
         self.lock = threading.RLock()
         self.outbox = Outbox(event_bus)
         self.worker = DaemonExecutor(max_workers=1, thread_name_prefix="wake-detector", max_pending=2)

@@ -16,6 +16,7 @@ from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 from test_private_access import CODE
 
 
@@ -95,7 +96,7 @@ def test_continued_input_replaces_the_message_a_reader_holds_instead_of_editing_
         def close(self): pass
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
-    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={'animation': {'enabled': False}}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     held = []
     def respond(text, user_name, **kwargs):

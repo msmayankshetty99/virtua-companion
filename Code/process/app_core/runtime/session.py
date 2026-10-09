@@ -41,7 +41,7 @@ class SessionManager:
         self.warmed_vad = None  # warm_session's Silero model, which each VoiceInput copies
         self._turn_speak = True
         # Build the wake word before starting audio workers, and wake feedback before subscribing, so a failed
-        # construction leaves no worker or bus listener behind (desktop_server then keeps Settings up).
+        # construction leaves no worker or bus listener behind (the app's lifespan then keeps Settings up).
         self.wake = WakeWord(config)
         try:
             self.speech = SpeechQueue(config, state)

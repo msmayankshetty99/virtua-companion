@@ -169,18 +169,19 @@ class ToolRegistry:
             return ToolResult(call_id or str(uuid.uuid4()), name, str(exc), True)
 
     @classmethod
-    def from_config(cls, config, activity=None, desktop=None):
-        """Riko's built-in and desktop tools, then the MCP servers mcp.json configures (the factory adds TaskMCP's tools,
-        SessionManager its own). desktop is the DesktopServices the desktop tools act through."""
+    def from_config(cls, config, activity=None, local_tools=None):
+        """Riko's built-in tools, then local_tools ({owner: tools}: the factory passes the desktop tools, so tools/ never
+        imports desktop/), then the MCP servers mcp.json configures, which a local name never yields to (the factory adds
+        TaskMCP's tools, SessionManager its own)."""
         servers = configured_servers(config.tools.mcp_config)
         registry = cls(timeout_seconds=config.tools.timeout_seconds, require_approval=config.tools.require_approval, activity=activity)
         from .approval import ToolApprovals
-        registry.approvals = ToolApprovals(config.root / 'persistent_memories' / 'tool_approvals.json', config.tools.require_approval)
+        registry.approvals = ToolApprovals(config.paths.tool_approvals, config.tools.require_approval)
         try:
             from .builtin import iter_tools
-            for tool in iter_tools(): registry.register_local(tool, owner='builtin')
-            from ..desktop.tools import iter_tools as desktop_tools
-            for tool in desktop_tools(desktop): registry.register_local(tool, owner='desktop')
+            for tool in iter_tools(config.paths.todo_list): registry.register_local(tool, owner='builtin')
+            for owner, tools in (local_tools or {}).items():
+                for tool in tools: registry.register_local(tool, owner=owner)
             for name, server in servers.items():
                 client = None
                 try:

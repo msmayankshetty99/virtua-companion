@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 import time
 
-from ..desktop.media import resolve_media
+from ..desktop.media import effects_directory, resolve_media
 from ..events.bus import event_bus
 from ..kernel.schema import Section, Setting, register
 from ..kernel.validation import boolean, number
@@ -70,7 +70,7 @@ class WakeFeedback:
         if rule is None: return False
         self.last_trigger = now
         payload = {'emotion': emotion or 'neutral', 'model_state': model_state}
-        directory = self.config.raw.get('desktop', {}).get('effects_directory', 'effects/greenscreens')
+        directory = effects_directory(self.config.raw)
         # Treat each asset independently: a bad sound must not suppress animation.
         if rule.get('animation'):
             try:

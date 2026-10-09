@@ -14,6 +14,7 @@ import threading
 
 from . import schema
 from .config import AppConfig, load_config
+from .paths import DataPaths
 from .schema import UNKNOWN, field, flatten  # noqa: F401  (callers and tests import field and UNKNOWN from here)
 from ..persistence.atomic import atomic_write
 
@@ -141,7 +142,7 @@ class SettingsStore:
             if errors: return {'saved': False, 'valid': False, 'errors': errors}
             budget_changes = {key.split('.')[-1]: value for key, value in changes.items()
                 if key in {'initiative.context_window_tokens', 'initiative.max_output_tokens'}}
-            preferences = self.path.parent / 'persistent_memories' / 'initiative_settings.json'
+            preferences = DataPaths.build(self.path).initiative_settings  # beside the YAML being edited
             saved_preferences = None
             if budget_changes and preferences.exists():
                 saved_preferences = json.loads(preferences.read_text(encoding='utf-8'))

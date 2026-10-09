@@ -11,11 +11,13 @@ from process.app_core.desktop.state import DesktopState
 from process.app_core.inference.kv_budget import pool_capacity
 from test_private_access import CODE
 
-# What factory.py and SessionManager used to set on these objects; now ChatDeps, TurnContext, DesktopServices or fields.
+# What factory.py and SessionManager used to set on these objects; now ChatDeps, TurnContext, DesktopServices or fields. For
+# DesktopState also the lock and fields desktop_server and tests wrote directly, now its components' (desktop/state.py).
 RETIRED = {
     ChatService: ['action_controller', 'task_store', 'task_mcp', 'initiative_provider', 'context_limit', 'turn_origin',
                   'runtime_context', 'memory_runtime_context', 'emotion_playback_managed', 'history_file'],
-    DesktopState: ['action_controller', 'media_resolver', 'effects_directory', 'effect_library', 'avatar_motion'],
+    DesktopState: ['action_controller', 'media_resolver', 'effects_directory', 'effect_library', 'avatar_motion', '_lock', 'actions', 'displays',
+                   'avatar_geometry', 'tool_activity', 'whiteboard', 'mic_enabled', 'audio_enabled', 'sleep_mode'],
     RuntimeConfig: ['initiative_context_tokens', 'n_ctx_initiative'],
 }
 DECLARED_READS = {'action_controller', 'task_store', 'task_mcp', 'initiative_provider', 'context_limit', 'turn_origin',

@@ -16,6 +16,7 @@ from process.app_core.audio.voice_input import VoiceInput
 from process.app_core.audio.voice_segments import Segment
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import VoiceConfig, audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 class Speech:
@@ -27,7 +28,7 @@ class Speech:
 
 def make_session(monkeypatch, provider=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(raw={'voice': {}}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(raw={'voice': {}}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     chat = ChatService(provider or BaseProvider(), system_prompt='Riko', tool_registry=ToolRegistry())
     return SessionManager(config, chat, DesktopState())
 
@@ -59,9 +60,9 @@ def test_interruption_thresholds_come_from_the_typed_voice_section(monkeypatch):
 
 def test_legacy_todo_contents_are_not_automatically_injected(monkeypatch):
     session = make_session(monkeypatch)
-    session.state.tool_activity = [{'name': 'todo_list', 'status': 'complete',
-                                    'arguments': {'task': 'private task'}, 'result': 'private task list'}]
-    assert session.runtime_snapshot()['desktop']['tools'] == [{'name': 'todo_list', 'status': 'complete'}]
+    session.state.tool_finished('todo_list', 'private task list', activity_id=session.state.tool_started('todo_list', {'task': 'private task'}))
+    tools = session.runtime_snapshot()['desktop']['tools']
+    assert [(item['name'], item['status']) for item in tools] == [('todo_list', 'complete')] and not {'arguments', 'result'} & set(tools[0])
     session.close()
 
 
@@ -134,7 +135,7 @@ def test_runtime_context_refreshes_after_tool_and_includes_outcomes(monkeypatch)
         def close(self): pass
     session = make_session(monkeypatch, Provider())
     session.state.add_whiteboard('text', {'text': 'A current note'})
-    session.state.actions = [{'id': 'a', 'status': 'completed'}]
+    session.state.record_action({'id': 'a', 'status': 'completed'})
     session.respond('Please explain')
     assert len(observed) == 2
     assert observed[0]['runtime']['generating']

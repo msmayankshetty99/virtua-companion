@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from process.app_core.audio.speech import AudioClip, SpeechQueue
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 def test_master_volume_scales_pcm_without_changing_duration():
@@ -107,7 +108,7 @@ def test_missing_sovits_keeps_chat_alive_and_next_reply_recovers(tmp_path, monke
             kwargs['on_delta'](text)
             return ModelResponse(ChatMessage('assistant', text))
         def close(self): pass
-    config = SimpleNamespace(root=tmp_path, character_name='Riko', raw={}, tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), character_name='Riko', raw={}, tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     chat = ChatService(Provider(), system_prompt='test')
     session = SessionManager(config, chat, DesktopState())
     events, failed, completed = [], threading.Event(), threading.Event()

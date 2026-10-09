@@ -27,7 +27,7 @@ class Setting:
     options: tuple | None = None
     range: tuple | None = None  # (min, max) Settings accepts; load_config may accept a wider one
     restart: str | None = None  # RESTART
-    live: str | None = None  # the hook that applies it on save (LIVE in Code/desktop_server.py)
+    live: str | None = None  # the hook that applies it on save (LIVE in app_core/http/settings.py)
     label: str | None = None
     help: str = ''
     group: str | None = None

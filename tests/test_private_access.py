@@ -17,7 +17,6 @@ RIKO = {'process', 'desktop_server', 'discord_bot', 'run_server', 'task_mcp_serv
 REFLECTION = {'getattr', 'setattr', 'hasattr', 'delattr'}  # getattr(session, '_closed', False) is the same coupling
 
 PRIVATE = {
-    ('desktop_server.py', '_emit'): 2, ('desktop_server.py', '_lock'): 3,
     ('process/app_core/emotion/compat.py', '_julia_original_forward'): 1, ('process/app_core/emotion/compat.py', '_update_attention_mask'): 1,  # a transformers encoder it patches
     ('process/app_core/runtime/warmup.py', '_backend'): 1, ('process/app_core/runtime/warmup.py', '_embed'): 1, ('process/app_core/runtime/warmup.py', '_interpret'): 1,
     ('run_server.py', '_dyld_get_image_name'): 3, ('run_server.py', '_dyld_image_count'): 1,  # dyld's own C functions via ctypes

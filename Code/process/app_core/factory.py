@@ -6,41 +6,58 @@ from .tools.registry import ToolRegistry
 from .conversation.chat import ChatDeps, ChatService
 from .emotion import JuliaEmotionEngine, ExpressionActionBridge
 from .emotion.worker import EmotionWorker
-from .desktop.state import get_desktop_state
-from .desktop.tools import DesktopServices
+from .desktop.activity import ActivityLog
+from .desktop.effects import EffectsModel
+from .desktop.geometry import SurfaceGeometry
+from .desktop.listeners import DesktopEvents
+from .desktop.presence import PlaybackFlags, Presence
+from .desktop.state import DesktopState
+from .desktop.tools import DesktopServices, iter_tools as desktop_tools
+from .desktop.whiteboard import WhiteboardModel
 from .persistence.memory import MemoryStore
 from .runtime.actions import ActionController
 from .persistence.tasks import TaskStore, TaskMCP, TASK_RULES
-from .desktop.media import resolve_media
+from .desktop.media import effects_directory, resolve_media
 from .desktop.effects import EffectLibrary
+from .persistence.atomic import atomic_write
 from contextlib import ExitStack
 from .kernel.lifecycle import close_bounded
 
 
-def create_chat_service(config: AppConfig) -> ChatService:
+def create_desktop_state(paths) -> DesktopState:
+    """The desktop components the HTTP routes serve and the desktop tools act through, over the data root's whiteboard.json
+    and desktop_settings.json (configuration/paths.DataPaths). Built before the model loads, reading nothing: the lifespan
+    loads both files (WhiteboardModel.load, SurfaceGeometry.load_settings), and nothing is saved before that."""
+    events = DesktopEvents()
+    geometry = SurfaceGeometry(events, settings_file=paths.desktop_settings, write=atomic_write)
+    return DesktopState(events=events, geometry=geometry, board=WhiteboardModel(events, geometry, board_file=paths.whiteboard),
+        effects=EffectsModel(events), playback=PlaybackFlags(events), activity=ActivityLog(events), presence=Presence(events))
+
+
+def create_chat_service(config: AppConfig, desktop_state: DesktopState | None = None) -> ChatService:
     """Build the complete application core without importing audio or UI code. The service's close() owns everything built
-    here; a failure part way closes what was built so far."""
+    here; a failure part way closes what was built so far. desktop_state: the one the app serves (default: a new
+    create_desktop_state over config.paths, loading nothing)."""
     cleanup = ExitStack()
-    try: return _build_chat_service(config, cleanup)
+    try: return _build_chat_service(config, cleanup, desktop_state if desktop_state is not None else create_desktop_state(config.paths))
     except BaseException:
         cleanup.close()
         raise
 
 
-def _build_chat_service(config, cleanup):
+def _build_chat_service(config, cleanup, desktop_state):
     def own(resource):
         cleanup.callback(close_bounded, resource)
         return resource
     emotion_engine = emotion_worker = None
     actions = own(ActionController())
-    effects_directory = config.raw.get('desktop', {}).get('effects_directory', 'effects/greenscreens')
-    desktop = DesktopServices(get_desktop_state(), actions=actions, effects_directory=effects_directory,
-        media_resolver=lambda path: resolve_media(config.root, path, effects_directory),
-        effect_library=EffectLibrary(config.root / effects_directory))
+    effects = effects_directory(config.raw)
+    desktop = DesktopServices.of(desktop_state, actions=actions, effects_directory=effects,
+        media_resolver=lambda path: resolve_media(config.root, path, effects), effect_library=EffectLibrary(config.root / effects))
     if config.emotion.enabled:
-        state = get_desktop_state()
+        presence = desktop_state.presence
         def on_emotion(emotion):
-            state.set_emotion(emotion)
+            presence.set_emotion(emotion)
             actions.set_emotion(emotion)
         bridge = ExpressionActionBridge(on_emotion=on_emotion)
         emotion_engine = own(JuliaEmotionEngine(
@@ -74,17 +91,16 @@ def _build_chat_service(config, cleanup):
         def expression(state):  # while sentences play, they drive the expression: the probe's reading waits
             if not playback_active(): bridge.update(state)
         hook = ProbeHook(lambda identity, idle: EmotionProbe(
-            probe_directory(config.root, config.runtime), identity, emotion_engine,
-            probe_config, idle=idle, legacy_directory=config.root / 'persistent_memories' / 'emotion_probes',
-            training_directory=training_directory(config.root, config.runtime),
+            probe_directory(config.paths, config.runtime), identity, emotion_engine,
+            probe_config, idle=idle, legacy_directory=config.paths.emotion_probes,
+            training_directory=training_directory(config.paths, config.runtime),
             on_prediction=expression, on_fallback=expression))
         host.attach_probe(hook, probe_config.interval_tokens)
         # Julia remains the teacher and low-confidence fallback. Student
         # events use the same expression/action bridge, never tool execution.
     if config.runtime.warmup: provider.warmup()
-    task_path = config.raw.get('tasks', {}).get('store_file', 'persistent_memories/tasks.sqlite3')
-    task_store = TaskStore(config.root / task_path)
-    registry = own(ToolRegistry.from_config(config, activity=get_desktop_state(), desktop=desktop))
+    task_store = TaskStore(config.paths.tasks)  # tasks.store_file (configuration/paths.py), as Code/task_mcp_server.py resolves it
+    registry = own(ToolRegistry.from_config(config, activity=desktop_state.activity, local_tools={'desktop': desktop_tools(desktop)}))
     from .tools.choices import ChoiceResolver
     registry.choice_resolver = ChoiceResolver(emotion_engine.choose_tool_input if emotion_engine else None,
         enabled=config.tools.best_fit_inputs, timeout=config.tools.best_fit_timeout_seconds,
@@ -103,7 +119,7 @@ def _build_chat_service(config, cleanup):
         system_prompt=config.system_prompt + '\n' + TASK_RULES + '\n' + str(config.raw.get('tasks', {}).get('rules', '')),
         character_name=config.character_name,
         tool_registry=registry,
-        history_file=config.memory.history_file,
+        history_file=config.paths.chat_history,
         emotion_engine=emotion_engine,
         memory_store=memory,
         deps=ChatDeps(action_controller=actions, task_store=task_store, task_mcp=task_mcp,

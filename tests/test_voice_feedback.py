@@ -4,6 +4,7 @@ from process.app_core.audio.wake_word import WakeWord
 from process.app_core.events.bus import event_bus
 from process.app_core.audio.voice_segments import VoiceSegments, Segment
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 def test_activation_and_expiry_publish_status_without_polling(tmp_path,monkeypatch):
@@ -14,7 +15,7 @@ def test_activation_and_expiry_publish_status_without_polling(tmp_path,monkeypat
         def cancel(self):self.cancelled=True
     monkeypatch.setattr('process.app_core.audio.wake_word.threading.Timer',Timer)
     monkeypatch.setattr('process.app_core.audio.wake_word.time.monotonic',lambda:now[0])
-    config=SimpleNamespace(root=tmp_path,character_name='Riko',**audio_sections({'voice':{'mode':'manual','follow_up_seconds':10}}))
+    config=SimpleNamespace(root=tmp_path,paths=DataPaths.at(tmp_path),character_name='Riko',**audio_sections({'voice':{'mode':'manual','follow_up_seconds':10}}))
     wake=WakeWord(config)
     off=event_bus.subscribe(events.append)
     try:

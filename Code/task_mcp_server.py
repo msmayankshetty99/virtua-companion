@@ -25,8 +25,12 @@ def main():
     sys.stdin.reconfigure(encoding='utf-8')
     sys.stdout.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser()
-    parser.add_argument('--store', type=Path, default=Path(__file__).resolve().parent.parent / 'persistent_memories' / 'tasks.sqlite3')
+    parser.add_argument('--store', type=Path, help="default: the backend's store, tasks.store_file in the YAML at RIKO_CONFIG "
+        'against RIKO_DATA_DIR (default: the checkout), as run_server resolves them')
     args = parser.parse_args()
+    if args.store is None:
+        from process.app_core.configuration.paths import from_environment
+        args.store = from_environment().tasks
     server = TaskMCP(TaskStore(args.store), actor='external_mcp')
     for line in sys.stdin:
         try:

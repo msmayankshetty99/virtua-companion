@@ -5,18 +5,16 @@ from __future__ import annotations
 from concurrent.futures import TimeoutError
 import json
 import logging
-from pathlib import Path
 import subprocess
-import sys
 import threading
 
 from .tool import ToolCancelled
+from ..kernel.code_paths import CodePaths
 
 logger = logging.getLogger(__name__)
 
 
-def worker_command():
-    return [sys.executable, '--tool-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(Path(__file__).with_name('worker.py'))]
+def worker_command(): return CodePaths.current().tool_command()  # tools/worker.py, or the frozen backend's --tool-worker
 
 
 class IsolatedWorkers:

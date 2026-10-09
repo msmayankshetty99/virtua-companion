@@ -4,10 +4,11 @@ import pytest
 
 from process.app_core.audio.wake_word import WakeWord, profile_key, wake_phrase
 from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 def config(root, name='Riko', **voice):
-    return SimpleNamespace(root=root, character_name=name, **audio_sections({'voice': voice}))
+    return SimpleNamespace(root=root, paths=DataPaths.at(root), character_name=name, **audio_sections({'voice': voice}))
 
 
 def test_profile_key_changes_for_phrase_or_actual_device():
