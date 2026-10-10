@@ -1,5 +1,5 @@
 """run_server.main and configure_logging, without the real desktop_server app (whose lifespan builds the services) and
-without binding 127.0.0.1:8765, where a developer's backend may be running."""
+without binding its port, where a developer's backend may be running."""
 import logging
 from pathlib import Path
 import socket as real_socket
@@ -11,6 +11,9 @@ import pytest
 import run_server
 from process.app_core.configuration.debug_logging import SafeFormatter, configure_logging
 from process.app_core.configuration.paths import DataPaths
+from process.app_core.desktop import api_guard  # main() imports it while socket and time are faked below
+
+REPO = Path(__file__).resolve().parents[1]
 
 LOGGERS = ('', 'process.app_core', 'desktop_server', 'process.app_core.kernel.metrics')  # '' is the root logger
 
@@ -101,16 +104,22 @@ class Recorder:
         return 'uvicorn-config'
 
 
-def start(monkeypatch, tmp_path, recorder, yaml='', clock=None, data=None):
+def start(monkeypatch, tmp_path, recorder, yaml='', clock=None, data=None, port=None, managed=False):
     """main() on a YAML in tmp_path, with the recorder's desktop_server, socket and uvicorn. data: RIKO_DATA_DIR relative to
-    tmp_path's parent, the cwd main() starts in (default: tmp_path, absolute)."""
+    tmp_path's parent, the cwd main() starts in (default: tmp_path, absolute). port: RIKO_PORT. managed: as packaged Electron
+    starts it (RIKO_MANAGED=1), with the stdin watcher recorded instead of started."""
     (tmp_path / 'character_config.yaml').write_text(yaml, encoding='utf-8')
     monkeypatch.chdir(tmp_path if data is None else tmp_path.parent)  # main() changes the cwd to RIKO_DATA_DIR; this puts it back afterwards
     monkeypatch.setenv('RIKO_DATA_DIR', str(tmp_path) if data is None else data)
     monkeypatch.setenv('RIKO_CONFIG', str(tmp_path / 'character_config.yaml'))
     monkeypatch.delenv('RIKO_MANAGED', raising=False)  # the managed path reads stdin and arms a faulthandler exit
+    if port is None: monkeypatch.delenv('RIKO_PORT', raising=False)
+    else: monkeypatch.setenv('RIKO_PORT', port)
+    if managed: monkeypatch.setenv('RIKO_MANAGED', '1')
     monkeypatch.setattr(sys, 'argv', ['run_server.py'])
     run_server.load_config(), run_server.uvicorn  # imports what they import lazily now, so no module is first imported with a fake below
+    if managed:  # after the warm-up: only main()'s own `import threading` sees the fake
+        monkeypatch.setitem(sys.modules, 'threading', SimpleNamespace(Thread=lambda target, name, daemon: SimpleNamespace(start=lambda: recorder.events.append(name))))
     loaded, load_config = [], run_server.load_config
     monkeypatch.setattr(run_server, 'load_config', lambda **options: loaded.append(options) or load_config(**options))
     monkeypatch.setitem(sys.modules, 'desktop_server', recorder.desktop_server)
@@ -157,6 +166,38 @@ def test_port_held_by_another_process_stops_startup_with_a_clear_message(monkeyp
         start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n', clock)
     assert 'api_secrets' not in recorder.events and not any(event[0] == 'run' for event in recorder.events if isinstance(event, tuple))
     assert recorder.events.count('bind_failed') == 41  # every half second for 20 s, then once more at the deadline
+
+
+def test_a_given_port_is_bound_served_and_named_to_electron_once_held(monkeypatch, tmp_path, capsys):
+    recorder = Recorder()
+    start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n', port='9123', managed=True)
+    assert ('bind', ('127.0.0.1', 9123)) in recorder.events and recorder.configs[0][1]['port'] == 9123
+    assert recorder.events[-2:] == ['release-shutdown', ('run', [recorder.listener])]
+    lines = capsys.readouterr().out.splitlines()
+    # electron/release.cjs watchListening sends the token only after this exact line, once the port is held.
+    assert lines == ['Riko AI server: http://127.0.0.1:9123 — Ctrl+C to stop', 'RIKO_BACKEND_LISTENING port=9123']
+
+
+@pytest.mark.parametrize('value', ['80', '1023', '65536', '0', '-1', 'abc', '9123.0', '\u0669\u0661\u0662\u0663'])
+def test_riko_port_is_a_port_from_1024_and_a_bad_one_stops_startup_before_the_app_is_built(monkeypatch, tmp_path, value):
+    with pytest.raises(ValueError, match='RIKO_PORT must be a port from 1024 to 65535'): api_guard.backend_port({'RIKO_PORT': value})
+    recorder = Recorder()
+    with pytest.raises(SystemExit, match='RIKO_PORT must be a port from 1024 to 65535'):
+        start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n', port=value)
+    assert recorder.events == []
+
+
+def test_electron_and_the_backend_share_the_default_port_the_listening_line_and_a_port_blind_guard():
+    assert api_guard.backend_port({}) == api_guard.DEFAULT_PORT == 8765 and api_guard.backend_port({'RIKO_PORT': ' 9123 '}) == 9123
+    assert api_guard.backend_url({'RIKO_PORT': '9123'}) == 'http://127.0.0.1:9123'
+    origin, release = ((REPO / 'electron' / name).read_text(encoding='utf-8') for name in ('backend_origin.cjs', 'release.cjs'))
+    assert f"const DEFAULT_BACKEND='http://127.0.0.1:{api_guard.DEFAULT_PORT}';" in origin
+    assert "const LISTENING='RIKO_BACKEND_LISTENING';" in release and "const listeningLine=port=>LISTENING+' port='+port;" in release
+    assert "RIKO_MANAGED:'1',RIKO_PORT:String(port)," in release  # startBackend gives the backend the port its windows use
+    guard = api_guard.LocalAPIGuard(None, lambda: 't' * 43)
+    for host in ('127.0.0.1:9123', 'localhost:9123', '127.0.0.1'):
+        assert guard.problem('http', {'host': host, 'authorization': 'Bearer ' + 't' * 43}) is None, host
+    assert guard.problem('http', {'host': 'example.com:9123', 'authorization': 'Bearer ' + 't' * 43})[0] == 403
 
 
 def test_main_works_in_the_data_folder_and_hands_children_its_absolute_path(monkeypatch, tmp_path):

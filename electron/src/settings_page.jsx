@@ -1,7 +1,7 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {Save, FolderOpen, Check, RefreshCw, AlertCircle, Plus, Trash2} from './ui/icons.jsx';
 import {request} from './api.mjs';
-import {inputValues, settingsPatch, settingsEdited, runtimePresets, llamaServerCommand} from './settings_model.mjs';
+import {inputValues, settingsPatch, settingsEdited, runtimePresets, llamaServerCommand, shownFields, restartNotice, pendingRestart} from './settings_model.mjs';
 import InitiativeSettings from './initiative_settings.jsx';
 import DisplaySettings from './display_settings.jsx';
 import VoiceInput from './voice_input.jsx';
@@ -47,7 +47,8 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
   },[destination,!!snapshot]);
   function jump(section){const target=sectionRefs.current.get(section);target?.scrollIntoView({block:'start',behavior:preferences.reduceMotion?'instant':'auto'});target?.focus({preventScroll:true});}
   const [modelQuery,setModelQuery]=useState(''),[modelGGUF,setModelGGUF]=useState(true);
-  const parsed=useMemo(()=>snapshot?settingsPatch(snapshot.fields,snapshot.values,inputs):{changes:{},errors:{}},[snapshot,inputs]);
+  // The backend's checks across settings (snapshot.rules) run on the draft as it changes.
+  const parsed=useMemo(()=>snapshot?settingsPatch(snapshot.fields,snapshot.values,inputs,snapshot.rules):{changes:{},errors:{}},[snapshot,inputs]);
   const sourceDirty=!!snapshot&&inputs['runtime.provider']==='llama_cpp'&&modelSource!==(snapshot.values['runtime.model_path']?'local':'huggingface');
   const dirty=sourceDirty || Object.keys(parsed.changes).length>0 || Object.keys(parsed.errors).length>0;
   // Only user edits guard navigation, reload and quit: opening Settings on a config it flags must not block them.
@@ -108,9 +109,11 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
   async function save() {
     setBusy(true);setError('');
     try {
-      const value=await request('/api/settings',{method:'PUT',body:{changes:parsed.changes,revision:snapshot.revision}});
+      const changes=parsed.changes,before=snapshot.restart_pending;
+      const value=await request('/api/settings',{method:'PUT',body:{changes,revision:snapshot.revision}});
       if(!value.saved){setServerErrors(value.errors);return;}
-      setSnapshot(value);setInputs(inputValues(value));setModelSource(value.values['runtime.model_path']?'local':'huggingface');setServerErrors({});setNotice(!value.restart_required?'Saved. Changes are active now.':'Saved. Avatar and background-pause changes are active now. Restart Python for other runtime changes; restart Electron for window changes.');
+      // Which restart each change awaits comes from its field's restart_scope; restart_pending names what still waits.
+      setSnapshot(value);setInputs(inputValues(value));setModelSource(value.values['runtime.model_path']?'local':'huggingface');setServerErrors({});setNotice(restartNotice(changes,value,before,fieldLabel));
     }catch(e){setError(e.message);}finally{setBusy(false);}
   }
   async function useAvatar(model,format){
@@ -135,21 +138,18 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
   }
   function preset(name){setInputs(old=>syncPool({...old,...runtimePresets[name]}));setNotice(name==='compact'?'Compact preset quantizes the KV cache, which turns flash attention on. If your GPU backend lacks flash attention for this model, attention runs on the CPU.':'Preset applied to your draft. Review and save when ready.');}
   const searchItems=useMemo(()=>settingsIndex(snapshot?.fields||[],groups,catalog),[snapshot?.fields,catalog]);
-  const fields=(snapshot?.fields||[]).filter(field=>field.path===destination?.path||(field.group===group
-    &&!['avatar.model','avatar.format','runtime.kv_pool_auto','runtime.kv_pool_tokens'].includes(field.path)
-    &&(advanced||!field.advanced)
-    &&(advanced||group!=='models'||inputs['runtime.provider']!=='llama_cpp'||(modelSource==='local'?!field.path.startsWith('runtime.hf_'):field.path!=='runtime.model_path'))
-    &&(advanced||group!=='models'||!(inputs['runtime.provider']==='llama_cpp'?['runtime.api_mode','runtime.reuse_response_ids','runtime.base_url','runtime.api_key','runtime.model'].includes(field.path):field.path.startsWith('runtime.')&&!['runtime.provider','runtime.api_mode','runtime.reuse_response_ids','runtime.base_url','runtime.api_key','runtime.model','runtime.temperature','runtime.max_output_tokens','runtime.n_ctx','runtime.request_timeout_seconds','runtime.warmup',...(inputs['runtime.provider']==='llama_server'?['runtime.parallel_slots','runtime.startup_timeout_seconds','runtime.pause_background_on_live']:[])].includes(field.path)))));
+  const fields=shownFields(snapshot?.fields||[],{group,inputs,advanced,modelSource,destination:destination?.path});
   const sections=[...new Set(fields.map(field=>field.section||'Settings'))].sort((a,b)=>{
     const order=['Model source','Token budgets','Generation','Scheduling & startup','Compute & cache','Speech recognition model','Background models','Embedding model','Emotion model','Renderer assets','Preset fallbacks','Settings','Emotion'];return order.indexOf(a)-order.indexOf(b);
   });
    const jumpSections=[...(group==='models'?['GPU memory',...(inputs['runtime.provider']==='llama_cpp'?['Conversation cache']:[])]:[]),...(group==='appearance'?['Avatar library']:[]),...sections];
    const sectionRef=name=>node=>{if(node)sectionRefs.current.set(name,node);else sectionRefs.current.delete(name);};
+   function fieldLabel(field){return preferences.advancedExplanations?field.technicalLabel||field.label:simpleLabel(field);}
    function renderField(field,prefix='setting-'){
     const id=prefix+field.path.replaceAll('.','-'),value=inputs[field.path],message=errors[field.path];
     const modelList=/model(_id)?$/.test(field.path)||field.path==='runtime.hf_repo_id';
     return <div className={'setting-field '+(field.multiline?'wide ':'')+(message?'invalid':'')} key={field.path}>
-     <label htmlFor={id}>{preferences.advancedExplanations?field.technicalLabel||field.label:simpleLabel(field)}{preferences.advancedExplanations&&<span className="field-path">{field.path}</span>}</label>
+     <label htmlFor={id}>{fieldLabel(field)}{preferences.advancedExplanations&&<span className="field-path">{field.path}</span>}</label>
      {field.kind==='boolean'?<div className="switch-row"><span>{value?'Enabled':'Disabled'}</span><input id={id} type="checkbox" role="switch" checked={!!value} disabled={field.readonly} onChange={e=>change(field.path,e.target.checked)}/></div>
       :field.path==='voice.input_device'?<select id={id} value={value} disabled={field.readonly} onChange={e=>change(field.path,e.target.value)}><option value="">Automatic microphone</option>{devices.map(d=><option key={d.index} value={d.index}>{d.name}</option>)}{value!==''&&!devices.some(d=>String(d.index)===String(value))&&<option value={value}>Device {value}</option>}</select>
       :field.options?<select id={id} value={value} disabled={field.readonly} aria-invalid={!!message} onChange={e=>change(field.path,e.target.value)}>{!field.options.includes(value)&&<option value={value}>{value||'Automatic'}</option>}{field.options.map(option=><option key={option}>{option}</option>)}</select>
@@ -190,7 +190,7 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
        {group==='voice'&&<details id="settings-voice-live" className="live-settings"><summary>Live calibration & detector testing</summary><VoiceInput/></details>}
        {group==='initiative'&&<details id="settings-initiative-live" className="live-settings"><summary>Live initiative preferences & event rules</summary><p>Saved live preferences override YAML initiative defaults.</p><InitiativeSettings/></details>}
        {group==='appearance'&&<details id="settings-display-live" className="live-settings"><summary>Live monitor & surface placement</summary><DisplaySettings/></details>}
-         </section><footer className="settings-save"><div><strong>{dirty?'Unsaved changes':'All changes saved'}</strong><small>{validating?'Checking your changes…':'Some changes need a restart. We’ll tell you after saving.'}</small></div><div><button disabled={!dirty||busy} onClick={()=>{setInputs(inputValues(snapshot));setModelSource(snapshot.values['runtime.model_path']?'local':'huggingface');setServerErrors({});setPathChecks({});setNotice('Changes discarded.');}}>Discard</button><button className="primary" disabled={!dirty||busy||validating||Object.values(errors).some(Boolean)} onClick={save}><Save size={17}/>{busy?'Saving…':'Save settings'}</button></div></footer>
+         </section><footer className="settings-save"><div><strong>{dirty?'Unsaved changes':'All changes saved'}</strong><small>{validating?'Checking your changes…':pendingRestart(snapshot)||'Some changes need a restart. We’ll tell you after saving.'}</small></div><div><button disabled={!dirty||busy} onClick={()=>{setInputs(inputValues(snapshot));setModelSource(snapshot.values['runtime.model_path']?'local':'huggingface');setServerErrors({});setPathChecks({});setNotice('Changes discarded.');}}>Discard</button><button className="primary" disabled={!dirty||busy||validating||Object.values(errors).some(Boolean)} onClick={save}><Save size={17}/>{busy?'Saving…':'Save settings'}</button></div></footer>
     </>}
   </main>;
 }

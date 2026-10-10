@@ -38,8 +38,8 @@ class Setting:
     obsolete: bool = False  # no longer read: never offered, and a strict section reports it as unknown
     quoted: bool = False  # always text, written quoted: PyYAML reads an unquoted 42 or yes as a number or boolean
     file: bool | None = None  # offer Browse and Check path
-    visible_when: tuple = ()  # ((path, allowed values), ...): it matters only while each holds (provider-specific keys)
-    omit: bool = False  # Settings leaves it out of its fields while visible_when does not hold
+    visible_when: tuple = ()  # ((path, allowed values), ...): it matters only while each holds (provider-specific keys); the
+    # renderer shows it only then (settings_model.mjs fieldRelevant), unless Advanced controls is on
 
 
 @dataclass(frozen=True, slots=True)

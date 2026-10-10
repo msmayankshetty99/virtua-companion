@@ -26,6 +26,23 @@ HOSTS = {'127.0.0.1', 'localhost'}
 WEBSOCKET_ORIGINS = {'null', 'file://', 'http://localhost:5173', 'http://127.0.0.1:5173'}
 SIGNATURE = re.compile(r'[0-9a-f]{64}')
 SECRET = re.compile(r'[A-Za-z0-9_-]{32,256}')  # what Electron and secrets.token_urlsafe produce
+DEFAULT_PORT = 8765  # electron/backend_origin.cjs holds Electron's copy of the default
+
+
+def backend_port(env=None):
+    """The loopback port this backend binds and its clients reach: RIKO_PORT (1024-65535), else 8765. Packaged Electron
+    passes the free port it chose; in development set it here and RIKO_BACKEND_URL for Electron. The guard checks the Host
+    name, never the port, so it holds on any port."""
+    value = (os.environ if env is None else env).get('RIKO_PORT', '').strip()
+    if not value: return DEFAULT_PORT
+    if not (value.isascii() and value.isdigit() and 1024 <= int(value) <= 65535):
+        raise ValueError(f'RIKO_PORT must be a port from 1024 to 65535, not {value!r}')
+    return int(value)
+
+
+def backend_url(env=None):
+    """This backend's address for a client: always 127.0.0.1, since 'localhost' may resolve to ::1."""
+    return f'http://127.0.0.1:{backend_port(env)}'
 
 
 def secret_path(root, name):

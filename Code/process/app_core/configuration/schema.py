@@ -230,10 +230,11 @@ def field(path, value):
 def visible(spec, values): return all(values.get(name) in allowed for name, allowed in spec.visible_when)
 
 
-def offered(path, values):
-    """Whether Settings offers a value as a field: not hidden or obsolete, nor an omitted key of another provider."""
+def offered(path):
+    """Whether Settings offers a value as a field: not hidden or obsolete. A key of another provider is offered too, so the
+    renderer can show it as soon as the draft switches provider (its visible_when)."""
     spec = setting(path)
-    return not (spec.obsolete or resolve(path, 'hidden') or spec.omit and not visible(spec, values))
+    return not (spec.obsolete or resolve(path, 'hidden'))
 
 
 def rules(): return [rule.payload() for item in sections() for rule in item.rules]

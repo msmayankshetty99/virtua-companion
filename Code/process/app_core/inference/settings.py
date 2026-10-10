@@ -64,11 +64,11 @@ register(Section('runtime', group='models', title='Compute & cache', configure=c
             help='Choose an exact GGUF. For split models choose the first shard; not the mmproj file.'),
         Setting('hf_revision', label='Model revision', visible_when=NATIVE, **SOURCE),
         Setting('hf_local_files_only', label='Offline mode', visible_when=NATIVE, **SOURCE),
-        # OpenAIProvider's alone: left out of Settings' fields for llama.cpp, as before visible_when existed.
-        Setting('tokenizer_model', nullable=True, advanced=True, visible_when=OPENAI, omit=True, **SOURCE),
-        Setting('model', visible_when=OPENAI, omit=True, **SOURCE),
-        Setting('api_mode', options=('auto', 'responses', 'chat_completions'), visible_when=OPENAI, omit=True, **SOURCE),
-        Setting('reuse_response_ids', visible_when=OPENAI, omit=True, **SOURCE),
+        # OpenAIProvider's alone.
+        Setting('tokenizer_model', nullable=True, advanced=True, visible_when=OPENAI, **SOURCE),
+        Setting('model', visible_when=OPENAI, **SOURCE),
+        Setting('api_mode', options=('auto', 'responses', 'chat_completions'), visible_when=OPENAI, **SOURCE),
+        Setting('reuse_response_ids', visible_when=OPENAI, **SOURCE),
         Setting('base_url', visible_when=SERVED, **SOURCE,
             help='Server address. For llama_server, the llama-server address such as http://127.0.0.1:8080; its --parallel must equal Parallel inference slots and each slot needs at least the live, initiative and reflection context. Conversations are sent to this address.' + PYTHON),
         Setting('api_key', label='API key', visible_when=SERVED, **SOURCE),

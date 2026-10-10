@@ -1,4 +1,8 @@
 const {contextBridge, ipcRenderer} = require('electron');
+// The backend origin main resolved once (backend_origin.cjs), from this window's --riko-backend= argument: src/api.mjs reads it
+// before the page's first request. A sandboxed preload cannot require that module, so this accepts only the form main sends.
+const backendArgument=process.argv.find(value=>value.startsWith('--riko-backend='))?.slice('--riko-backend='.length)||'';
+contextBridge.exposeInMainWorld('rikoConfig',{backend:/^http:\/\/127\.0\.0\.1:[0-9]{4,5}$/.test(backendArgument)?backendArgument:''});
 contextBridge.exposeInMainWorld('setupBridge',{hardware:()=>ipcRenderer.invoke('setup-hardware'),directory:()=>ipcRenderer.invoke('setup-directory'),model:()=>ipcRenderer.invoke('setup-model'),sovits:()=>ipcRenderer.invoke('setup-sovits'),finish:values=>ipcRenderer.invoke('setup-finish',values)});
 contextBridge.exposeInMainWorld('neuralBridge',{openData:()=>ipcRenderer.invoke('neural-data-open')});
 contextBridge.exposeInMainWorld('gestureBridge',{send:value=>ipcRenderer.send('window-gesture',value)});

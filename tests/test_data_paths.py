@@ -77,7 +77,7 @@ def test_electron_creates_and_reads_the_same_folders():
         assert re.search(variable + r":path\.join\(directory,'models',", release)
     assert "path.join(directory,'logs','backend-launch.log')" in release
     # Development: main reads the token and confirmation key from persistent_memories beside the config.
-    assert "secretDirectory = path.join(path.dirname(configPath), 'persistent_memories');" in main
+    assert "backend.watchSecrets(path.join(path.dirname(configPath),'persistent_memories'));" in main
     assert paths.api_token.parent == paths.confirm_key.parent == paths.root / 'persistent_memories'
 
 

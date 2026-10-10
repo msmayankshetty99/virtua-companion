@@ -138,9 +138,11 @@ class DiscordLauncher:
                 if not code.frozen and not code.discord_bot.is_file(): raise ValueError('Discord client entry point is missing')
                 # The worker exits when its stdin closes, i.e. when this backend exits however it exits,
                 # so a client holding a dead backend's token never outlives it. It finds this backend's data root, .env and
-                # token from RIKO_CONFIG (absolute) and RIKO_DATA_DIR, whatever this process's environment held.
+                # token from RIKO_CONFIG (absolute) and RIKO_DATA_DIR, and its address (RIKO_PORT, which run_server bound)
+                # from Discord_backend_url, which outranks the .env's, whatever this process's environment held.
+                from ...desktop.api_guard import backend_url
                 env = {**os.environ, 'RIKO_API_TOKEN': self.token(), 'RIKO_DATA_DIR': str(self.paths.root),
-                    'RIKO_CONFIG': str(self.paths.config_file), 'RIKO_EXIT_WITH_BACKEND': '1'}
+                    'RIKO_CONFIG': str(self.paths.config_file), 'RIKO_EXIT_WITH_BACKEND': '1', 'Discord_backend_url': backend_url()}
                 self.process = subprocess.Popen(code.discord_command(), cwd=self.paths.root, env=env,
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))

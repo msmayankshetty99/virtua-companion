@@ -181,8 +181,11 @@ def test_configuration_settings_and_probe_rules(tmp_path):
     with pytest.raises(ValueError, match='llama_cpp'): load_config(path)
     path.write_text('runtime:\n  provider: llama_server\n  base_url: http://127.0.0.1:8080\n', encoding='utf-8')
     store = SettingsStore(path)
-    paths = {item['path'] for item in store.snapshot()['fields']}
-    assert {'runtime.base_url', 'runtime.api_key', 'runtime.parallel_slots'} <= paths and 'runtime.api_mode' not in paths
+    fields = {item['path']: item for item in store.snapshot()['fields']}
+    assert {'runtime.base_url', 'runtime.api_key', 'runtime.parallel_slots'} <= fields.keys()
+    # Sent for every provider, so a draft that switches to an OpenAI-compatible one shows it; the renderer hides it here.
+    assert 'llama_server' not in fields['runtime.api_mode']['visible_when']['runtime.provider']
+    assert 'llama_server' in fields['runtime.parallel_slots']['visible_when']['runtime.provider']
     assert store.validate({'runtime.temperature': .5}) == {'valid': True, 'errors': {}}  # the minimal config stays editable
     assert not store.validate({'runtime.base_url': 'http://127.0.0.1:8080/llama'})['valid']  # rejected before it is saved
     assert 'llama_server' in field('runtime.provider', 'llama_server')['options']

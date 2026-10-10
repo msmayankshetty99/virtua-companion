@@ -33,6 +33,35 @@ def unknown_warnings(raw):
 def revision(text): return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
+def value_error(spec, value, current):
+    """Why Settings refuses value for the field spec (field()) whose stored value is current; '' when it accepts it."""
+    if spec['readonly']: return 'Legacy setting is not used by the current runtime'
+    error = ''
+    if value is None and spec['nullable']: pass
+    elif spec['kind'] == 'boolean' and type(value) is not bool: error = 'Choose on or off'
+    elif spec['kind'] == 'number':
+        if type(value) not in (int, float) or not math.isfinite(value): error = 'Enter a finite number'
+        elif spec['integer'] and type(value) is not int: error = 'Enter a whole number'
+        elif 'min' in spec and value < spec['min'] or 'max' in spec and value > spec['max']: error = f"Allowed range: {spec.get('min', '−∞')} to {spec.get('max', '∞')}"
+    elif spec['kind'] == 'text' and not isinstance(value, str): error = 'Enter text'
+    elif spec['kind'] == 'json' and not isinstance(value, type(current)) and current is not None: error = 'Keep the same JSON structure type'
+    if spec.get('options') and value not in spec['options']: error = 'Choose a supported option'
+    if isinstance(value, str) and len(value) > 100000: error = 'Value is too long'
+    return error
+
+
+def beyond_values(candidate, written, draft, changes):
+    """The checks after load_config accepted the candidate: each section's review (configuration/schema.py) and the URLs
+    the YAML holds (written: {path: value})."""
+    # Each section's checks beyond load_config: the wake word, an edited speech recognition pair or avatar, default
+    # memories, the llama.cpp budget and split, the initiative budget.
+    errors = schema.review(candidate, draft, changes)
+    for path, value in written.items():
+        if path.endswith(('_url', '.url')) and isinstance(value, str) and not value.startswith(('http://', 'https://')):
+            errors[path] = 'Use an http:// or https:// URL'
+    return errors
+
+
 class SettingsStore:
     def __init__(self, path, running=None):
         """running: the AppConfig the backend started with, so snapshot() can say which saved settings await a restart."""
@@ -51,7 +80,7 @@ class SettingsStore:
         text, raw = self._read()
         candidate = load_config(self.path, recover=True)  # open even while a section is broken, so Settings can repair it
         values = schema.values(candidate, raw)
-        fields = [field(k, v) for k, v in values.items() if schema.offered(k, values)]
+        fields = [field(k, v) for k, v in values.items() if schema.offered(k)]
         warnings = unknown_warnings(raw)
         for item in fields:
             if any(item['path'] == path or item['path'].startswith(path + '.') for path in warnings): item.update(unknown=True, help=UNKNOWN)
@@ -78,19 +107,9 @@ class SettingsStore:
         if not isinstance(changes, dict) or len(changes) > 300: raise ValueError('Invalid settings patch')
         for path, value in changes.items():
             if path not in values: errors[path] = 'Unknown setting'; continue
-            spec = field(path, values[path])
-            if spec['readonly']: errors[path] = 'Legacy setting is not used by the current runtime'; continue
-            if value is None and spec['nullable']: pass
-            elif spec['kind'] == 'boolean' and type(value) is not bool: errors[path] = 'Choose on or off'
-            elif spec['kind'] == 'number':
-                if type(value) not in (int, float) or not math.isfinite(value): errors[path] = 'Enter a finite number'
-                elif spec['integer'] and type(value) is not int: errors[path] = 'Enter a whole number'
-                elif 'min' in spec and value < spec['min'] or 'max' in spec and value > spec['max']: errors[path] = f"Allowed range: {spec.get('min', '−∞')} to {spec.get('max', '∞')}"
-            elif spec['kind'] == 'text' and not isinstance(value, str): errors[path] = 'Enter text'
-            elif spec['kind'] == 'json' and not isinstance(value, type(values[path])) and values[path] is not None: errors[path] = 'Keep the same JSON structure type'
-            if spec.get('options') and value not in spec['options']: errors[path] = 'Choose a supported option'
-            if isinstance(value, str) and len(value) > 100000: errors[path] = 'Value is too long'
-            if path not in errors:
+            error = value_error(field(path, values[path]), value, values[path])
+            if error: errors[path] = error
+            else:
                 node = raw
                 keys = path.split('.')
                 for key in keys[:-1]:
@@ -109,12 +128,7 @@ class SettingsStore:
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as file: file.write(output)
             candidate = load_config(temporary)  # every registered section's check, as the backend will run it
-            # Each section's checks beyond load_config (configuration/schema.py review): the wake word, an edited speech
-            # recognition pair or avatar, default memories, the llama.cpp budget and split, the initiative budget.
-            errors.update(schema.review(candidate, {**values, **changes}, changes))
-            for path, value in dict(flatten(raw)).items():
-                if path.endswith(('_url', '.url')) and isinstance(value, str) and not value.startswith(('http://', 'https://')):
-                    errors[path] = 'Use an http:// or https:// URL'
+            errors.update(beyond_values(candidate, dict(flatten(raw)), {**values, **changes}, changes))
             writes = schema.derive(candidate)  # e.g. the automatic KV pool, saved with every change
             if writes:
                 for path, value in writes.items():
@@ -132,6 +146,31 @@ class SettingsStore:
         with LOCK:
             _, _, errors = self.prepare(changes)
             warnings = unknown_warnings(self._read()[1])
+            return {'valid': not errors, 'errors': errors, **({'warnings': warnings} if warnings else {})}
+
+    def validate_file(self):
+        """validate() for the file as it stands, as if Settings had just set every value it offers: each section's check
+        (load_config), each value's type, range and options, and the checks beyond them (a speech recognition pair this
+        machine cannot run fails here, where loading would fall back). It judges the file as the backend reads it (PyYAML,
+        YAML 1.1) and its effective values, not ruamel's round-trip view. The packaged first run checks its configuration
+        with it, and so does `--validate-config` (configuration/first_run.py)."""
+        import yaml
+        with LOCK:
+            read = yaml.safe_load(self.path.read_text(encoding='utf-8'))
+            if not isinstance(read, dict): raise ValueError('Configuration must be a YAML mapping')
+            errors, written = {}, dict(flatten(read))
+            try:
+                candidate = load_config(self.path)
+                values = schema.values(candidate, read)
+                specs = {path: field(path, values[path]) for path in written if path in values and schema.offered(path)}
+                # A key the file's provider does not use (visible_when), perhaps left by another provider, is not judged.
+                specs = {path: spec for path, spec in specs.items() if all(values.get(name) in allowed for name, allowed in spec.get('visible_when', {}).items())}
+                changes = {path: values[path] for path, spec in specs.items() if not spec['readonly']}  # a legacy key is load_config's
+                errors.update((path, error) for path, value in changes.items() if (error := value_error(specs[path], value, value)))
+                errors.update(beyond_values(candidate, written, values, changes))
+                schema.derive(candidate)  # a manual KV pool too small for the budgets
+            except (ValueError, TypeError, KeyError) as exc: errors.setdefault('__all__', str(exc))
+            warnings = unknown_warnings(read)
             return {'valid': not errors, 'errors': errors, **({'warnings': warnings} if warnings else {})}
 
     def save(self, changes, expected_revision):

@@ -90,9 +90,11 @@ def release_check(library=None):
     tree without a library. It needs no GPU, audio device, credentials, network or model, and touches no user data."""
     import ctypes
     import importlib
+    import json
     import subprocess
     import tempfile
-    from process.app_core.configuration.native_backends import backends_for, library_name
+    import yaml
+    from process.app_core.configuration.native_backends import backends_for, bundled_library, library_name
     shipped, name = backends_for(sys.platform), library_name(sys.platform)  # the frozen copy bundled:<backend> resolves with
     if library and (Path(library).name != name or Path(library).absolute().parent.name not in shipped):
         raise SystemExit(f'{library} is not where bundled:<backend> looks on {sys.platform}: native/<{"|".join(shipped)}>/{name}')
@@ -134,6 +136,20 @@ def release_check(library=None):
             worker = subprocess.run([*CodePaths.current().discord_command(), '--dry-run'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
             if worker.returncode or 'RIKO_DISCORD_DRY_RUN_OK' not in worker.stdout:
                 raise SystemExit(f'The Discord worker failed its dry run (exit {worker.returncode}):\n{worker.stdout}{worker.stderr}')
+            # The packaged first run (electron/release.cjs saveSetup): the setup page's choices on stdin, through the same
+            # command line, answer a configuration that resolves bundled:<backend> into this bundle (a stand-in without one).
+            if shipped:
+                if library: bundle, backend = library.parents[2], library.parent.name
+                else:
+                    bundle, backend = Path(data) / 'bundle', shipped[0]
+                    stand_in = bundled_library(backend, bundle); stand_in.parent.mkdir(parents=True); stand_in.touch()
+                choices = {'backend': backend, 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 2, 'name': 'Riko'}
+                setup = subprocess.run(CodePaths.current().server_command('--setup-config', data), input=json.dumps(choices), capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', env={**os.environ, 'RIKO_BUNDLE_ROOT': str(bundle)}, timeout=300)
+                try: written = yaml.safe_load(json.loads(setup.stdout.splitlines()[-1])['config'])
+                except (IndexError, KeyError, TypeError, ValueError, yaml.YAMLError): written = None
+                if setup.returncode or not isinstance(written, dict) or written['runtime']['native_library'] != f'bundled:{backend}':
+                    raise SystemExit(f'The first-run configuration failed (exit {setup.returncode}):\n{setup.stdout}{setup.stderr}')
         finally: os.chdir(previous)
     print('RIKO_RELEASE_CHECK_OK', flush=True)
 
@@ -151,6 +167,11 @@ def main():
         import runpy
         runpy.run_module('discord_bot', run_name='__main__')
         return
+    if '--setup-config' in sys.argv or '--validate-config' in sys.argv:
+        # The packaged first run asks for its configuration (electron/release.cjs saveSetup); --validate-config checks a
+        # file. One line of JSON out; no data root, port or model (configuration/first_run.py).
+        from process.app_core.configuration.first_run import command
+        raise SystemExit(command(sys.argv))
     this = sys.modules[__name__]  # uvicorn, Server and load_config resolve through __getattr__ (and tests replace them there)
     from process.app_core.configuration.paths import working_directory
     data = working_directory().absolute()  # RIKO_DATA_DIR, else the checkout
@@ -165,7 +186,10 @@ def main():
     # voice.level/chat.delta packet and can dominate the capture/UI event loop.
     # Redirected stdout uses the ANSI code page on Windows (cp932 has no em dash); never let output stop startup.
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='backslashreplace')
-    print("Riko AI server: http://127.0.0.1:8765 — Ctrl+C to stop", flush=True)
+    from process.app_core.desktop.api_guard import backend_port
+    try: port = backend_port()  # RIKO_PORT, else 8765: packaged Electron passes the free port its windows use
+    except ValueError as exc: raise SystemExit(str(exc)) from None
+    print(f"Riko AI server: http://127.0.0.1:{port} — Ctrl+C to stop", flush=True)
     import desktop_server
     app = desktop_server.create_app(config)  # this config, loaded once; the lifespan builds the services once uvicorn starts
     backend = app.state.backend
@@ -179,15 +203,16 @@ def main():
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE if os.name == 'nt' else socket.SO_REUSEADDR, 1)
     deadline = time.monotonic() + 20  # a previous backend may still be shutting down after a quick relaunch
     while True:
-        try: listener.bind(('127.0.0.1', 8765)); break
+        try: listener.bind(('127.0.0.1', port)); break
         except OSError as exc:
             if time.monotonic() >= deadline:
-                raise SystemExit(f'Port 8765 is already in use ({exc}); stop the other process and try again.') from None
+                raise SystemExit(f'Port {port} is already in use ({exc}); stop the other process or set RIKO_PORT, and try again.') from None
             time.sleep(.5)
     listener.listen(2048)
     backend.api_secrets()
-    if os.environ.get('RIKO_MANAGED') == '1': print('RIKO_BACKEND_LISTENING', flush=True)  # see electron/release.cjs
-    server = this.Server(this.uvicorn.Config(app, host="127.0.0.1", port=8765,
+    # electron/release.cjs listeningLine: main sends the token only once this names the port it gave us.
+    if os.environ.get('RIKO_MANAGED') == '1': print(f'RIKO_BACKEND_LISTENING port={port}', flush=True)
+    server = this.Server(this.uvicorn.Config(app, host="127.0.0.1", port=port,
                 log_level="info", timeout_graceful_shutdown=2), backend.stop_turn)
     if os.environ.get('RIKO_MANAGED') == '1':
         import faulthandler
@@ -196,7 +221,7 @@ def main():
             for line in sys.stdin:
                 if line.strip() == 'shutdown': break
             # Electron kills us 15 s after asking (electron/release.cjs). If teardown hangs, write every thread's
-            # stack to the launch log and exit at 14 s instead of outliving the app with :8765 and the model.
+            # stack to the launch log and exit at 14 s instead of outliving the app with its port and the model.
             try: faulthandler.dump_traceback_later(14, exit=True)
             except Exception: pass  # no usable stderr
             server.should_exit = True

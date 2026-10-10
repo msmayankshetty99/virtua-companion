@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -343,16 +344,24 @@ def test_live_budget_is_checked_only_when_edited_so_older_setups_can_save(tmp_pa
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def packaged_setup(data, form, resources):
+    """The packaged first run end to end: Electron's saveSetup (electron/release.cjs) asks this tree's backend, as it asks
+    the frozen one (`--setup-config`), and writes its answer."""
+    script = ("require('./release.cjs').saveSetup(process.argv[1], JSON.parse(process.argv[2]), process.argv[3], process.argv[3], process.platform,"
+        " JSON.parse(process.argv[4])).catch(error => {console.error(error.message); process.exit(1);})")
+    command = [sys.executable, str(ROOT / 'Code' / 'run_server.py')]
+    subprocess.run(['node', '-e', script, str(data), json.dumps(form), str(resources), json.dumps(command)], cwd=ROOT / 'electron', check=True, timeout=300)
+
+
 @pytest.mark.skipif(not shutil.which('node') or not (ROOT / 'electron' / 'node_modules' / 'yaml').is_dir(), reason='needs node and the Electron dependencies')
 def test_packaged_setup_writes_a_config_settings_can_save(tmp_path, monkeypatch):
-    # Electron's setup refuses a backend whose library is not where it looks, so this also proves that both languages
-    # resolve bundled:<backend> to the same file for this OS.
+    # The backend refuses a bundle whose library is not where bundled:<backend> resolves, and Electron passes it the
+    # resources it will later start the backend with, so this also proves both use the same file for this OS.
     resources, backend = tmp_path / 'application', backends_for()[0]
     library = bundled_library(backend, resources)
     library.parent.mkdir(parents=True); library.write_text('test')
     form = {'backend': backend, 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 4}
-    script = "require('./release.cjs').saveSetup(process.argv[1], JSON.parse(process.argv[2]), process.argv[3])"
-    subprocess.run(['node', '-e', script, str(tmp_path / 'data'), json.dumps(form), str(resources)], cwd=ROOT / 'electron', check=True, timeout=60)
+    packaged_setup(tmp_path / 'data', form, resources)
     monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(resources))
     store = SettingsStore(tmp_path / 'data' / 'character_config.yaml')
     assert load_config(store.path).runtime.native_library == library
@@ -370,8 +379,7 @@ def test_packaged_setup_name_gives_a_usable_wake_word(tmp_path, monkeypatch, nam
     library = bundled_library(backend, resources)
     library.parent.mkdir(parents=True); library.write_text('test')
     form = {'backend': backend, 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 4, 'name': name}
-    script = "require('./release.cjs').saveSetup(process.argv[1], JSON.parse(process.argv[2]), process.argv[3])"
-    subprocess.run(['node', '-e', script, str(tmp_path / 'data'), json.dumps(form), str(resources)], cwd=ROOT / 'electron', check=True, timeout=60)
+    packaged_setup(tmp_path / 'data', form, resources)
     monkeypatch.setenv('RIKO_BUNDLE_ROOT', str(resources))
     store = SettingsStore(tmp_path / 'data' / 'character_config.yaml')
     config = load_config(store.path)
@@ -423,3 +431,11 @@ def test_settings_lists_the_avatar_model_above_the_animation_engine(tmp_path):
     path.write_text('runtime:\n  provider: lm_studio\n', encoding='utf-8')  # neither section in the file, as after first setup
     sections = [field['section'] for field in SettingsStore(path).snapshot()['fields'] if field['section'] in ('Avatar model', 'Animation engine')]
     assert sections.index('Avatar model') < sections.index('Animation engine')
+
+
+def test_a_key_the_files_provider_does_not_use_is_not_judged(tmp_path):
+    """A leftover runtime.api_mode from an OpenAI setup loads and runs on llama_cpp; checking the whole file (first run,
+    --validate-config) must not reject it, as Settings no longer does for a field its provider hides."""
+    path = tmp_path / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: llama_server\n  api_mode: chat\n', encoding='utf-8')
+    assert SettingsStore(path).validate_file() == {'valid': True, 'errors': {}}

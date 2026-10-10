@@ -43,6 +43,19 @@ def test_existing_localhost_backend_urls_keep_working_over_ipv4_loopback(tmp_pat
     assert BotSettings.from_env(tmp_path, {'Discord_backend_url': 'http://localhost:8765/'}).backend_url == 'http://127.0.0.1:8765'
 
 
+def test_the_backend_url_defaults_to_the_backends_port_and_a_started_worker_reaches_its_own_backend(tmp_path, monkeypatch):
+    from process.app_core.configuration.paths import DataPaths
+    from process.app_core.integrations.discord.access import DiscordAccess
+    assert BotSettings.from_env(tmp_path, {}).backend_url == 'http://127.0.0.1:8765'
+    assert BotSettings.from_env(tmp_path, {'RIKO_PORT': '9123'}).backend_url == 'http://127.0.0.1:9123'  # as run_server binds
+    assert BotSettings.from_env(tmp_path, {'RIKO_PORT': '9123', 'Discord_backend_url': 'http://127.0.0.1:9000'}).backend_url == 'http://127.0.0.1:9000'
+    with pytest.raises(ValueError): BotSettings.from_env(tmp_path, {'RIKO_PORT': '80'})
+    paths = DataPaths.at(tmp_path)
+    paths.env_file.write_text('Discord_backend_url=http://127.0.0.1:8765\n', encoding='utf-8')
+    monkeypatch.setenv('Discord_backend_url', 'http://127.0.0.1:9123')  # what DiscordLauncher hands the worker
+    assert DiscordAccess(paths).settings().backend_url == 'http://127.0.0.1:9123'
+
+
 def test_discord_preferences_roundtrip_and_bad_data_preserved(tmp_path):
     path = tmp_path / 'discord.json'
     prefs = Preferences(path)

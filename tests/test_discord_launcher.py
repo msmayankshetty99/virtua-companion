@@ -8,7 +8,7 @@ from process.app_core.configuration.paths import DataPaths
 
 def test_launcher_is_explicit_idempotent_and_uses_only_the_transport(tmp_path, monkeypatch):
     # The data root is outside the checkout and holds no Code/: the worker is code, found where this code is (V106).
-    monkeypatch.setattr(launcher.os, 'environ', {'Discord_bot_token': 'fake-token', 'Discord_admins': '1'})
+    monkeypatch.setattr(launcher.os, 'environ', {'Discord_bot_token': 'fake-token', 'Discord_admins': '1', 'RIKO_PORT': '9123'})
     monkeypatch.setattr('dotenv.dotenv_values', lambda path: {})
     monkeypatch.setattr(launcher.threading, 'Thread', lambda **kwargs: SimpleNamespace(start=lambda: None))
     calls = []
@@ -30,10 +30,12 @@ def test_launcher_is_explicit_idempotent_and_uses_only_the_transport(tmp_path, m
     script = Path(launcher.__file__).resolve().parents[4] / 'discord_bot.py'
     assert calls[0][0] == [sys.executable, str(script)] and script.is_file() and not script.is_relative_to(tmp_path)
     assert 'fake-token' not in str(calls[0][0])  # credentials never on the command line
-    # The child inherits the environment as before, plus only the backend API token, data root, config and exit rule: it
-    # loads this backend's .env and access file whatever RIKO_DATA_DIR and RIKO_CONFIG held here.
+    # The child inherits the environment as before, plus only the backend API token, data root, config, exit rule and
+    # address: it loads this backend's .env and access file whatever RIKO_DATA_DIR and RIKO_CONFIG held here, and reaches
+    # the port this backend bound (RIKO_PORT) whatever Discord_backend_url its .env names.
     env = calls[0][1]['env']
-    assert set(env) - set(launcher.os.environ) == {'RIKO_API_TOKEN', 'RIKO_DATA_DIR', 'RIKO_CONFIG', 'RIKO_EXIT_WITH_BACKEND'}
+    assert set(env) - set(launcher.os.environ) == {'RIKO_API_TOKEN', 'RIKO_DATA_DIR', 'RIKO_CONFIG', 'RIKO_EXIT_WITH_BACKEND', 'Discord_backend_url'}
+    assert env['Discord_backend_url'] == 'http://127.0.0.1:9123'
     assert calls[0][1]['stdin'] == launcher.subprocess.PIPE  # closes when this backend exits
     assert env['RIKO_API_TOKEN'] == 'x' * 43 and env['RIKO_DATA_DIR'] == str(paths.root) == str(calls[0][1]['cwd'])
     assert env['RIKO_CONFIG'] == str(tmp_path / 'data' / 'character_config.yaml')

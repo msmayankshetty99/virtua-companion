@@ -143,7 +143,9 @@ def test_settings_returns_provider_visibility_and_the_rules_the_backend_enforces
     assert fields['runtime.base_url']['visible_when'] == {'runtime.provider': ['llama_server', 'lm_studio', 'openai', 'openai_compatible', 'ollama', 'local_http']}
     assert fields['runtime.n_ubatch']['visible_when'] == {'runtime.provider': ['llama_cpp']}
     assert fields['runtime.parallel_slots']['visible_when'] == {'runtime.provider': ['llama_cpp', 'llama_server']}
-    assert 'visible_when' not in fields['runtime.temperature'] and 'runtime.model' not in fields  # an omitted OpenAI-only key, as before
+    assert 'visible_when' not in fields['runtime.temperature']
+    # Every provider's keys arrive, so switching the draft's provider shows them at once (the renderer filters by visible_when).
+    assert fields['runtime.model']['visible_when'] == fields['runtime.api_mode']['visible_when'] == {'runtime.provider': ['lm_studio', 'openai', 'openai_compatible', 'ollama', 'local_http']}
     rules = {rule['path']: rule for rule in snapshot['rules']}
     assert rules['runtime.n_ubatch'] == {'path': 'runtime.n_ubatch', 'message': 'runtime.n_ubatch must not exceed n_batch',
         'when': {'runtime.provider': ['llama_cpp']}, 'at_most': 'runtime.n_batch'}

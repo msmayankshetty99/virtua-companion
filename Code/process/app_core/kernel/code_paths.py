@@ -31,3 +31,7 @@ class CodePaths:
     def discord_command(self): return [sys.executable, '--discord-worker'] if self.frozen else [sys.executable, str(self.discord_bot)]
 
     def tool_command(self): return [sys.executable, '--tool-worker'] if self.frozen else [sys.executable, str(self.tool_worker)]
+
+    def server_command(self, *arguments):
+        """run_server with arguments: the frozen binary itself, or Code/run_server.py (--setup-config, --validate-config)."""
+        return [sys.executable, *arguments] if self.frozen else [sys.executable, str(self.root / 'Code' / 'run_server.py'), *arguments]
