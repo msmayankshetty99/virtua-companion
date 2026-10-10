@@ -1,19 +1,18 @@
 """Backend entry point: standalone in development, Electron-owned in releases."""
 from pathlib import Path
-import asyncio
 import os
 import logging
 import sys
-
-import uvicorn
-
-from process.app_core.configuration.config import load_config
 
 # Imported lazily or dynamically, so a module or data file the frozen build misses would otherwise fail only on a
 # user's machine (tools/release/build.py collects them).
 RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'faster_whisper', 'ctranslate2', 'silero_vad',
     'onnxruntime', 'sounddevice', 'soundfile', 'scipy.signal', 'ruamel.yaml', 'pypdf', 'openai', 'huggingface_hub', 'discord',
-    'discord_bot')
+    'discord_bot', 'uvicorn')
+# kernel/, which code imports partly inside functions (chat's metrics, the background budgets): the release check imports
+# each by name, as it loads every name of the lazy process.app_core facade. tests/test_release_build.py keeps it equal to kernel/.
+KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('audio_config', 'background_budget', 'cancellation', 'code_paths', 'lifecycle',
+    'messages', 'metrics', 'output_filter', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
 # Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
 DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
 
@@ -24,16 +23,32 @@ def is_driver(name):
     return name.lower() == 'nvcuda.dll' or bool(re.fullmatch(r'libcuda\.(dylib|so(\.\d+)*)', name))
 
 
-class Server(uvicorn.Server):
-    """uvicorn, except that the active turn ends before requests drain: a reply still generating would hold its
-    request for the whole drain, and Electron allows the entire shutdown 15 s (electron/release.cjs)."""
-    def __init__(self, config, stop_turn):
-        super().__init__(config)
-        self.stop_turn = stop_turn
+def server_class():
+    import asyncio
+    import uvicorn
 
-    async def shutdown(self, sockets=None):
-        await asyncio.to_thread(self.stop_turn)
-        await super().shutdown(sockets=sockets)
+    class Server(uvicorn.Server):
+        """uvicorn, except that the active turn ends before requests drain: a reply still generating would hold its
+        request for the whole drain, and Electron allows the entire shutdown 15 s (electron/release.cjs)."""
+        def __init__(self, config, stop_turn):
+            super().__init__(config)
+            self.stop_turn = stop_turn
+
+        async def shutdown(self, sockets=None):
+            await asyncio.to_thread(self.stop_turn)
+            await super().shutdown(sockets=sockets)
+    return Server
+
+
+def __getattr__(name):
+    """uvicorn, Server and load_config load on first use and stay: frozen, every built-in tool call and the Discord client
+    re-execute this binary (--tool-worker, --discord-worker), and main() dispatches those before any of them loads."""
+    if name == 'uvicorn': import uvicorn as value
+    elif name == 'Server': value = server_class()
+    elif name == 'load_config': from process.app_core.configuration.config import load_config as value
+    else: raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    globals()[name] = value
+    return value
 
 
 def loaded_libraries(names):
@@ -75,9 +90,11 @@ def release_check(library=None):
     tree without a library. It needs no GPU, audio device, credentials, network or model, and touches no user data."""
     import ctypes
     import importlib
+    import json
     import subprocess
     import tempfile
-    from process.app_core.configuration.native_backends import backends_for, library_name
+    import yaml
+    from process.app_core.configuration.native_backends import backends_for, bundled_library, library_name
     shipped, name = backends_for(sys.platform), library_name(sys.platform)  # the frozen copy bundled:<backend> resolves with
     if library and (Path(library).name != name or Path(library).absolute().parent.name not in shipped):
         raise SystemExit(f'{library} is not where bundled:<backend> looks on {sys.platform}: native/<{"|".join(shipped)}>/{name}')
@@ -91,17 +108,21 @@ def release_check(library=None):
             if directory: directory.close()
         problems = native_bundle_problems(library, loaded_libraries({file.name for file in library.parent.iterdir()} | DRIVER_LIBRARIES))
         if problems: raise SystemExit('The native bundle is not self-contained:\n  ' + '\n  '.join(problems))
-    for module in RELEASE_MODULES: importlib.import_module(module)
+    for module in RELEASE_MODULES + KERNEL_MODULES: importlib.import_module(module)
+    core = importlib.import_module('process.app_core')
+    for name in core.__all__: getattr(core, name)
     from eff_word_net.audio_processing import Resnet50_Arc_loss
     from silero_vad import load_silero_vad
     Resnet50_Arc_loss(); load_silero_vad()  # wake words and voice activity: both models are package data files
     previous = os.getcwd()
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as data:
-        # desktop_server loads the config on import: the defaults, in an empty data root, never a developer's files.
+        # The app over the defaults, in an empty data root, never a developer's files.
         os.environ.update(RIKO_DATA_DIR=data, RIKO_CONFIG=str(Path(data) / 'character_config.yaml'))
         os.chdir(data)
         try:
-            import desktop_server  # the FastAPI app and the whole app_core import graph
+            import desktop_server  # the FastAPI app, every router and the whole app_core import graph
+            from process.app_core.configuration.config import load_config
+            desktop_server.create_app(load_config(recover='setup'))  # builds the routes and the Backend; starts nothing
             from process.app_core.tools.builtin.scientific_calculator import Tool
             from process.app_core.tools.registry import ToolRegistry
             registry = ToolRegistry(timeout_seconds=300)  # through the real worker: --tool-worker when frozen
@@ -111,11 +132,24 @@ def release_check(library=None):
             finally: registry.close()
             if result.is_error or result.content != '1024': raise SystemExit(f'A built-in tool failed in its worker: {result.content}')
             # As DiscordLauncher starts it, but --dry-run stops before the credentials check and the login.
-            script = Path(__file__).with_name('discord_bot.py')
-            command = [sys.executable, '--discord-worker'] if getattr(sys, 'frozen', False) else [sys.executable, str(script)]
-            worker = subprocess.run([*command, '--dry-run'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
+            from process.app_core.kernel.code_paths import CodePaths
+            worker = subprocess.run([*CodePaths.current().discord_command(), '--dry-run'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
             if worker.returncode or 'RIKO_DISCORD_DRY_RUN_OK' not in worker.stdout:
                 raise SystemExit(f'The Discord worker failed its dry run (exit {worker.returncode}):\n{worker.stdout}{worker.stderr}')
+            # The packaged first run (electron/release.cjs saveSetup): the setup page's choices on stdin, through the same
+            # command line, answer a configuration that resolves bundled:<backend> into this bundle (a stand-in without one).
+            if shipped:
+                if library: bundle, backend = library.parents[2], library.parent.name
+                else:
+                    bundle, backend = Path(data) / 'bundle', shipped[0]
+                    stand_in = bundled_library(backend, bundle); stand_in.parent.mkdir(parents=True); stand_in.touch()
+                choices = {'backend': backend, 'repo': 'owner/model', 'filename': 'model.gguf', 'context': 8192, 'output': 1024, 'threads': 2, 'name': 'Riko'}
+                setup = subprocess.run(CodePaths.current().server_command('--setup-config', data), input=json.dumps(choices), capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', env={**os.environ, 'RIKO_BUNDLE_ROOT': str(bundle)}, timeout=300)
+                try: written = yaml.safe_load(json.loads(setup.stdout.splitlines()[-1])['config'])
+                except (IndexError, KeyError, TypeError, ValueError, yaml.YAMLError): written = None
+                if setup.returncode or not isinstance(written, dict) or written['runtime']['native_library'] != f'bundled:{backend}':
+                    raise SystemExit(f'The first-run configuration failed (exit {setup.returncode}):\n{setup.stdout}{setup.stderr}')
         finally: os.chdir(previous)
     print('RIKO_RELEASE_CHECK_OK', flush=True)
 
@@ -133,16 +167,32 @@ def main():
         import runpy
         runpy.run_module('discord_bot', run_name='__main__')
         return
-    os.chdir(Path(os.environ.get('RIKO_DATA_DIR', Path(__file__).resolve().parents[1])))
-    config = load_config()
+    if '--setup-config' in sys.argv or '--validate-config' in sys.argv:
+        # The packaged first run asks for its configuration (electron/release.cjs saveSetup); --validate-config checks a
+        # file. One line of JSON out; no data root, port or model (configuration/first_run.py).
+        from process.app_core.configuration.first_run import command
+        raise SystemExit(command(sys.argv))
+    this = sys.modules[__name__]  # uvicorn, Server and load_config resolve through __getattr__ (and tests replace them there)
+    from process.app_core.configuration.paths import working_directory
+    data = working_directory().absolute()  # RIKO_DATA_DIR, else the checkout
+    # Explicit, and absolute, for load_config (earlier releases kept the to-do list in this cwd) and every child: tool
+    # workers, MCP servers and the task MCP server find the same data root.
+    os.environ['RIKO_DATA_DIR'] = str(data)
+    os.chdir(data)
+    config = this.load_config(recover='setup')  # the app's lifespan reports a broken section in setup mode
     from process.app_core.configuration.debug_logging import configure_logging
     configure_logging(config)
     # Debug our application, not WebSocket frames. Uvicorn DEBUG dumps every
     # voice.level/chat.delta packet and can dominate the capture/UI event loop.
     # Redirected stdout uses the ANSI code page on Windows (cp932 has no em dash); never let output stop startup.
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='backslashreplace')
-    print("Riko AI server: http://127.0.0.1:8765 — Ctrl+C to stop", flush=True)
+    from process.app_core.desktop.api_guard import backend_port
+    try: port = backend_port()  # RIKO_PORT, else 8765: packaged Electron passes the free port its windows use
+    except ValueError as exc: raise SystemExit(str(exc)) from None
+    print(f"Riko AI server: http://127.0.0.1:{port} — Ctrl+C to stop", flush=True)
     import desktop_server
+    app = desktop_server.create_app(config)  # this config, loaded once; the lifespan builds the services once uvicorn starts
+    backend = app.state.backend
     # Hold the port before the model loads, so no other process (or account) can listen on it and
     # collect the API token Electron sends. In development this start's token is minted only now, so a
     # squatter could only have seen the previous one; packaged Electron sends its token only after the
@@ -153,16 +203,17 @@ def main():
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE if os.name == 'nt' else socket.SO_REUSEADDR, 1)
     deadline = time.monotonic() + 20  # a previous backend may still be shutting down after a quick relaunch
     while True:
-        try: listener.bind(('127.0.0.1', 8765)); break
+        try: listener.bind(('127.0.0.1', port)); break
         except OSError as exc:
             if time.monotonic() >= deadline:
-                raise SystemExit(f'Port 8765 is already in use ({exc}); stop the other process and try again.') from None
+                raise SystemExit(f'Port {port} is already in use ({exc}); stop the other process or set RIKO_PORT, and try again.') from None
             time.sleep(.5)
     listener.listen(2048)
-    desktop_server.api_secrets()
-    if os.environ.get('RIKO_MANAGED') == '1': print('RIKO_BACKEND_LISTENING', flush=True)  # see electron/release.cjs
-    server = Server(uvicorn.Config(desktop_server.app, host="127.0.0.1", port=8765,
-                log_level="info", timeout_graceful_shutdown=2), desktop_server.stop_turn)
+    backend.api_secrets()
+    # electron/release.cjs listeningLine: main sends the token only once this names the port it gave us.
+    if os.environ.get('RIKO_MANAGED') == '1': print(f'RIKO_BACKEND_LISTENING port={port}', flush=True)
+    server = this.Server(this.uvicorn.Config(app, host="127.0.0.1", port=port,
+                log_level="info", timeout_graceful_shutdown=2), backend.stop_turn)
     if os.environ.get('RIKO_MANAGED') == '1':
         import faulthandler
         import threading
@@ -170,7 +221,7 @@ def main():
             for line in sys.stdin:
                 if line.strip() == 'shutdown': break
             # Electron kills us 15 s after asking (electron/release.cjs). If teardown hangs, write every thread's
-            # stack to the launch log and exit at 14 s instead of outliving the app with :8765 and the model.
+            # stack to the launch log and exit at 14 s instead of outliving the app with its port and the model.
             try: faulthandler.dump_traceback_later(14, exit=True)
             except Exception: pass  # no usable stderr
             server.should_exit = True

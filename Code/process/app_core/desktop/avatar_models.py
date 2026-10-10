@@ -103,3 +103,12 @@ class AvatarModels:
                 destination.unlink(missing_ok=True)
                 raise
         return {'path': destination.relative_to(self.root).as_posix(), 'format': detected}
+
+
+def review_settings(candidate, draft, changes):
+    """Settings' check of an edited avatar.model or avatar.format (a Section review: desktop imports nothing else from
+    app_core, so app_core/__init__.py registers it)."""
+    if not {'avatar.model', 'avatar.format'} & changes.keys(): return {}
+    try: AvatarModels(candidate.root).validate(draft['avatar.model'], draft['avatar.format'])
+    except (ValueError, OSError) as exc: return {'avatar.model': str(exc)}
+    return {}

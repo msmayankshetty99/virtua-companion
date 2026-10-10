@@ -8,7 +8,8 @@ import pytest
 from process.app_core.inference.llama_native import NativeClient, NativeRuntime
 from process.app_core.configuration.config import load_config
 from process.app_core.configuration.config import RuntimeConfig
-from process.app_core.conversation.messages import ChatMessage
+from process.app_core.kernel.messages import ChatMessage
+from process.app_core.kernel.turns import TurnContext
 from process.app_core.inference.llama_native import InProcessLlamaProvider
 from process.app_core.configuration.settings_store import SettingsStore, field
 
@@ -77,7 +78,7 @@ def test_julia_gpu_option_does_not_enable_gpu_probe():
     assert field('emotion.device', 'cpu')['options'] == ['cpu', 'auto', 'cuda', 'cuda:0']
     assert field('memory.device', 'cpu')['options'] == ['cpu', 'auto', 'cuda', 'cuda:0', 'mps']
     from process.app_core.emotion.probe import ProbeConfig
-    with pytest.raises(ValueError): ProbeConfig.from_raw({'device': 'cuda'})
+    assert not hasattr(ProbeConfig.from_raw({'device': 'cuda'}), 'device')  # ignored (load_config reports it), never a GPU probe
 
 
 def test_probe_cannot_silently_use_stock_http_server(tmp_path):
@@ -260,7 +261,7 @@ def test_missing_library_fails_before_model_resolution(tmp_path, monkeypatch):
 
 
 def test_native_probe_capture_checks_utf8_prefix_and_turn_alignment(monkeypatch):
-    from process.app_core.emotion.probe import FEATURE_VERSION
+    from process.app_core.emotion.probe_hook import FEATURE_VERSION, ProbeHook
     runtime = fake_runtime([])
     samples = []
     probe = SimpleNamespace(active_group=None, close=lambda: None)
@@ -284,9 +285,11 @@ def test_native_probe_capture_checks_utf8_prefix_and_turn_alignment(monkeypatch)
         return 0
     runtime.dll.riko_request = request
     provider = InProcessLlamaProvider(RuntimeConfig(model_path='unused.gguf'))
+    hook = ProbeHook(lambda identity, idle: probe)
+    provider.attach_probe(hook, 32)
+    hook.start({}, provider.probe_idle)  # what _start does once the model is up
     provider.native = runtime
     provider.client = NativeClient(runtime)
-    provider.probe = probe
     monkeypatch.setattr(provider, '_start', lambda: None)
     runtime.dll.riko_stop = lambda _: None
     runtime.dll.riko_destroy = lambda _: None
@@ -445,7 +448,7 @@ def test_probe_identity_records_the_flash_attention_llama_cpp_chose(requested, n
 
 def chat_over_native(monkeypatch, replies, tool_output='found'):
     """ChatService on the native provider; the fake tokenizer counts four characters per token."""
-    from process.app_core.conversation.chat import ChatService
+    from process.app_core.conversation.chat import ChatDeps, ChatService
     from process.app_core.tools.registry import RegisteredTool, ToolRegistry
     runtime, requests, replies = fake_runtime([]), [], iter(replies)
     def request(handle, path, body, output, cancel, user):
@@ -464,9 +467,8 @@ def chat_over_native(monkeypatch, replies, tool_output='found'):
     monkeypatch.setattr(provider, '_start', lambda: None)
     registry = ToolRegistry()
     registry.tools['lookup'] = RegisteredTool('lookup', 'Look it up', {'type': 'object', 'properties': {}}, lambda args: tool_output)
-    chat = ChatService(provider, system_prompt='Riko', tool_registry=registry)
-    chat.context_limit = 8192
-    chat.history = [ChatMessage(role, f'{role} {i} ' + 'q' * 400) for i in range(120) for role in ('user', 'assistant')]
+    chat = ChatService(provider, system_prompt='Riko', tool_registry=registry, deps=ChatDeps(context_limit=8192))
+    chat.conversation.append([ChatMessage(role, f'{role} {i} ' + 'q' * 400) for i in range(120) for role in ('user', 'assistant')])
     return chat, requests
 
 
@@ -477,9 +479,9 @@ SAID = {'type': 'message', 'content': [{'type': 'output_text', 'text': 'Summary'
 def test_native_chat_keeps_sent_observations_and_a_fixed_prefix_with_one_count_per_reply(monkeypatch):
     chat, requests = chat_over_native(monkeypatch, [CALL, CALL, SAID] + [SAID] * 5)
     observed = iter(range(100))
-    chat.runtime_context = lambda: {'observation': next(observed)}
+    observe = TurnContext(runtime=lambda: {'observation': next(observed)})
     try:
-        for turn in range(6): assert chat.respond(f'turn {turn} ' + 'z' * 400).message.content == 'Summary'
+        for turn in range(6): assert chat.respond(f'turn {turn} ' + 'z' * 400, context=observe).message.content == 'Summary'
     finally: chat.tool_registry.close(); chat.provider.close()
     inputs = [body['input'] for path, body in requests if path == '/v1/responses']
     counts, pending = [], 0

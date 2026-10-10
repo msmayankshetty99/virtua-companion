@@ -2,9 +2,15 @@
 from pathlib import Path
 
 EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.mp4', '.webm', '.mov', '.m4v'}
+EFFECTS_DIRECTORY = 'effects/greenscreens'  # desktop.effects_directory's default, against the data root
 
 
-def resolve_media(root, value, effects_directory='effects/greenscreens', *, extensions=None):
+def effects_directory(raw):
+    """desktop.effects_directory from a config's raw sections, relative to its root."""
+    return raw.get('desktop', {}).get('effects_directory', EFFECTS_DIRECTORY)
+
+
+def resolve_media(root, value, effects_directory=EFFECTS_DIRECTORY, *, extensions=None):
     root = Path(root).resolve()
     roots = [root / 'character_files', root / 'persistent_memories' / 'generated_assets', root / effects_directory]
     path = Path(value)

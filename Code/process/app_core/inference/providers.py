@@ -8,13 +8,16 @@ from contextlib import contextmanager
 from copy import deepcopy
 from typing import Iterable, Sequence
 
-from ..conversation.messages import ChatMessage, ModelResponse, ToolCall
-from ..conversation.streaming import WordDeltas
+from ..kernel.messages import ChatMessage, ModelResponse, ToolCall
+from ..kernel.streaming import WordDeltas
+from .provider import BaseProvider
 from .responses import response_input, response_tools, template_messages
+from .settings import OPENAI_COMPATIBLE
 
 
-class OpenAIProvider:
-    """Adapter for OpenAI-compatible Chat Completions and Responses servers."""
+class OpenAIProvider(BaseProvider):
+    """Adapter for OpenAI-compatible Chat Completions and Responses servers: no slots, estimated token counts (BaseProvider's)
+    and no provider-wide cancel. Each streamed request stops through its own `cancelled` (cancellable_stream)."""
     def __init__(self, config):
         from openai import OpenAI
         self.config = config
@@ -173,14 +176,6 @@ class OpenAIProvider:
             yield from pending
         finally: stream.close()
 
-    def count_tokens(self, messages):
-        from .context_budget import estimate_tokens
-        return estimate_tokens(template_messages(messages))
-
-    def count_text_tokens(self, text):
-        from .context_budget import estimate_text_tokens
-        return estimate_text_tokens(text) # A calibrated estimate, not the server's tokenizer.
-
     def close(self):
         close = getattr(self.client, "close", None)
         if close: close()
@@ -193,7 +188,7 @@ def cancellable_stream(start, cancelled=None):
     its socket down on cancellation, which wakes the blocked read (closing alone may not). It is per request on
     purpose: initiative and reflection share this provider, so a provider-wide cancel would stop them too.
     Any failure once cancelled is BackgroundPreempted, as from the llama.cpp providers."""
-    from .llama_context import BackgroundPreempted
+    from ..kernel.cancellation import BackgroundPreempted
     cancelled = cancelled or (lambda: False)
     opened, done, abandoned, closing = Future(), threading.Event(), threading.Event(), threading.Lock()
     def guard():
@@ -271,7 +266,7 @@ def create_provider(config):
     if provider == "llama_server":
         from .llama_server import LlamaServerProvider
         return LlamaServerProvider(config)
-    if provider in {"openai", "lm_studio", "openai_compatible", "ollama", "local_http"}:
+    if provider in OPENAI_COMPATIBLE:
         return OpenAIProvider(config)
     raise ValueError(
         f"Unsupported provider '{config.provider}'. Use llama_cpp, llama_server, openai, lm_studio, "

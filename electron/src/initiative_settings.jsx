@@ -1,7 +1,6 @@
 import React, {useEffect, useState} from 'react';
 import useResource from './use_resource.jsx';
-
-const API = 'http://127.0.0.1:8765';
+import {request} from './api.mjs';
 
 export default function InitiativeSettings() {
   const [status, setStatus, streamError] = useResource('initiative');
@@ -9,12 +8,6 @@ export default function InitiativeSettings() {
   const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
   const [context, setContext] = useState('');
-  async function request(path, options) {
-    const response = await fetch(API + path, options);
-    const body = await response.json();
-    if (!response.ok) throw new Error(body.detail || 'Request failed');
-    return body;
-  }
   async function load() {
     try {
       const value = await request('/api/initiative');
@@ -30,13 +23,13 @@ export default function InitiativeSettings() {
     setPending(true);
     try {
       const {context_window_tokens,max_output_tokens,...preferences}=settings;
-      const value = await request('/api/initiative', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(preferences)});
+      const value = await request('/api/initiative', {method: 'PUT', body: preferences});
       setStatus(value); setSettings(value.settings); setError('');
     } catch (exc) {setError(exc.message);} finally {setPending(false);}
   }
   async function testEvent() {
     try {
-      await request('/api/initiative/event', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({event: 'user.custom', context})});
+      await request('/api/initiative/event', {method: 'POST', body: {event: 'user.custom', context}});
       setError('');
     } catch (exc) {setError(exc.message);}
   }

@@ -6,7 +6,8 @@ import pytest
 from process.app_core.configuration.config import AppConfig, RuntimeConfig
 from process.app_core.resources.gpu_memory import GPUMonitor, reconcile
 from process.app_core.inference.llama_context import context_capacity, native_arguments
-from process.app_core.resources.vram_estimate import estimate, read_gguf
+from process.app_core.inference.gguf import read_gguf
+from process.app_core.resources.vram_estimate import estimate
 
 
 def config(tmp_path, **options):

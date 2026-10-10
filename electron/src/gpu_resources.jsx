@@ -1,5 +1,5 @@
 import React,{useEffect,useState} from 'react';
-import {request} from './api.mjs';
+import {request,socketURL} from './api.mjs';
 import {connectEvents} from './event_connection.mjs';
 import Explanation from './explanation.jsx';
 const memory=value=>value==null?'Unavailable':`${Math.round(value).toLocaleString()} MiB`;
@@ -12,7 +12,7 @@ export default function GPUResources({changes={},valid=true}){
     return connectEvents(event=>{
       const value=event.type==='resource.snapshot'?event.payload?.gpu:event.type==='resource.gpu'?event.payload:null;
       if(value)setLive(value);
-    },connected=>setError(connected?'':'GPU telemetry disconnected'),{url:'ws://127.0.0.1:8765/ws/resources/gpu'});
+    },connected=>setError(connected?'':'GPU telemetry disconnected'),{url:socketURL('/ws/resources/gpu')});
   },[]);
   useEffect(()=>{
     let alive=true;if(!valid){setError('Fix invalid draft settings to calculate the estimate.');return;}

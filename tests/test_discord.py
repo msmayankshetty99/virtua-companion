@@ -2,7 +2,6 @@ import asyncio
 import io
 import json
 from pathlib import Path
-import threading
 import time
 from types import SimpleNamespace
 from uuid import uuid4
@@ -20,6 +19,7 @@ from process.app_core.integrations.discord.replies import StreamReply
 from process.app_core.integrations.discord.voice import VoiceCapture, MAX_CALL_BYTES, downsample_call
 from process.app_core.audio.tts_http import request_payload, synthesize_wav
 from process.app_core.tools.approval import ToolApprovals, approval_turn
+from process.app_core.kernel.audio_config import audio_sections
 
 
 def test_discord_policy_fails_closed_and_separates_admins(tmp_path):
@@ -41,6 +41,22 @@ def test_discord_backend_url_cannot_send_runtime_secrets_remotely(tmp_path, url)
 
 def test_existing_localhost_backend_urls_keep_working_over_ipv4_loopback(tmp_path):
     assert BotSettings.from_env(tmp_path, {'Discord_backend_url': 'http://localhost:8765/'}).backend_url == 'http://127.0.0.1:8765'
+
+
+def test_the_backend_url_defaults_to_the_backends_port_and_a_started_worker_reaches_its_own_backend(tmp_path, monkeypatch):
+    from process.app_core.configuration.paths import DataPaths
+    from process.app_core.integrations.discord.access import DiscordAccess
+    assert BotSettings.from_env(tmp_path, {}).backend_url == 'http://127.0.0.1:8765'
+    assert BotSettings.from_env(tmp_path, {'RIKO_PORT': '9123'}).backend_url == 'http://127.0.0.1:9123'  # as run_server binds
+    assert BotSettings.from_env(tmp_path, {'RIKO_PORT': '9123', 'Discord_backend_url': 'http://127.0.0.1:9000'}).backend_url == 'http://127.0.0.1:9000'
+    with pytest.raises(ValueError): BotSettings.from_env(tmp_path, {'RIKO_PORT': '80'})
+    paths = DataPaths.at(tmp_path)
+    paths.env_file.write_text('Discord_backend_url=http://127.0.0.1:8765\n', encoding='utf-8')
+    monkeypatch.setenv('Discord_backend_url', 'http://127.0.0.1:9123')  # what DiscordLauncher hands the worker
+    assert DiscordAccess(paths).settings().backend_url == 'http://127.0.0.1:9123'
+    monkeypatch.delenv('Discord_backend_url')
+    monkeypatch.setenv('DISCORD_BACKEND_URL', 'http://127.0.0.1:9124')  # how Windows reports the launcher's variable
+    assert DiscordAccess(paths).settings().backend_url == 'http://127.0.0.1:9124'
 
 
 def test_discord_preferences_roundtrip_and_bad_data_preserved(tmp_path):
@@ -179,8 +195,7 @@ def test_call_pcm_is_resampled_to_mono_16khz():
 def test_discord_api_uses_existing_session_without_local_speech_and_scopes_stop(monkeypatch):
     identity = str(uuid4())
     calls = []
-    session = SimpleNamespace(_closed=False, _voice_lock=threading.RLock(),
-        _active_turn=identity, _generation_active=True, cancel=lambda: calls.append('cancel'),
+    session = SimpleNamespace(is_open=True, cancel_turn=lambda turn_id: turn_id == identity and not calls.append('cancel'),
         respond=lambda *args, **kwargs: calls.append(kwargs) or SimpleNamespace(message=SimpleNamespace(content='hello')))
     app = FastAPI(); app.include_router(api.create_router(lambda: session))
     client = TestClient(app)
@@ -195,7 +210,7 @@ def test_discord_api_uses_existing_session_without_local_speech_and_scopes_stop(
 
 def test_discord_asr_api_validates_limits_and_recovers_after_failure(monkeypatch):
     calls = []
-    session = SimpleNamespace(_closed=False)
+    session = SimpleNamespace(is_open=True)
     monkeypatch.setattr(api, 'transcribe_pcm', lambda session, pcm: calls.append(len(pcm)) or 'heard you')
     app = FastAPI(); app.include_router(api.create_router(lambda: session))
     client = TestClient(app)
@@ -213,7 +228,7 @@ def test_audio_export_failure_does_not_disable_subsequent_requests(monkeypatch):
         if not state[0]: raise RuntimeError('offline')
         return b'RIFFfake'
     monkeypatch.setattr(api, 'synthesize_wav', synthesize)
-    app = FastAPI(); app.include_router(api.create_router(lambda: SimpleNamespace(_closed=False, config=None)))
+    app = FastAPI(); app.include_router(api.create_router(lambda: SimpleNamespace(is_open=True, config=None)))
     client = TestClient(app)
     assert client.post('/api/discord/speech', json={'text':'hello'}).status_code == 503
     state[0] = True
@@ -222,7 +237,7 @@ def test_audio_export_failure_does_not_disable_subsequent_requests(monkeypatch):
 
 
 def test_exported_tts_reuses_http_payload_and_never_opens_sound_device(tmp_path, monkeypatch):
-    config = SimpleNamespace(root=tmp_path, raw={'sovits_ping_config':{'sample_rate':16000, 'text_lang':'en'}})
+    config = SimpleNamespace(root=tmp_path, **audio_sections({'sovits_ping_config':{'sample_rate':16000, 'text_lang':'en'}}))
     url, payload = request_payload(config, 'hello')
     assert payload['media_type'] == 'raw' and payload['text_lang'] == 'en'
     class Response:
@@ -257,7 +272,7 @@ def test_bot_import_and_command_registration_do_not_construct_models(tmp_path):
     from process.app_core.integrations.discord.bot import CompanionBot
     from process.app_core.integrations.discord.commands import CompanionCommands
     async def run():
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})))
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json')
         await bot.add_cog(CompanionCommands(bot))
         names = {command.name for command in bot.tree.get_commands()}
         assert {'chat','speak','transcribe','join','leave','listen','stop','settings','messages','tool_policy','camera','tasks','initiative','whiteboard','resources','animation','memory','memories','history','edit','task_create','task_update','status','reasoning'} <= names
@@ -276,7 +291,7 @@ def test_stop_is_scoped_to_user_and_turn_and_retains_other_queued_jobs(tmp_path)
             def __init__(self, *args): pass
             async def request(self, method, path, **kwargs): calls.append((path, kwargs['body']))
             async def close(self): pass
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         channel = SimpleNamespace(id=42)
         active = Job(channel, SimpleNamespace(id=1))
         active.task = asyncio.create_task(asyncio.Event().wait())
@@ -306,7 +321,7 @@ def test_approval_snapshots_do_not_relay_unrelated_desktop_turns(tmp_path):
             sent.append(content)
             return SimpleNamespace(edit=edit)
         async def edit(**kwargs): pass
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         job = Job(SimpleNamespace(id=42, send=send), SimpleNamespace(id=1))
         bot.active = job
         unrelated = {'id':'desktop', 'name':'tool', 'arguments':{}, 'turn_id':'desktop-turn', 'expires_at':time.time()+120}
@@ -330,7 +345,7 @@ def test_audio_attachments_are_rejected_before_download_and_pcm_cannot_bypass_pa
             def __init__(self, *args): self.ready = asyncio.Event(); self.ready.set()
             async def close(self): pass
         async def read(): raise AssertionError('Paused audio must never be downloaded')
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         channel, user = SimpleNamespace(id=42), SimpleNamespace(id=1)
         with pytest.raises(ValueError, match='paused'):
             await bot.process_job(Job(channel, user, attachment=SimpleNamespace(size=4, filename='recording.wav', read=read)))
@@ -372,7 +387,7 @@ def test_paused_calling_cannot_load_voice_dependencies_and_text_chat_still_works
             return SimpleNamespace(edit=None)
         user = SimpleNamespace(id=1, display_name='Owner')
         channel = SimpleNamespace(id=42, guild=None, send=send)
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         monkeypatch.setattr('process.app_core.integrations.discord.bot.receive_extension', lambda: (_ for _ in ()).throw(AssertionError('Voice dependency loaded')))
         bot.preferences.set(42, 'audio', True) # Old preference cannot re-enable attachments.
         assert bot.voice_for(channel) is None
@@ -396,7 +411,7 @@ def test_whiteboard_changes_send_images_without_polling_or_audio(tmp_path):
                 return b'PNG'
             async def close(self): pass
         async def send(content=None, **kwargs): sent.append(kwargs['file'].filename)
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         bot.board_target = SimpleNamespace(id=42, guild=None, send=send)
         await bot.backend_event({'type':'whiteboard.changed','payload':{'revision':'a'}})
         worker = bot.board_update
@@ -430,7 +445,7 @@ def test_discord_transport_errors_never_end_the_turn_queue(tmp_path):
         async def deliver(content=None, **kwargs): sent.append(content); return SimpleNamespace(content=content)
         offline, online = SimpleNamespace(id=42, guild=None, send=drop), SimpleNamespace(id=42, guild=None, send=deliver)
         user = SimpleNamespace(id=1, display_name='Owner')
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         bot.processor = asyncio.create_task(bot.process_queue())
         for channel, text in ((offline, 'lost'), (online, 'busy'), (online, 'hello')): bot.queue.put_nowait(Job(channel, user, text))
         await asyncio.wait_for(bot.queue.join(), 10) # The bound only catches a dead queue; a passing run returns at once.
@@ -454,7 +469,7 @@ def test_turn_queue_restarts_after_an_unexpected_failure_and_stops_only_when_can
             async def close(self): pass
         async def deliver(content=None, **kwargs): sent.append(content); return SimpleNamespace(content=content)
         channel, user = SimpleNamespace(id=42, guild=None, send=deliver), SimpleNamespace(id=1, display_name='Owner')
-        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), backend_factory=Backend)
+        bot = CompanionBot(BotSettings(tmp_path, admins=frozenset({1})), preferences=tmp_path / 'discord_preferences.json', backend_factory=Backend)
         finish_job = bot.finish_job
         async def bug(job): bot.finish_job = finish_job; raise RuntimeError('unexpected bug')
         bot.finish_job = bug

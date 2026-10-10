@@ -1,6 +1,7 @@
-"""run_server.main and configure_logging, without the real desktop_server (whose import loads the cwd's private YAML and
-builds services) and without binding 127.0.0.1:8765, where a developer's backend may be running."""
+"""run_server.main and configure_logging, without the real desktop_server app (whose lifespan builds the services) and
+without binding its port, where a developer's backend may be running."""
 import logging
+from pathlib import Path
 import socket as real_socket
 import sys
 from types import SimpleNamespace
@@ -9,8 +10,12 @@ import pytest
 
 import run_server
 from process.app_core.configuration.debug_logging import SafeFormatter, configure_logging
+from process.app_core.configuration.paths import DataPaths
+from process.app_core.desktop import api_guard  # main() imports it while socket and time are faked below
 
-LOGGERS = ('', 'process.app_core', 'desktop_server', 'process.app_core.inference.metrics')  # '' is the root logger
+REPO = Path(__file__).resolve().parents[1]
+
+LOGGERS = ('', 'process.app_core', 'desktop_server', 'process.app_core.kernel.metrics')  # '' is the root logger
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +31,7 @@ def restore_logging():
 
 
 def config(tmp_path, *, debug=False, **logging_settings):
-    return SimpleNamespace(root=tmp_path, runtime=SimpleNamespace(api_key=None),
+    return SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), runtime=SimpleNamespace(api_key=None),
         raw={'desktop': {'debug': debug}, 'logging': {'file_enabled': False, **logging_settings}})
 
 
@@ -41,7 +46,7 @@ def test_desktop_debug_sets_application_levels_only(tmp_path, debug):
 def test_explicit_level_wins_and_unknown_levels_fall_back_to_info(tmp_path):
     configure_logging(config(tmp_path, debug=True, level='warning', inference_timings=False))
     assert logging.getLogger('process.app_core').level == logging.WARNING
-    assert logging.getLogger('process.app_core.inference.metrics').level == logging.WARNING
+    assert logging.getLogger('process.app_core.kernel.metrics').level == logging.WARNING
     configure_logging(config(tmp_path, level='verbose'))
     assert logging.getLogger('desktop_server').level == logging.INFO
 
@@ -65,9 +70,10 @@ def test_debug_log_file_redacts_secrets(tmp_path, monkeypatch):
 class Recorder:
     """Stands in for desktop_server, the listening socket, uvicorn.Config and run_server.Server, recording the order."""
     def __init__(self, bind_failures=0, interrupt=False):
-        self.events, self.bind_failures, self.interrupt, self.configs = [], bind_failures, interrupt, []
-        self.app, self.stop_turn = object(), lambda: None
-        self.desktop_server = SimpleNamespace(app=self.app, stop_turn=self.stop_turn, api_secrets=lambda: self.events.append('api_secrets'))
+        self.events, self.bind_failures, self.interrupt, self.configs, self.given = [], bind_failures, interrupt, [], []
+        self.stop_turn = lambda: None
+        self.app = SimpleNamespace(state=SimpleNamespace(backend=SimpleNamespace(stop_turn=self.stop_turn, api_secrets=lambda: self.events.append('api_secrets'))))
+        self.desktop_server = SimpleNamespace(create_app=lambda config: self.events.append('create_app') or self.given.append(config) or self.app)
         recorder = self
 
         class Listener:
@@ -98,21 +104,31 @@ class Recorder:
         return 'uvicorn-config'
 
 
-def start(monkeypatch, tmp_path, recorder, yaml='', clock=None):
-    """main() on a YAML in tmp_path, with the recorder's desktop_server, socket and uvicorn."""
+def start(monkeypatch, tmp_path, recorder, yaml='', clock=None, data=None, port=None, managed=False):
+    """main() on a YAML in tmp_path, with the recorder's desktop_server, socket and uvicorn. data: RIKO_DATA_DIR relative to
+    tmp_path's parent, the cwd main() starts in (default: tmp_path, absolute). port: RIKO_PORT. managed: as packaged Electron
+    starts it (RIKO_MANAGED=1), with the stdin watcher recorded instead of started."""
     (tmp_path / 'character_config.yaml').write_text(yaml, encoding='utf-8')
-    monkeypatch.chdir(tmp_path)  # main() changes the cwd to RIKO_DATA_DIR; this puts it back afterwards
-    monkeypatch.setenv('RIKO_DATA_DIR', str(tmp_path))
+    monkeypatch.chdir(tmp_path if data is None else tmp_path.parent)  # main() changes the cwd to RIKO_DATA_DIR; this puts it back afterwards
+    monkeypatch.setenv('RIKO_DATA_DIR', str(tmp_path) if data is None else data)
     monkeypatch.setenv('RIKO_CONFIG', str(tmp_path / 'character_config.yaml'))
     monkeypatch.delenv('RIKO_MANAGED', raising=False)  # the managed path reads stdin and arms a faulthandler exit
+    if port is None: monkeypatch.delenv('RIKO_PORT', raising=False)
+    else: monkeypatch.setenv('RIKO_PORT', port)
+    if managed: monkeypatch.setenv('RIKO_MANAGED', '1')
     monkeypatch.setattr(sys, 'argv', ['run_server.py'])
-    run_server.load_config()  # imports what load_config imports lazily now, so no module is first imported with a fake below
+    run_server.load_config(), run_server.uvicorn  # imports what they import lazily now, so no module is first imported with a fake below
+    if managed:  # after the warm-up: only main()'s own `import threading` sees the fake
+        monkeypatch.setitem(sys.modules, 'threading', SimpleNamespace(Thread=lambda target, name, daemon: SimpleNamespace(start=lambda: recorder.events.append(name))))
+    loaded, load_config = [], run_server.load_config
+    monkeypatch.setattr(run_server, 'load_config', lambda **options: loaded.append(options) or load_config(**options))
     monkeypatch.setitem(sys.modules, 'desktop_server', recorder.desktop_server)
     monkeypatch.setitem(sys.modules, 'socket', recorder.socket)  # main() imports socket and time when it binds
     if clock: monkeypatch.setitem(sys.modules, 'time', clock)
     monkeypatch.setattr(run_server.uvicorn, 'Config', recorder.config)
     monkeypatch.setattr(run_server, 'Server', recorder.Server)
     run_server.main()
+    assert loaded == [{'recover': 'setup'}]  # one load, whose result the app serves (a test that stops startup earlier stops here)
 
 
 @pytest.mark.parametrize('debug', [False, True])
@@ -122,6 +138,7 @@ def test_application_debug_does_not_enable_websocket_packet_dump(monkeypatch, tm
     # Uvicorn DEBUG logs every WebSocket frame (voice.level, chat.delta); desktop.debug raises only Riko's own loggers.
     assert recorder.configs == [(recorder.app, {'host': '127.0.0.1', 'port': 8765, 'log_level': 'info', 'timeout_graceful_shutdown': 2})]
     assert recorder.server == ('uvicorn-config', recorder.stop_turn)
+    assert [config.root for config in recorder.given] == [tmp_path] and recorder.given[0].raw['desktop']['debug'] is debug  # main()'s own config
     assert logging.getLogger('process.app_core').level == logging.getLogger('desktop_server').level == (logging.DEBUG if debug else logging.INFO)
     assert not (tmp_path / 'logs').exists()
 
@@ -134,7 +151,8 @@ def test_port_is_held_before_the_token_is_minted_and_ctrl_c_exits_cleanly(monkey
     start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n', clock)  # returns: KeyboardInterrupt is swallowed
     socket = recorder.socket
     option = socket.SO_EXCLUSIVEADDRUSE if run_server.os.name == 'nt' else socket.SO_REUSEADDR
-    assert recorder.events == [('socket', socket.AF_INET, socket.SOCK_STREAM), ('setsockopt', option, 1),
+    # The app is built (starting nothing, minting nothing) before the port is held; its secrets only once it is.
+    assert recorder.events == ['create_app', ('socket', socket.AF_INET, socket.SOCK_STREAM), ('setsockopt', option, 1),
         'bind_failed', 'bind_failed', ('bind', ('127.0.0.1', 8765)), ('listen', 2048), 'api_secrets', ('run', [recorder.listener])]
     assert clock.sleeps == [.5, .5]  # a previous backend may still be shutting down
 
@@ -148,3 +166,41 @@ def test_port_held_by_another_process_stops_startup_with_a_clear_message(monkeyp
         start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n', clock)
     assert 'api_secrets' not in recorder.events and not any(event[0] == 'run' for event in recorder.events if isinstance(event, tuple))
     assert recorder.events.count('bind_failed') == 41  # every half second for 20 s, then once more at the deadline
+
+
+def test_a_given_port_is_bound_served_and_named_to_electron_once_held(monkeypatch, tmp_path, capsys):
+    recorder = Recorder()
+    start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n', port='9123', managed=True)
+    assert ('bind', ('127.0.0.1', 9123)) in recorder.events and recorder.configs[0][1]['port'] == 9123
+    assert recorder.events[-2:] == ['release-shutdown', ('run', [recorder.listener])]
+    lines = capsys.readouterr().out.splitlines()
+    # electron/release.cjs watchListening sends the token only after this exact line, once the port is held.
+    assert lines == ['Riko AI server: http://127.0.0.1:9123 — Ctrl+C to stop', 'RIKO_BACKEND_LISTENING port=9123']
+
+
+@pytest.mark.parametrize('value', ['80', '1023', '65536', '0', '-1', 'abc', '9123.0', '\u0669\u0661\u0662\u0663'])
+def test_riko_port_is_a_port_from_1024_and_a_bad_one_stops_startup_before_the_app_is_built(monkeypatch, tmp_path, value):
+    with pytest.raises(ValueError, match='RIKO_PORT must be a port from 1024 to 65535'): api_guard.backend_port({'RIKO_PORT': value})
+    recorder = Recorder()
+    with pytest.raises(SystemExit, match='RIKO_PORT must be a port from 1024 to 65535'):
+        start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n', port=value)
+    assert recorder.events == []
+
+
+def test_electron_and_the_backend_share_the_default_port_the_listening_line_and_a_port_blind_guard():
+    assert api_guard.backend_port({}) == api_guard.DEFAULT_PORT == 8765 and api_guard.backend_port({'RIKO_PORT': ' 9123 '}) == 9123
+    assert api_guard.backend_url({'RIKO_PORT': '9123'}) == 'http://127.0.0.1:9123'
+    origin, release = ((REPO / 'electron' / name).read_text(encoding='utf-8') for name in ('backend_origin.cjs', 'release.cjs'))
+    assert f"const DEFAULT_BACKEND='http://127.0.0.1:{api_guard.DEFAULT_PORT}';" in origin
+    assert "const LISTENING='RIKO_BACKEND_LISTENING';" in release and "const listeningLine=port=>LISTENING+' port='+port;" in release
+    assert "RIKO_MANAGED:'1',RIKO_PORT:String(port)," in release  # startBackend gives the backend the port its windows use
+    guard = api_guard.LocalAPIGuard(None, lambda: 't' * 43)
+    for host in ('127.0.0.1:9123', 'localhost:9123', '127.0.0.1'):
+        assert guard.problem('http', {'host': host, 'authorization': 'Bearer ' + 't' * 43}) is None, host
+    assert guard.problem('http', {'host': 'example.com:9123', 'authorization': 'Bearer ' + 't' * 43})[0] == 403
+
+
+def test_main_works_in_the_data_folder_and_hands_children_its_absolute_path(monkeypatch, tmp_path):
+    start(monkeypatch, tmp_path, Recorder(), 'logging:\n  file_enabled: false\n', data=tmp_path.name)
+    exported = Path(run_server.os.environ['RIKO_DATA_DIR'])  # tool workers, MCP servers and load_config read it after the chdir
+    assert exported.is_absolute() and exported.resolve() == Path.cwd().resolve() == tmp_path.resolve()

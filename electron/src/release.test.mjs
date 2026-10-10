@@ -6,43 +6,56 @@ import path from 'node:path';
 import {createRequire} from 'node:module';
 import {EventEmitter} from 'node:events';
 const require=createRequire(import.meta.url);
-const {hardware,configuration,saveSetup,installRoot,askMicrophone,startSovits,stopBackend,watchListening,finderPath,LISTENING}=require('../release.cjs');
+const {hardware,saveSetup,backendExecutable,backendAnswer,installRoot,askMicrophone,startBackend,startSovits,stopBackend,watchListening,listeningLine,freePort,finderPath,LISTENING}=require('../release.cjs');
 const {MANIFEST}=require('../native_backends.cjs');
 const YAML=require('yaml');
-// A packaged app's resources with one native bundle. The tests pass the OS explicitly, so every host checks the same one.
-function fixture(backend='cuda',library='libriko-native.so'){const root=fs.mkdtempSync(path.join(os.tmpdir(),'riko-release-'));const folder=path.join(root,'native',backend);fs.mkdirSync(folder,{recursive:true});fs.writeFileSync(path.join(folder,library),'test');return root;}
 const form={backend:'cuda',repo:'owner/model',filename:'model.gguf',context:8192,output:1024,threads:4,memories:'I like tea.\nMy name is Alex.',sovitsAuto:false};
-test('setup separates persistent data from binaries and refuses overwrite',()=>{const root=fixture();const directory=fs.mkdtempSync(path.join(os.tmpdir(),'riko-data-'));try{saveSetup(directory,form,root,root,'linux');const config=YAML.parse(fs.readFileSync(path.join(directory,'character_config.yaml'),'utf8'));assert.equal(config.runtime.native_library,'bundled:cuda');assert.equal(config.memory.default_memories.length,2);assert.equal(config.tools.require_approval,true);assert.equal(config.emotion.probe.enabled,false);assert.deepEqual(config.voice,{wake_word:'Riko',asr_device:'cpu',asr_compute_type:'int8'});assert.ok(fs.existsSync(path.join(directory,'models')));assert.throws(()=>saveSetup(directory,form,root,root,'linux'),/EEXIST/);assert.throws(()=>saveSetup(root,form,root,root,'linux'),/outside/);}finally{fs.rmSync(root,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true});}});
-test('setup wakes on the first word of any companion name and writes YAML the backend reads as text',()=>{
-  const root=fixture(),directory=fs.mkdtempSync(path.join(os.tmpdir(),'riko-data-'));
+// A stand-in for riko-backend --setup-config (the real one: tests/test_settings_store.py and test_first_run.py). It logs each
+// call beside itself, then answers as its first argument says.
+const FAKE=String.raw`const fs=require('fs'),path=require('path');const [mode,...args]=process.argv.slice(2);const input=JSON.parse(fs.readFileSync(0,'utf8'));
+fs.appendFileSync(path.join(__dirname,'calls.jsonl'),JSON.stringify({args,bundle:process.env.RIKO_BUNDLE_ROOT,input})+'\n');
+if(mode==='ok'){console.log('a warning first');console.log(JSON.stringify({config:'presets:\n  default:\n    name: '+JSON.stringify(input.name||'Riko')+'\n'}));}
+else if(mode==='refuse'){console.log(JSON.stringify({error:'Invalid context/output budget'}));process.exitCode=1;}
+else if(mode==='empty')console.log(JSON.stringify({config:''}));
+else if(mode==='crash'){console.log('not json');console.error('Traceback: boom');process.exitCode=3;}
+else setTimeout(()=>{},60000);`;
+function fakeBackend(){
+  const folder=fs.mkdtempSync(path.join(os.tmpdir(),'riko-backend-')),script=path.join(folder,'riko-backend.cjs');fs.writeFileSync(script,FAKE);
+  const calls=()=>fs.existsSync(path.join(folder,'calls.jsonl'))?fs.readFileSync(path.join(folder,'calls.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line)):[];
+  return {command:mode=>[process.execPath,script,mode],calls,remove:()=>fs.rmSync(folder,{recursive:true,force:true})};
+}
+const temporary=prefix=>fs.mkdtempSync(path.join(os.tmpdir(),prefix));
+test('setup asks the backend for the configuration and writes its answer in a data folder outside the application, never twice',async()=>{
+  const backend=fakeBackend(),resources=temporary('riko-release-'),parent=temporary('riko-data-'),directory=path.join(parent,'Riko');
   try{
-    for(const [name,saved,wake] of [['Riko Chan','Riko Chan','Riko'],['  Ai  Hoshino ','Ai  Hoshino','Ai'],['','Riko','Riko'],[undefined,'Riko','Riko'],['Yes','Yes','Yes']]){
-      const config=configuration({...form,name},root,'linux');
-      assert.equal(config.presets.default.name,saved);assert.equal(config.voice.wake_word,wake);
-    }
-    // The backend's PyYAML reads YAML 1.1, where an unquoted Yes, on or 42 is not text.
-    saveSetup(directory,{...form,name:'Yes',memories:'on\n42'},root,root,'linux');
-    const config=YAML.parse(fs.readFileSync(path.join(directory,'character_config.yaml'),'utf8'),{version:'1.1'});
-    assert.equal(config.presets.default.name,'Yes');assert.equal(config.voice.wake_word,'Yes');
-    assert.deepEqual(config.memory.default_memories.map(memory=>memory.text),['on','42']);
-  }finally{fs.rmSync(root,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true});}
+    assert.equal(await saveSetup(directory,{...form,name:'Mika'},resources,resources,'linux',backend.command('ok')),directory);
+    const file=path.join(directory,'character_config.yaml');
+    assert.equal(fs.readFileSync(file,'utf8'),'presets:\n  default:\n    name: "Mika"\n','the backend\'s text, as it wrote it');
+    if(process.platform!=='win32')assert.equal(fs.statSync(file).mode&0o777,0o600);
+    for(const folder of ['models','persistent_memories','logs'])assert.ok(fs.statSync(path.join(directory,folder)).isDirectory(),folder);
+    assert.deepEqual(backend.calls(),[{args:['--setup-config',directory],bundle:resources,input:{...form,name:'Mika'}}],'the choices on stdin, the bundle to resolve bundled:<backend>');
+    await assert.rejects(saveSetup(directory,form,resources,resources,'linux',backend.command('ok')),/EEXIST/);
+    await assert.rejects(saveSetup(path.join(resources,'data'),form,resources,resources,'linux',backend.command('ok')),/outside the application folder/);
+    await assert.rejects(saveSetup('relative/data',form,resources,resources,'linux',backend.command('ok')),/absolute data directory/);
+    assert.equal(backend.calls().length,1,'refused before the backend is asked');assert.equal(fs.readFileSync(file,'utf8'),'presets:\n  default:\n    name: "Mika"\n');
+  }finally{backend.remove();fs.rmSync(resources,{recursive:true,force:true});fs.rmSync(parent,{recursive:true,force:true});}
 });
-test('setup validates budgets, model and explicit speech consent',()=>{const root=fixture();try{assert.throws(()=>configuration({...form,output:8192},root,'linux'),/budget/);assert.throws(()=>configuration({...form,filename:'../secret.gguf'},root,'linux'),/GGUF/);assert.throws(()=>configuration({...form,sovitsAuto:true},root,'linux'),/GPT-SoVITS/);assert.equal(startSovits({auto_start:false}),null);assert.throws(()=>startSovits({auto_start:true,executable:'relative.exe'}),/missing/);}finally{fs.rmSync(root,{recursive:true,force:true});}});
-test('setup leaves room for the reply inside the live context, as Settings requires',()=>{const root=fixture();try{for(const [context,output] of [[8192,1024],[2048,2047],[131072,64]]){const {runtime,memory}=configuration({...form,context,output},root,'linux');assert.equal(runtime.n_ctx,context);assert.equal(runtime.max_output_tokens,output);assert.ok(memory.context_window_tokens>=1);assert.ok(memory.context_window_tokens+runtime.max_output_tokens<=runtime.n_ctx);}}finally{fs.rmSync(root,{recursive:true,force:true});}});
-test('setup writes bundled:<backend> only for a bundle this OS ships, under its own library name',()=>{
-  for(const [platform,backend,library] of [['win32','cuda','riko-native.dll'],['win32','vulkan','riko-native.dll'],['linux','vulkan','libriko-native.so'],['darwin','metal','libriko-native.dylib']]){
-    const root=fixture(backend,library);
-    try{assert.equal(configuration({...form,backend},root,platform).runtime.native_library,'bundled:'+backend);}finally{fs.rmSync(root,{recursive:true,force:true});}
-  }
-  const windows=fixture('cuda','riko-native.dll'),mac=fixture('cuda','libriko-native.so');
+test('setup shows the backend\'s refusal, or why it gave none, and writes no configuration',async()=>{
+  const backend=fakeBackend(),resources=temporary('riko-release-'),directory=temporary('riko-data-');
   try{
-    assert.throws(()=>configuration(form,windows,'linux'),/Packaged native backend is missing: .*libriko-native\.so/);
-    assert.throws(()=>configuration(form,mac,'darwin'),/^Error: Choose Metal$/);
-    assert.throws(()=>configuration({...form,backend:'metal'},mac,'win32'),/^Error: Choose CUDA or Vulkan$/);
-    assert.throws(()=>configuration({...form,backend:'../native'},mac,'linux'),/Choose CUDA or Vulkan/);
-    assert.throws(()=>configuration(form,mac,'freebsd'),/No native backend ships for freebsd/);
-  }finally{fs.rmSync(windows,{recursive:true,force:true});fs.rmSync(mac,{recursive:true,force:true});}
+    await assert.rejects(saveSetup(directory,form,resources,resources,'linux',backend.command('refuse')),/^Error: Invalid context\/output budget$/);
+    await assert.rejects(saveSetup(directory,form,resources,resources,'linux',backend.command('crash')),/gave no answer \(exit 3\): Traceback: boom/);
+    await assert.rejects(saveSetup(directory,form,resources,resources,'linux',backend.command('empty')),/returned no configuration/);
+    await assert.rejects(saveSetup(directory,form,resources,resources,'linux',[path.join(directory,'missing-backend')]),/could not start/);
+    await assert.rejects(backendAnswer(backend.command('silent'),[],{},process.env,300),/did not answer in time/);
+    assert.ok(!fs.existsSync(path.join(directory,'character_config.yaml')));
+  }finally{backend.remove();fs.rmSync(resources,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true});}
 });
+test('the packaged backend is resources/backend/riko-backend, with .exe on Windows',()=>{
+  assert.equal(backendExecutable('/app/resources','darwin'),path.join('/app/resources','backend','riko-backend'));
+  assert.equal(backendExecutable('/app/resources','win32'),path.join('/app/resources','backend','riko-backend.exe'));
+});
+test('GPT-SoVITS starts only for auto_start: true, with an absolute executable',()=>{for(const auto_start of [false,undefined,'no','yes',1])assert.equal(startSovits({auto_start,executable:'relative.exe'}),null,String(auto_start));assert.equal(startSovits(undefined),null);assert.throws(()=>startSovits({auto_start:true,executable:'relative.exe'}),/missing/);});
 test('hardware detection runs only the tools for this OS\'s bundles and preselects from them',async()=>{
   const probe=outputs=>{const calls=[];return {calls,run:(file,args)=>{calls.push([file,...args]);return Promise.resolve(outputs[file]||'');}};};
   const mac=probe({'nvidia-smi':'NVIDIA','vulkaninfo':'MoltenVK'}),macHw=await hardware('darwin',mac.run);
@@ -62,25 +75,42 @@ test('the setup page offers the backends hardware() reports instead of a fixed l
   assert.match(page,/\(hw\?\.backends\|\|\[\]\)\.map\(backend=><option key=\{backend\.id\} value=\{backend\.id\}>/);
   assert.match(page,/backend:h\.preferred/);
 });
-test('setup refuses a data folder that an update or uninstall would delete',()=>{
-  const install=fs.mkdtempSync(path.join(os.tmpdir(),'riko-install-')),resources=path.join(install,'resources'),sibling=install+'-data';
-  fs.mkdirSync(path.join(resources,'native','cuda'),{recursive:true});fs.writeFileSync(path.join(resources,'native','cuda','libriko-native.so'),'test');
+test('setup refuses a data folder that an update or uninstall would delete',async()=>{
+  const install=fs.mkdtempSync(path.join(os.tmpdir(),'riko-install-')),resources=path.join(install,'resources'),sibling=install+'-data',backend=fakeBackend();
+  fs.mkdirSync(resources,{recursive:true});
   try{
-    for(const directory of [install,path.join(install,'data'),path.join(install,'data','nested'),resources])assert.throws(()=>saveSetup(directory,form,resources,install,'linux'),/outside the application folder/);
-    assert.ok(!fs.existsSync(path.join(install,'data')));
-    assert.equal(saveSetup(sibling,form,resources,install,'linux'),sibling);assert.ok(fs.existsSync(path.join(sibling,'character_config.yaml')));
-  }finally{fs.rmSync(install,{recursive:true,force:true});fs.rmSync(sibling,{recursive:true,force:true});}
+    for(const directory of [install,path.join(install,'data'),path.join(install,'data','nested'),resources])await assert.rejects(saveSetup(directory,form,resources,install,'linux',backend.command('ok')),/outside the application folder/);
+    assert.ok(!fs.existsSync(path.join(install,'data')));assert.deepEqual(backend.calls(),[]);
+    assert.equal(await saveSetup(sibling,form,resources,install,'linux',backend.command('ok')),sibling);assert.ok(fs.existsSync(path.join(sibling,'character_config.yaml')));
+  }finally{backend.remove();fs.rmSync(install,{recursive:true,force:true});fs.rmSync(sibling,{recursive:true,force:true});}
   assert.equal(installRoot('/Applications/Riko.app/Contents/MacOS/Riko','darwin'),'/Applications/Riko.app');
   assert.equal(installRoot('/opt/Riko/riko-companion','linux'),'/opt/Riko');
-  assert.match(fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8'),/release\.saveSetup\(values\.directory,values\.settings,process\.resourcesPath,release\.installRoot\(app\.getPath\('exe'\)\)\)/);
+  // setup-finish passes installRoot(app.getPath('exe')): ipc_routes.test.mjs and main_wiring.test.mjs.
 });
-test('a second packaged launch exits before it can spawn a backend, GPT-SoVITS or windows',()=>{
-  const host=fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8');
-  const lock=host.indexOf("if(app.isPackaged&&!app.requestSingleInstanceLock()){app.quit();return;}");
-  assert.ok(lock>0,'the losing instance must stop evaluating main.cjs');
-  for(const later of ['app.whenReady(','ipcMain.','app.on(',"require('./release.cjs')",'new BrowserWindow('])assert.ok(host.indexOf(later)>lock,later+' must come after the single-instance exit');
+test('main learns the backend holds its port only from a complete marker line naming that port',()=>{
+  assert.equal(listeningLine(9123),'RIKO_BACKEND_LISTENING port=9123');  // Code/run_server.py prints exactly this
+  let calls=0;const watch=watchListening(9123,()=>calls++);
+  watch('Riko AI server: http://127.0.0.1:9123\n'+LISTENING+'\n'+listeningLine(9124)+'\n'+LISTENING+' port=91234\nRIKO_BACKEND_');assert.equal(calls,0);
+  watch('LISTENING port=9123_NOT\n');assert.equal(calls,0);watch(listeningLine(9123)+'\r\nINFO later\n');assert.equal(calls,1);watch(listeningLine(9123)+'\n');assert.equal(calls,1);
+  const split=watchListening(9123,()=>calls++);for(const part of ['RIKO_BACK','END_LISTEN','ING por','t=9123','\n'])split(Buffer.from(part));assert.equal(calls,2);
 });
-test('main learns the backend holds its port only from a complete marker line',()=>{let calls=0;const watch=watchListening(()=>calls++);watch('Riko AI server: http://127.0.0.1:8765\nRIKO_BACKEND_');assert.equal(calls,0);watch('LISTENING_NOT\n');assert.equal(calls,0);watch(LISTENING+'\r\nINFO later\n');assert.equal(calls,1);watch(LISTENING+'\n');assert.equal(calls,1);const split=watchListening(()=>calls++);for(const part of ['RIKO_BACK','END_LISTEN','ING','\n'])split(Buffer.from(part));assert.equal(calls,2);});
+test('the packaged backend gets a free loopback port of its own',async()=>{
+  const port=await freePort();assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,String(port));
+  const net=require('node:net');await new Promise((resolve,reject)=>{const server=net.createServer();server.once('error',reject);server.listen(port,'127.0.0.1',()=>server.close(resolve));});
+  await assert.rejects(freePort({createServer:()=>Object.assign(new EventEmitter(),{unref(){},listen(){setImmediate(()=>this.emit('error',new Error('EACCES')));}})}),/EACCES/);
+});
+test('startBackend hands the backend its port and hears it only once the backend names that port',{skip:process.platform==='win32'&&'the fixture backend is a shell script'},async()=>{
+  const resources=fs.mkdtempSync(path.join(os.tmpdir(),'riko-resources-')),directory=fs.mkdtempSync(path.join(os.tmpdir(),'riko-data-'));
+  try{
+    fs.mkdirSync(path.join(resources,'backend'));fs.mkdirSync(path.join(directory,'logs'));
+    // Names whatever RIKO_PORT it was given, then waits for stdin to close, as the managed backend does.
+    fs.writeFileSync(path.join(resources,'backend','riko-backend'),'#!/bin/sh\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT managed=$RIKO_MANAGED"\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT"\ncat >/dev/null\n',{mode:0o755});
+    let heard;const listening=new Promise(resolve=>{heard=resolve;});
+    const child=startBackend(directory,resources,{api_token:'t'.repeat(43),confirm_key:'k'.repeat(43)},9123,heard);
+    await listening;await stopBackend(child,5000,1000);
+    assert.equal(child.exitCode,0);assert.deepEqual(child.signalCode,null);
+  }finally{fs.rmSync(resources,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true});}
+});
 function fakeChild({exitOnShutdown=false,signalCode=null}={}){const child=Object.assign(new EventEmitter(),{exitCode:null,signalCode,signals:[],written:'',kill(signal='SIGTERM'){child.signals.push(signal);return true;}});child.stdin={end(text){child.written+=text;if(exitOnShutdown)setImmediate(()=>child.emit('exit',0,null));}};return child;}
 test('stopBackend asks for shutdown, then escalates to SIGTERM and SIGKILL',async()=>{const hung=fakeChild();await stopBackend(hung,20,20);assert.equal(hung.written,'shutdown\n');assert.deepEqual(hung.signals,['SIGTERM','SIGKILL']);const quick=fakeChild({exitOnShutdown:true});await stopBackend(quick,20,20);assert.deepEqual(quick.signals,[]);const crashed=fakeChild({signalCode:'SIGABRT'}),started=Date.now();await stopBackend(crashed,1000,1000);assert.ok(Date.now()-started<500);assert.equal(crashed.written,'');});
 test('a Finder-launched macOS backend still finds Homebrew tools for MCP servers and FFmpeg',()=>{
@@ -89,7 +119,7 @@ test('a Finder-launched macOS backend still finds Homebrew tools for MCP servers
   assert.equal(finderPath(undefined),'/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin');
   assert.match(fs.readFileSync(new URL('../release.cjs',import.meta.url),'utf8'),/process\.platform==='darwin'\?\{PATH:finderPath\(process\.env\.PATH\)\}/);
 });
-test('Linux launches keep the AppImage sandbox flag and run under XWayland',()=>{const builder=YAML.parse(fs.readFileSync(new URL('../electron-builder.yml',import.meta.url),'utf8'));assert.deepEqual(builder.appImage.executableArgs,['--no-sandbox','--ozone-platform=x11']);assert.ok(builder.linux.executableArgs.includes('--ozone-platform=x11'));const main=fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8');const relaunch=main.indexOf("app.commandLine.hasSwitch('ozone-platform')");assert.ok(relaunch>0&&relaunch<main.indexOf('requestSingleInstanceLock'));assert.match(main,/execPath:process\.env\.APPIMAGE/);});
+test('Linux launches keep the AppImage sandbox flag and run under XWayland',()=>{const builder=YAML.parse(fs.readFileSync(new URL('../electron-builder.yml',import.meta.url),'utf8'));assert.deepEqual(builder.appImage.executableArgs,['--no-sandbox','--ozone-platform=x11']);assert.ok(builder.linux.executableArgs.includes('--ozone-platform=x11'));});  // a Wayland launch relaunches itself: window_platform.test.mjs, main_wiring.test.mjs
 test('installers carry every local file main-process code requires, including the native-backend manifest',()=>{
   const builder=YAML.parse(fs.readFileSync(new URL('../electron-builder.yml',import.meta.url),'utf8')),dir=new URL('..',import.meta.url);
   const shipped=file=>builder.files.some(pattern=>pattern===file||(pattern.startsWith('*.')&&!file.includes('/')&&file.endsWith(pattern.slice(1)))||(pattern.endsWith('/**')&&file.startsWith(pattern.slice(0,-2))));
@@ -114,11 +144,7 @@ test('macOS asks for the microphone before the packaged backend starts, without 
   for(const platform of ['win32','linux']){const other=preferences('not-determined');assert.equal(await askMicrophone(other,platform),null);assert.deepEqual(other.calls,[]);}
   assert.equal(await askMicrophone(preferences('not-determined',()=>Promise.resolve(false)),'darwin'),false);
   for(const fails of [()=>{throw new Error('no usage description');},()=>Promise.reject(new Error('denied'))])assert.equal(await askMicrophone(preferences('not-determined',fails),'darwin'),false);
-  const host=fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8');
-  assert.match(host.split('\n')[0],/nativeImage, systemPreferences \} = require\('electron'\);$/);
-  const packaged=host.indexOf("const locator=path.join(app.getPath('userData'),'data-location.json');"),ask=host.indexOf('release.askMicrophone(systemPreferences).then(state=>microphoneNotice('),start=host.indexOf('backendProcess=release.startBackend(');
-  assert.ok(packaged>0&&packaged<ask&&ask<start,'asked in the packaged branch, before the backend starts');
-  assert.doesNotMatch(host,/await release\.askMicrophone/);
+  // Main asks before it starts the backend, without waiting for the answer: main_wiring.test.mjs.
 });
 test('the macOS app is a hardened arm64 DMG whose processes may use the microphone and load the backend libraries',()=>{
   const builder=YAML.parse(fs.readFileSync(new URL('../electron-builder.yml',import.meta.url),'utf8')),mac=builder.mac;

@@ -7,6 +7,8 @@ from pathlib import Path
 import struct
 import threading
 
+from ..kernel.schema import Section, Setting, register
+from ..kernel.validation import boolean, number
 from ..persistence.atomic import atomic_write
 
 BONES = {'hips', 'spine', 'chest', 'upperChest', 'neck', 'head', 'leftEye', 'rightEye', 'jaw'}
@@ -16,22 +18,25 @@ for side in ('left', 'right'):
         BONES.update(side + finger + joint for joint in ('Metacarpal', 'Proximal', 'Intermediate', 'Distal'))
 STATES = {'idle', 'listening', 'thinking', 'speaking', 'tool', 'sleeping', 'held', 'clicked', 'settling', 'walking'}
 MAX_BYTES = 32 * 1024 * 1024
-DEFAULTS = {'enabled': True, 'julia_selection': True, 'policy_timeout_seconds': .75,
-            'min_dwell_seconds': 1.0, 'transition_seconds': .3, 'min_confidence': .35,
-            'mouse_tracking': True, 'walk_speed': 240.0}
 
 
 def validate_settings(raw):
     if not isinstance(raw, dict): raise ValueError('animation must be a mapping')
-    result = {**DEFAULTS, **raw}
-    for key in ('enabled', 'julia_selection', 'mouse_tracking'):
-        if type(result[key]) is not bool: raise ValueError(f'animation.{key} must be boolean')
-    for key, low, high in [('policy_timeout_seconds', .05, 10), ('min_dwell_seconds', 0, 30),
-                          ('transition_seconds', .05, 3), ('min_confidence', 0, 1), ('walk_speed', 20, 1000)]:
-        value = result[key]
-        if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
-            raise ValueError(f'animation.{key} must be between {low} and {high}')
+    # Other keys keep no value here: load_config reports them (configuration/schema.py unknown_settings).
+    result = {**DEFAULTS, **{key: value for key, value in raw.items() if key in DEFAULTS}}
+    for spec in SETTINGS.settings:  # the ranges Settings offers are the ranges load_config accepts
+        if type(spec.default) is bool: boolean(f'animation.{spec.key}', result[spec.key])
+        else: result[spec.key] = number(f'animation.{spec.key}', result[spec.key], ge=spec.range[0], le=spec.range[1])
     return result
+
+
+SETTINGS = register(Section('animation', group='appearance', title='Animation engine', strict=True, check=validate_settings, settings=(
+    Setting('enabled', True),
+    Setting('julia_selection', True, help='Reuse the enabled Julia emotion model to select eligible motion intents. Rules provide immediate fallback; no extra model copy is loaded.'),
+    Setting('policy_timeout_seconds', .75, range=(.05, 10)), Setting('min_dwell_seconds', 1.0, range=(0, 30)),
+    Setting('transition_seconds', .3, range=(.05, 3)), Setting('min_confidence', .35, range=(0, 1)), Setting('mouse_tracking', True),
+    Setting('walk_speed', 240.0, range=(20, 1000), help='Desktop movement speed in pixels/second. Walking is explicitly requested; dragging always cancels it.'))))
+DEFAULTS = SETTINGS.defaults()
 
 
 def validate_pose(raw):

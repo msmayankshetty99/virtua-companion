@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 if __name__ == '__main__':
-    # The parent reads and writes UTF-8 (registry.py). Without UTF-8 mode, Windows pipes use the ANSI code page,
+    # The parent reads and writes UTF-8 (isolation.py). Without UTF-8 mode, Windows pipes use the ANSI code page,
     # which cannot encode results such as todo_list's emoji.
     sys.stdin.reconfigure(encoding='utf-8'); sys.stdout.reconfigure(encoding='utf-8')
     try:

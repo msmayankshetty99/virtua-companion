@@ -10,7 +10,7 @@ from process.app_core.configuration.config import MemoryConfig
 from process.app_core.emotion import JuliaEmotionEngine
 from process.app_core.emotion.julia import load_julia
 from process.app_core.persistence.memory import MemoryStore
-from process.app_core.runtime.torch_device import resolve, validate
+from process.app_core.kernel.torch_device import resolve, validate
 
 
 def fake_torch(cuda, mps):
@@ -69,7 +69,7 @@ def test_memory_embedder_uses_configured_device_with_cpu_retry(tmp_path, monkeyp
 
 def test_an_explicit_julia_thread_count_still_applies_after_loading(monkeypatch):
     import torch
-    from process.app_core.runtime.torch_device import preserve_torch_globals
+    from process.app_core.kernel.torch_device import preserve_torch_globals
     threads = torch.get_num_threads()
     monkeypatch.setenv('JULIA_CPU_THREADS', '2')
     try:

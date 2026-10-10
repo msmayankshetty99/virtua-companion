@@ -5,11 +5,16 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 
+from process.app_core.conversation.chat import ChatDeps
+from process.app_core.conversation.history import ConversationHistory
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import EventBus, event_bus
 from process.app_core.events.outbox import Outbox
 from process.app_core.events.resources import ResourceEvents
 from process.app_core.runtime.actions import ActionController
+from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 ROOT = Path(__file__).resolve().parents[1] / 'Code'
 EMITTERS = {'publish', 'emit', '_emit', 'notify', 'on_prediction', 'on_fallback', 'callback'}
@@ -68,8 +73,8 @@ def test_wake_calibration_timeout_does_not_deadlock_with_runtime_snapshot(monkey
             voice_held.wait(2)
     unsubscribe = event_bus.subscribe(gate)
     monkeypatch.setattr(session_module, 'SpeechQueue', FakeSpeech)
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
-    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
+    config = SimpleNamespace(raw={}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = session_module.SessionManager(config, chat, DesktopState())
     session.wake.recording = WakeCapture(max_seconds=0.01)  # next frame times out the sample
     def vad():

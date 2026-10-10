@@ -71,8 +71,8 @@ def probe_samples(provider, slot):
 
 def test_provider_loads_streams_counts_cancels_and_closes(provider):
     import run_server
-    from process.app_core.conversation.messages import ChatMessage
-    from process.app_core.inference.llama_context import BackgroundPreempted
+    from process.app_core.kernel.messages import ChatMessage
+    from process.app_core.kernel.cancellation import BackgroundPreempted
     provider.warmup()  # loads the GGUF, checks /slots, and answers one token on every slot, as the backend does at startup
     notes = provider.native.notes
     offload = re.search(r'offloaded (\d+)/(\d+) layers', notes)
@@ -103,8 +103,8 @@ def test_provider_loads_streams_counts_cancels_and_closes(provider):
 
 def test_emotion_probe_samples_the_live_slot_only(provider):
     import torch
-    from process.app_core.conversation.messages import ChatMessage
-    from process.app_core.emotion.probe import FEATURE_VERSION
+    from process.app_core.kernel.messages import ChatMessage
+    from process.app_core.emotion.probe_hook import FEATURE_VERSION, FEATURE_WIDTH, ProbeHook
     captures, identities = [], []
 
     class Probe:  # what factory.create_chat_service attaches, reduced to the calls the provider makes
@@ -113,14 +113,14 @@ def test_emotion_probe_samples_the_live_slot_only(provider):
         def capture(self, hidden, transcript, group, **options): captures.append((hidden, transcript, group, options))
         def close(self): pass
 
-    provider.probe_factory = lambda identity, idle: identities.append(identity) or Probe()
-    provider.set_probe_interval(4)
+    provider.attach_probe(ProbeHook(lambda identity, idle: identities.append(identity) or Probe()), 4)
     provider.warmup()
     assert provider.client.get('/props').json()['riko_emotion_probe'] == FEATURE_VERSION
     assert len(identities) == 1 and len(identities[0]['gguf_sha256']) == 64 and identities[0]['server_build']
+    assert isinstance(provider.probe, Probe) and provider.probe_error == ''
 
     samples = probe_samples(provider, 0)
-    assert samples and all(sample['feature_version'] == FEATURE_VERSION and len(sample['features']) == 256
+    assert samples and all(sample['feature_version'] == FEATURE_VERSION and len(sample['features']) == FEATURE_WIDTH
         and all(math.isfinite(value) for value in sample['features']) and sample['prefix_bytes'] > 0 for sample in samples)
     assert probe_samples(provider, 1) == []  # the patch arms the capture on slot 0 only
 
@@ -132,3 +132,15 @@ def test_emotion_probe_samples_the_live_slot_only(provider):
     captures.clear()
     provider.initiative.generate([ChatMessage('user', COUNT)], max_output_tokens=24, context_limit=1024)
     assert captures == []
+    provider.replay_lane.generate([ChatMessage('user', COUNT)], max_output_tokens=40, emotion_turn_id='replay-1')  # EmotionProbe.replay's lane
+    assert captures and all(group == 'replay-1' and options['replay'] for _, _, group, options in captures)
+
+
+def test_a_probe_that_cannot_start_leaves_the_real_model_answering(provider):
+    from process.app_core.kernel.messages import ChatMessage
+    from process.app_core.emotion.probe_hook import ProbeHook
+    def unavailable(identity, idle): raise RuntimeError('Unable to load Julia 1 emotion model: offline')
+    provider.attach_probe(ProbeHook(unavailable), 4)
+    provider.warmup()
+    assert provider.probe is None and 'Julia 1' in provider.probe_error
+    assert provider.generate([ChatMessage('user', 'Say hello.')], max_output_tokens=8).message.content.strip()

@@ -124,7 +124,6 @@ class ServerClient:
 
 
 class LlamaServerProvider(LlamaContextProvider):
-    supports_latent_probe = False
     transport = 'llama-server'
     missing_route_hint = ' Update llama-server to a recent llama.cpp build; Riko needs /v1/responses, /apply-template, /tokenize and /slots.'
 
@@ -135,7 +134,7 @@ class LlamaServerProvider(LlamaContextProvider):
     def _client(self): return ServerClient(self.root, self.config.api_key, self.config.request_timeout_seconds)
 
     def _required_context(self):
-        return max(self.config.n_ctx, getattr(self.config, 'initiative_n_ctx', 4096), getattr(self.config, 'reflection_n_ctx', 4096))
+        return max(self.config.n_ctx, self.config.initiative_n_ctx, self.config.reflection_n_ctx)
 
     def launch_hint(self):
         slots, port = self.config.parallel_slots, urlsplit(self.root).port or 8080

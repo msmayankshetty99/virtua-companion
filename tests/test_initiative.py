@@ -2,12 +2,15 @@ import json
 from types import SimpleNamespace
 import pytest
 
-from process.app_core.conversation.chat import ChatService
+from process.app_core.conversation.chat import ChatDeps, ChatService
 from process.app_core.desktop.state import DesktopState
 from process.app_core.events.bus import event_bus
 from process.app_core.runtime.initiative import Initiative, DEFAULTS, InitiativeDecisionError, parse_decision
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.runtime.session import SessionManager
+from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 class Speech:
@@ -17,10 +20,11 @@ class Speech:
     def close(self): pass
 
 
-def engine(tmp_path, monkeypatch, *, adapter=None, generate=None):
+def engine(tmp_path, monkeypatch, *, adapter=None, generate=None, raw=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
-    config = SimpleNamespace(root=tmp_path, raw={}, character_name='Riko', tools=SimpleNamespace(max_iterations=8))
-    provider = SimpleNamespace(generate=generate or (lambda *args, **kwargs: ModelResponse(ChatMessage('assistant', json.dumps({'initiate': True, 'message': 'Would you like a hand?', 'urgent': False})))), close=lambda: None)
+    config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), raw=raw or {}, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
+    provider = BaseProvider()
+    provider.generate = generate or (lambda *args, **kwargs: ModelResponse(ChatMessage('assistant', json.dumps({'initiate': True, 'message': 'Would you like a hand?', 'urgent': False}))))
     chat = ChatService(provider, system_prompt='Riko')
     session = SessionManager(config, chat, DesktopState())
     session.initiative = Initiative(session, adapter=adapter, start_worker=False)
@@ -69,7 +73,7 @@ def test_bubble_default_cooldown_and_settings_persistence(tmp_path, monkeypatch)
     initiative.update({'enabled': True})
     rule = initiative.settings['rules'][0]
     assert initiative.evaluate(rule, {'type': 'initiative.tick'})
-    assert initiative.session.state.speech_bubble == 'Would you like a hand?'
+    assert initiative.session.state.snapshot()['speech'] == 'Would you like a hand?'
     assert initiative.session.chat.history[-1].role == 'assistant'
     assert not initiative.session.speech.items
     assert not initiative.evaluate(rule, {'type': 'initiative.tick'})
@@ -88,7 +92,7 @@ def test_initiative_retains_character_but_omits_desktop_and_memory_context(tmp_p
     initiative = engine(tmp_path, monkeypatch, generate=generate)
     chat = initiative.session.chat
     chat.system_prompt = 'Character identity must remain.'
-    chat.history = [ChatMessage('user', 'x' * 2000) for _ in range(24)]
+    chat.conversation.append([ChatMessage('user', 'x' * 2000) for _ in range(24)])
     initiative.update({'enabled': True})
     try:
         assert not initiative.evaluate(initiative.settings['rules'][0], {})
@@ -126,7 +130,7 @@ def test_spoken_requires_permission_and_sleep_blocks_all_initiative(tmp_path, mo
     assert initiative.evaluate(rule, {})
     assert initiative.session.speech.items
     initiative.session._speech_pending = 0
-    initiative.session.state.sleep_mode = True
+    initiative.session.state.set_sleep(True)
     assert not initiative.evaluate(rule, {})
     initiative.session.close()
 
@@ -172,17 +176,25 @@ def test_corrupt_optional_settings_fail_closed_without_overwriting(tmp_path, mon
     initiative.session.close()
 
 
+def test_an_unknown_yaml_key_is_ignored_instead_of_disabling_initiative(tmp_path, monkeypatch):
+    initiative = engine(tmp_path, monkeypatch, raw={'initiative': {'enabled': True, 'interval_secs': 30}})  # load_config reports it
+    try:
+        assert initiative.settings['enabled'] and not initiative.error and 'interval_secs' not in initiative.settings
+        with pytest.raises(ValueError, match='Unknown'): initiative.update({'interval_secs': 30})  # a request is still checked strictly
+    finally: initiative.session.close()
+
+
 def test_idle_check_requests_tasks_through_read_only_tool(tmp_path, monkeypatch):
     from process.app_core.persistence.tasks import TaskStore, TaskMCP
     from process.app_core.tools.registry import ToolRegistry
-    from process.app_core.conversation.messages import ToolCall
+    from process.app_core.kernel.messages import ToolCall
     initiative = engine(tmp_path, monkeypatch)
     store = TaskStore(tmp_path / 'tasks.sqlite3')
     store.create('Write private report')
     registry = ToolRegistry()
-    registry.register_mcp(TaskMCP(store))
+    registry.register_mcp(TaskMCP(store), source='riko')
     chat = initiative.session.chat
-    chat.task_store, chat.tool_registry = store, registry
+    chat.deps, chat.tool_registry = ChatDeps(task_store=store), registry
     calls = []
     def generate(messages, **kwargs):
         calls.append(1)
@@ -200,6 +212,28 @@ def test_idle_check_requests_tasks_through_read_only_tool(tmp_path, monkeypatch)
     assert len(calls) == 2
     assert not chat.history
     initiative.session.close()
+
+
+def test_initiative_offers_only_read_only_tools_and_refuses_a_call_to_any_other(tmp_path, monkeypatch):
+    from process.app_core.tools.registry import ToolRegistry
+    from process.app_core.tools.tool import RIKO, RegisteredTool
+    from process.app_core.kernel.messages import ToolCall
+    initiative = engine(tmp_path, monkeypatch)
+    registry, effects, offered = ToolRegistry(), [], []
+    registry.register(RegisteredTool('peek', 'Look', {'type': 'object'}, lambda args: 'seen', read_only=True), source=RIKO)
+    registry.register(RegisteredTool('poke', 'Change', {'type': 'object'}, lambda args: effects.append(args) or 'done'), source=RIKO)
+    chat = initiative.session.chat
+    chat.tool_registry = registry
+    def generate(messages, **kwargs):
+        offered.append({tool['function']['name'] for tool in kwargs['tools']})
+        return ModelResponse(ChatMessage('assistant', tool_calls=[ToolCall('call', 'poke', {})]))
+    chat.provider.generate = generate
+    initiative.update({'enabled': True})
+    try:
+        with pytest.raises(ValueError, match='only permits read-only tools'):
+            initiative.evaluate(initiative.settings['rules'][0], {'type': 'environment.user_idle'})
+        assert offered == [{'peek'}] and effects == []
+    finally: registry.close(); initiative.session.close()
 
 
 @pytest.mark.parametrize('content', ['', '   ', 'Not now.', 'null', '[]', '{}',

@@ -47,13 +47,14 @@ class Job:
 
 
 class CompanionBot(commands.Bot):
-    def __init__(self, settings, *, backend_factory=BackendClient):
+    def __init__(self, settings, *, preferences, backend_factory=BackendClient):
+        """preferences: the channel preferences file (DataPaths.discord_preferences)."""
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
         super().__init__(command_prefix='!', intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.settings = settings
-        self.preferences = Preferences(settings.root / 'persistent_memories/discord_preferences.json')
+        self.preferences = Preferences(preferences)
         self.backend = backend_factory(settings.backend_url, self.backend_event, self.backend_disconnected)
         self.queue = asyncio.Queue(maxsize=8)
         self.processor = None

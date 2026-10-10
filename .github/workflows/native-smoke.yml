@@ -8,6 +8,7 @@ on:
     paths:
       - tools/llama_cpp/**
       - Code/process/app_core/inference/**
+      - Code/process/app_core/kernel/**   # messages, streaming, cancellation and timings the providers use
       - tools/release/**
       - electron/native_backends.json
       - Code/process/app_core/emotion/**   # FEATURE_VERSION must match tools/llama_cpp/emotion-probe.patch
@@ -20,6 +21,7 @@ on:
     paths:  # the same list as push
       - tools/llama_cpp/**
       - Code/process/app_core/inference/**
+      - Code/process/app_core/kernel/**   # messages, streaming, cancellation and timings the providers use
       - tools/release/**
       - electron/native_backends.json
       - Code/process/app_core/emotion/**   # FEATURE_VERSION must match tools/llama_cpp/emotion-probe.patch

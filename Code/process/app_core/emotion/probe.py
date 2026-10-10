@@ -15,10 +15,11 @@ import threading
 import uuid
 import time
 
+from ..kernel.schema import Section, Setting, dataclass_defaults, register
 from .models import EMOTIONS, EmotionState
+from .probe_hook import FEATURE_VERSION, FEATURE_WIDTH  # noqa: F401  (FEATURE_VERSION was defined here: old imports work)
 
 logger = logging.getLogger(__name__)
-FEATURE_VERSION = 'result_norm-pool256-v1'
 
 
 @dataclass
@@ -43,9 +44,8 @@ class ProbeConfig:
     @classmethod
     def from_raw(cls, raw):
         if not isinstance(raw, dict): raise ValueError('emotion.probe must be an object')
-        unknown = set(raw) - set(cls.__dataclass_fields__)
-        if unknown: raise ValueError(f'Unknown emotion.probe keys: {sorted(unknown)}')
-        value = cls(**raw)
+        # A key this class does not declare keeps its default: load_config reports it (configuration/schema.py unknown_settings).
+        value = cls(**{key: item for key, item in raw.items() if key in cls.__dataclass_fields__})
         if type(value.interval_tokens) is not int or not 1 <= value.interval_tokens <= 512:
             raise ValueError('probe.interval_tokens must be an integer between 1 and 512')
         for key in ('enabled', 'use_for_expression', 'auto_train', 'retain_sample_text'):
@@ -63,6 +63,38 @@ class ProbeConfig:
         return value
 
 
+def needs_native(config, raw):
+    """load_config, once AppConfig is assembled: the probe reads hidden states inside the in-process llama.cpp provider."""
+    if not ProbeConfig.from_raw(config.emotion.probe).enabled: return
+    if config.runtime.provider != 'llama_cpp' or not config.emotion.enabled:
+        raise ValueError('emotion.probe requires emotion.enabled and runtime.provider: llama_cpp with a probe-enabled native library')
+    if not config.runtime.native_library: raise ValueError('emotion.probe requires runtime.native_library pointing to the in-process probe DLL')
+
+
+PYTHON = ' Restart Python.'
+PROBE = {  # Settings metadata; every probe setting but these two is advanced
+    'enabled': dict(advanced=False, label='Latent emotion probe', help='Train a read-only CPU emotion probe against genuine Julia-1 labels from native llama.cpp hidden states. Requires the custom in-process DLL. Julia remains fallback until held-out validation passes.'),
+    'interval_tokens': dict(advanced=False, range=(1, 512), restart='none', live='probe_interval', label='Emotion probe interval (tokens)',
+        help='Run native capture and the CPU emotion probe at most once per this many generated tokens (reasoning-only samples are excluded). Default 32. Applies immediately on save. Generation still evaluates every token. Smaller values increase capture and teacher work.'),
+    'use_for_expression': dict(help='Automatically use the probe for agent expressions only after held-out validation passes. Julia remains for user input and low-confidence or unavailable-feature fallback. Disable to continue gathering comparisons.' + PYTHON),
+    'auto_train': dict(help='Train automatically only after continuous idle time and sufficient new samples. Inference, microphone activity and playback take priority. Manual Train now skips the idle delay, not foreground protection.' + PYTHON),
+    'idle_seconds': dict(help='Continuous idle time before automatic training. Default 300 seconds (five minutes).' + PYTHON),
+    'retain_sample_text': dict(help='Retain input and expression text for dataset review and replay with another main model. Text is private and stored locally. Applies to newly collected examples; older text-free records cannot be reconstructed.' + PYTHON),
+    'min_samples': dict(help='Minimum paired samples before training; evaluation also requires enough held-out message groups and emotion classes.' + PYTHON),
+    'min_agreement': dict(help='Minimum held-out emotion-label agreement with Julia before activation. Measures teacher imitation, not emotional truth.' + PYTHON),
+    'min_macro_f1': dict(help='Minimum class-balanced validation score. Helps prevent agreement dominated by one frequent emotion.' + PYTHON),
+    'max_rmse': dict(help='Maximum held-out score error for intensity, valence and arousal. Lower is stricter.' + PYTHON),
+    'min_confidence': dict(help='Minimum prediction confidence for expressions. Below this threshold Julia remains the fallback.' + PYTHON),
+    'hidden_units': dict(help='Two hidden-layer widths for the CPU expression head. Low-rank connections limit memory. Changing architecture creates a separate compatible artifact.' + PYTHON),
+    'rank': dict(help='Rank of the low-rank connections. Higher values add capacity and CPU cost. Changing architecture creates a separate artifact.' + PYTHON),
+    'epochs': dict(help='Number of passes through training samples. More epochs take longer and may overfit; held-out validation controls activation.' + PYTHON),
+    'retrain_every': dict(help='Minimum new samples required for automatic retraining after a previous run. Manual training bypasses this count, not the minimum dataset size.' + PYTHON),
+    'max_samples': dict(help='Maximum paired samples retained per compatible model artifact. Older records are evicted when this limit is reached. Retained text is part of this private dataset.' + PYTHON),
+}
+register(Section('emotion.probe', group='neural', title='Expression probe', advanced=True, strict=True, check=ProbeConfig.from_raw,
+    configure=needs_native, settings=tuple(Setting(key, default, **PROBE.get(key, {})) for key, default in dataclass_defaults(ProbeConfig).items())))
+
+
 def identity_key(identity):
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
@@ -78,7 +110,7 @@ def build_network(config):
     # Low-rank connections make 24,576 hidden units affordable on CPU rather
     # than allocating a dense 16,384 x 8,192 matrix.
     with torch.device('cpu'):
-        return nn.Sequential(nn.LayerNorm(256), nn.Linear(256, config.rank),
+        return nn.Sequential(nn.LayerNorm(FEATURE_WIDTH), nn.Linear(FEATURE_WIDTH, config.rank),
             nn.Linear(config.rank, a), nn.GELU(), nn.Linear(a, config.rank),
             nn.Linear(config.rank, b), nn.GELU(), nn.Linear(b, len(EMOTIONS) + 3))
 
@@ -86,7 +118,7 @@ def build_network(config):
 def latent_features(hidden):
     import torch
     value = hidden.detach().float().reshape(-1, hidden.shape[-1])[-1]
-    value = torch.nn.functional.adaptive_avg_pool1d(value[None, None], 256).flatten().cpu()
+    value = torch.nn.functional.adaptive_avg_pool1d(value[None, None], FEATURE_WIDTH).flatten().cpu()
     if not torch.isfinite(value).all(): raise ValueError('Nonfinite probe activations')
     return value
 
@@ -126,13 +158,13 @@ class EmotionProbe:
         self.config, self.teacher, self.idle = config, teacher, idle
         self.on_prediction = on_prediction
         self.on_fallback = on_fallback
-        with teacher._lock: teacher._load_model()
+        teacher.ensure_loaded()
         self.identity = {**identity, 'feature_version': FEATURE_VERSION,
             'teacher': teacher.model_id, 'teacher_path': str(teacher.model_path),
-            'teacher_snapshot': getattr(teacher, '_resolved_source', None),
-            'teacher_questions': teacher._questions(), 'teacher_context': teacher.context_tokens,
+            'teacher_snapshot': teacher.resolved_source,
+            'teacher_questions': teacher.question_set(), 'teacher_context': teacher.context_tokens,
             'teacher_max_length': teacher.max_length, 'teacher_strict_encoding': teacher.strict_encoding,
-            'teacher_fingerprint': teacher.probe_fingerprint(),
+            'teacher_fingerprint': teacher.fingerprint(),
             'network': [*config.hidden_units, config.rank]}
         self.key = identity_key(self.identity)
         self.path = Path(directory) / self.key / 'probe.pt'
@@ -147,6 +179,7 @@ class EmotionProbe:
         self.closed, self.training, self.since_train = False, False, 0
         self.idle_since = None
         self.manual_training = False
+        self.replaying = False  # replay() is generating from retained examples
         self.data_revision = str(uuid.uuid4())
         self.metadata = {}
         self.save_lock = threading.Lock()
@@ -173,7 +206,7 @@ class EmotionProbe:
             return {'model_key': self.key, 'ready': self.ready, 'training': self.training,
                 'samples': len(self.samples), 'pending': len(self.pending), 'validation': dict(self.validation),
                 'mode': 'probe' if self.ready and self.config.use_for_expression else 'julia_collecting',
-                'manual_training': self.manual_training, 'idle_seconds': self.config.idle_seconds,
+                'manual_training': self.manual_training, 'replaying': self.replaying, 'idle_seconds': self.config.idle_seconds,
                 'idle_elapsed': max(0,time.monotonic()-self.idle_since) if self.idle_since is not None else 0,
                 'revision': self.data_revision, 'error': self.error, 'emotions': list(EMOTIONS)}
 
@@ -184,6 +217,49 @@ class EmotionProbe:
             self.manual_training = True
             self.condition.notify_all()
             return self.status()
+
+    def replay(self, examples, lane):
+        """Generate a short new reply to each retained example's text on lane (ProbeHost.replay_lane: the capture slot, which
+        any live request preempts) whenever the provider and session are idle, so this backbone collects its own features and
+        Julia labels; no history, speech or UI turn. One replay at a time, on its own thread; a preempted example runs again."""
+        with self.condition:
+            if self.closed: raise RuntimeError('The expression probe is closed')
+            if self.replaying: raise RuntimeError('Example replay is already running')
+            self.replaying = True
+        try: threading.Thread(target=self._replay, args=(list(examples), lane), name='expression-example-replay', daemon=True).start()
+        except BaseException:
+            self.replaying = False
+            raise
+
+    def _wait(self, ready, poll):
+        """Poll ready() until it holds; False once closed. ready may take provider and session locks: never under self.condition."""
+        while not self.closed:
+            if ready(): return True
+            with self.condition: self.condition.wait(poll)  # close() wakes it
+        return False
+
+    def _replay(self, examples, lane):
+        from ..kernel.cancellation import BackgroundPreempted
+        from ..kernel.messages import ChatMessage
+        try:
+            for example in examples[:self.config.max_samples]:
+                text = example.get('text') if isinstance(example, dict) else None
+                if not isinstance(text, str) or not text.strip(): continue
+                while True:
+                    if not self._wait(self.idle, .5): return
+                    try:
+                        lane.generate([ChatMessage('system', 'Use this earlier dialogue as a training scenario. Continue with a short new assistant reply.'),
+                            ChatMessage('user', text[:2000])], max_output_tokens=96, emotion_turn_id='replay-' + str(uuid.uuid4()),
+                            cancelled=lambda: self.closed)
+                        break
+                    except BackgroundPreempted:
+                        if self.closed: return  # else a live request took the slot: run this example again once idle
+                # Finish this group's labels before the next one.
+                if not self._wait(lambda: not self.pending, .1): return
+        except Exception:
+            logger.exception('Expression example replay failed')
+            self.error = 'Example replay failed; see the diagnostic log.'
+        finally: self.replaying = False
 
     def training_due(self):
         if not self.idle(): self.idle_since=None; return False

@@ -1,6 +1,6 @@
 """Few-shot EfficientWord-Net enrollment; no ASR runs while waiting for wake."""
 from collections import deque
-from ..runtime.workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 from hashlib import sha256
 import json
 import logging
@@ -9,19 +9,9 @@ import time
 
 from ..events.bus import event_bus
 from ..events.outbox import Outbox
+from ..kernel.audio_config import FRAME_SECONDS, wake_phrase
 from ..persistence.atomic import atomic_write
 from .wake_capture import WakeCapture, prepare_audio
-
-
-def wake_phrase(voice, character_name):
-    """The wake name and, when the detector cannot use it, why ('' otherwise). Without voice.wake_word it is the first
-    word of the companion's name: the packaged setup accepts any name, and enrollment needs one short word."""
-    configured = voice.get('wake_word') if isinstance(voice, dict) else None
-    if configured is None: return (str(character_name or '').split() or ['Riko'])[0], ''
-    if not isinstance(configured, str):  # PyYAML reads an unquoted 42 or yes as a number or boolean
-        return str(configured), f'YAML read it as {type(configured).__name__}, not text: quote numbers and yes, no, on or off'
-    phrase = configured.strip()
-    return phrase, '' if len(phrase.split()) == 1 else 'Use one short wake name (a single word)'
 
 
 def profile_key(phrase, device):
@@ -32,28 +22,24 @@ def profile_key(phrase, device):
 
 class WakeWord:
     def __init__(self, config):
-        settings = config.raw.get("voice") or {}
-        self.mode = settings.get("mode", "wake_word")
-        if self.mode not in {"wake_word", "continuous", "manual"}:
-            raise ValueError("voice.mode must be wake_word, continuous or manual")
-        self.phrase, problem = wake_phrase(settings, config.character_name)
+        voice = config.voice  # mode, threshold and follow-up already checked (VoiceConfig.from_raw)
+        self.mode = voice.mode
+        self.phrase, problem = wake_phrase(voice, config.character_name)
         # An unusable wake word disables only enrollment and keyword detection: startup, chat, Speak now and the
         # other modes still work, and the status shows why.
         self.unavailable = f'Wake word “{self.phrase}” cannot be used. {problem}. Change it in Settings and restart Python.' if problem else ''
         if self.unavailable: logging.getLogger(__name__).warning('%s', self.unavailable)
-        self.threshold = float(settings.get("wake_threshold", .9))
-        self.config_threshold = self.threshold
-        self.followup = float(settings.get("follow_up_seconds", 10))
-        if not 0 < self.threshold < 1 or not 0 < self.followup <= 300:
-            raise ValueError("Invalid wake threshold or follow-up duration")
-        self.directory = config.root / "persistent_memories" / "wake_words"
+        # voice.wake_threshold starts each new enrollment; an enrolled profile keeps the threshold saved with it (bind_device).
+        self.threshold = self.config_threshold = voice.wake_threshold
+        self.followup = voice.follow_up_seconds
+        self.directory = config.paths.wake_words
         self.lock = threading.RLock()
         self.outbox = Outbox(event_bus)
         self.worker = DaemonExecutor(max_workers=1, thread_name_prefix="wake-detector", max_pending=2)
         self.model = None
         self.embeddings = []
         self.samples = []
-        self.window = deque(maxlen=47)  # 1.5 seconds, 512-sample input blocks.
+        self.window = deque(maxlen=round(1.5 / FRAME_SECONDS))  # 1.5 seconds of capture blocks (47)
         self.device = None
         self.path = None
         self.job = None
@@ -256,7 +242,7 @@ class WakeWord:
                     return
             self.window.append(frame)
             self.counter += 1
-            if not self.embeddings or len(self.window) < 47 or self.counter % 8: return
+            if not self.embeddings or len(self.window) < self.window.maxlen or self.counter % 8: return
             if self.job and not self.job.done(): return
             self._schedule_detection(b''.join(self.window))
 

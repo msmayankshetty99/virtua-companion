@@ -2,56 +2,13 @@
 from functools import lru_cache
 import json
 from pathlib import Path
-import struct
 
 from .gpu_memory import MIB
+from ..inference.gguf import read_gguf  # defined here before inference/gguf.py: old imports still work
 from ..inference.llama_context import context_capacity
 
 KV_BYTES = {'f32': 4, 'f16': 2, 'bf16': 2, 'q8_0': 34 / 32, 'q4_0': 18 / 32,
             'q4_1': 20 / 32, 'q5_0': 22 / 32, 'q5_1': 24 / 32, 'iq4_nl': 18 / 32}
-
-
-def read_gguf(path):
-    """Read only metadata, never tensors. Bound all untrusted lengths."""
-    scalar = {0: '<B', 1: '<b', 2: '<H', 3: '<h', 4: '<I', 5: '<i', 6: '<f', 7: '<?', 10: '<Q', 11: '<q', 12: '<d'}
-    with Path(path).open('rb') as file:
-        def unpack(fmt):
-            data = file.read(struct.calcsize(fmt))
-            if len(data) != struct.calcsize(fmt): raise ValueError('Truncated GGUF metadata')
-            return struct.unpack(fmt, data)[0]
-        def string():
-            length = unpack('<Q')
-            if length > 4 * MIB: raise ValueError('Oversized GGUF metadata string')
-            data = file.read(length)
-            if len(data) != length: raise ValueError('Truncated GGUF string')
-            return data.decode('utf-8')
-        def value(kind, keep=True, depth=0):
-            if depth > 2: raise ValueError('Nested GGUF metadata exceeds limit')
-            if kind in scalar: return unpack(scalar[kind])
-            if kind == 8: return string()
-            if kind == 9:
-                subtype, count = unpack('<I'), unpack('<Q')
-                if count > 2000000: raise ValueError('Oversized GGUF array')
-                if subtype in scalar and not keep:
-                    file.seek(struct.calcsize(scalar[subtype]) * count, 1)
-                    return None
-                result = []
-                for _ in range(count):
-                    item = value(subtype, False, depth + 1)
-                    if keep and count <= 4096: result.append(item)
-                return result if keep and count <= 4096 else None
-            raise ValueError('Unknown GGUF metadata type')
-        if file.read(4) != b'GGUF' or unpack('<I') not in (2, 3): raise ValueError('Not GGUF v2/v3')
-        unpack('<Q')
-        count = unpack('<Q')
-        if count > 10000: raise ValueError('Oversized GGUF metadata')
-        result = {}
-        for _ in range(count):
-            key, kind = string(), unpack('<I')
-            keep = not key.startswith(('tokenizer.', 'general.description', 'general.tags'))
-            item = value(kind, keep)
-            if keep: result[key] = item
-        return result
 
 
 @lru_cache(maxsize=16)
@@ -133,7 +90,7 @@ def estimate(config, telemetry, metadata=None):
     if managed and metadata is None:
         try: meta = model_metadata(runtime)
         except Exception as exc: warnings.append('LLM metadata unavailable: ' + str(exc))
-    pool = context_capacity(runtime)
+    pool = context_capacity(runtime) if managed else None  # only the in-process provider allocates a KV pool
     kv_per_token = None
     if managed and runtime.n_gpu_layers != 0:
         layers, embedding, heads, kv_heads = (meta.get(k) for k in ('layers', 'embedding', 'heads', 'kv_heads'))
@@ -163,7 +120,7 @@ def estimate(config, telemetry, metadata=None):
             add('llm_compute', 'LLM compute workspace', 128, 768, 'Heuristic; missing architecture details')
     else:
         add('llm_weights', 'LLM', 0, 0, 'CPU-only owned model' if managed else 'External provider excluded (any local GPU use appears in Other)')
-    voice = config.raw.get('voice', {})
+    voice = config.raw.get('voice') or {}
     from ..audio.asr import MODEL, resolve
     device, precision, note = resolve(voice)
     model = str(voice.get('asr_model', MODEL)).lower()
@@ -194,7 +151,7 @@ def estimate(config, telemetry, metadata=None):
             suggested_live = max(0, maximum_pool - (pool - runtime.n_ctx))
         else:
             suggested_live = maximum_pool // runtime.parallel_slots
-            if suggested_live < max(getattr(runtime, 'initiative_n_ctx', 4096), getattr(runtime, 'reflection_n_ctx', 4096)): suggested_live = 0
+            if suggested_live < max(runtime.initiative_n_ctx, runtime.reflection_n_ctx): suggested_live = 0
         model_limit = meta.get('context_length')
         if model_limit: suggested_live = min(suggested_live, model_limit)
         suggested_live = min(suggested_live, 1048576)
@@ -214,8 +171,8 @@ def estimate(config, telemetry, metadata=None):
         'confidence': 'low',
         'confidence_basis': 'Model/KV metadata is used where available; compute, recurrent state, ASR and graphics reserves remain heuristic, not a native backend dry-run allocation report.',
         'warnings': warnings, 'suggestion': suggestion, 'kv': {'unified': runtime.kv_unified, 'pool_tokens': pool,
-        'live_context_tokens': runtime.n_ctx, 'initiative_context_tokens': getattr(runtime, 'initiative_n_ctx', 4096),
-        'reflection_context_tokens': getattr(runtime, 'reflection_n_ctx', 4096), 'slots': runtime.parallel_slots},
+        'live_context_tokens': runtime.n_ctx, 'initiative_context_tokens': runtime.initiative_n_ctx,
+        'reflection_context_tokens': runtime.reflection_n_ctx, 'slots': runtime.parallel_slots},
         'managed': managed,
         'projection': projection,
         'note': 'Estimated peak residency, not measured allocations. Ranges and unknowns are intentional. Recommendations never modify settings.'}

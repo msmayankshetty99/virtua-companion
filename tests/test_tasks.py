@@ -6,10 +6,11 @@ import sys
 import pytest
 
 from process.app_core.persistence.tasks import TaskStore, TaskMCP, TaskConflict
-from process.app_core.tools import registry as tool_registry
+from process.app_core.tools.mcp import stdio as mcp_stdio
 from process.app_core.tools.registry import ToolRegistry, StdioMCPClient
-from process.app_core.conversation.chat import ChatService
-from process.app_core.conversation.messages import ChatMessage, ModelResponse, ToolCall
+from process.app_core.conversation.chat import ChatDeps, ChatService
+from process.app_core.kernel.messages import ChatMessage, ModelResponse, ToolCall
+from process.app_core.configuration.paths import DataPaths
 
 
 def test_tasks_survive_restart_and_preserve_provenance(tmp_path):
@@ -44,7 +45,7 @@ def test_mcp_rules_tools_and_conflicts_are_reported_as_errors(tmp_path):
     store = TaskStore(tmp_path / 'tasks.sqlite3')
     server = TaskMCP(store, source_turn=lambda: 'turn42')
     registry = ToolRegistry()
-    registry.register_mcp(server)
+    registry.register_mcp(server, source='riko')
     result = registry.execute('task_create', {'title': 'Build app'}, 'call1')
     assert not result.is_error
     task = result.content
@@ -65,7 +66,7 @@ def test_task_get_tool_returns_recent_change_summaries_while_the_store_keeps_eve
                      reason=f'Finished lesson {revision}. ' + 'detail ' * 500)
     store.update(task['id'], 31, {'status': 'blocked', 'blocker': 'No textbook'}, reason='User said so')
     registry = ToolRegistry()
-    registry.register_mcp(TaskMCP(store))
+    registry.register_mcp(TaskMCP(store), source='riko')
     try:
         schema = next(d['function']['parameters'] for d in registry.definitions() if d['function']['name'] == 'task_get')
         assert schema['properties']['history_limit'] == {'type': 'integer', 'minimum': 0, 'maximum': TOOL_HISTORY_MAX} and schema['required'] == ['task_id']
@@ -95,7 +96,7 @@ def test_task_get_tool_returns_recent_change_summaries_while_the_store_keeps_eve
 def test_tasks_are_requested_by_tools_not_preloaded(tmp_path):
     store = TaskStore(tmp_path / 'tasks.sqlite3')
     registry = ToolRegistry()
-    registry.register_mcp(TaskMCP(store))
+    registry.register_mcp(TaskMCP(store), source='riko')
     class Provider:
         count = 0
         def generate(self, messages, **options):
@@ -106,8 +107,7 @@ def test_tasks_are_requested_by_tools_not_preloaded(tmp_path):
             assert messages[-1].role == 'tool'
             assert 'Build app' in messages[-1].content
             return ModelResponse(ChatMessage('assistant', 'Task recorded.'))
-    chat = ChatService(Provider(), system_prompt='Riko', tool_registry=registry)
-    chat.task_store = store
+    chat = ChatService(Provider(), system_prompt='Riko', tool_registry=registry, deps=ChatDeps(task_store=store))
     store.create('Build app')
     chat.respond('What is my app project status?')
 
@@ -136,10 +136,10 @@ def test_mcp_command_is_found_on_the_child_path_and_a_miss_names_that_path(tmp_p
     with pytest.raises(FileNotFoundError, match="'riko-missing-mcp' was not found on PATH: " + re.escape(str(tmp_path))):
         StdioMCPClient('riko-missing-mcp', env={'PATH': str(tmp_path)})
     seen = []  # Windows: which() applies PATHEXT, so a bare npx becomes its npx.CMD shim on the merged PATH.
-    monkeypatch.setattr(tool_registry.shutil, 'which', lambda command, path=None: seen.append((command, path)) or 'C:/node/npx.CMD')
-    assert tool_registry.resolve_command('npx', {'PATH': os.pathsep.join(['/a', '/b'])}) == 'C:/node/npx.CMD'
+    monkeypatch.setattr(mcp_stdio.shutil, 'which', lambda command, path=None: seen.append((command, path)) or 'C:/node/npx.CMD')
+    assert mcp_stdio.resolve_command('npx', {'PATH': os.pathsep.join(['/a', '/b'])}) == 'C:/node/npx.CMD'
     assert seen == [('npx', os.pathsep.join(['/a', '/b']))]
-    assert tool_registry.resolve_command('C:/proj/.venv/Scripts/python', {}) == 'C:/proj/.venv/Scripts/python'  # a path runs as written
+    assert mcp_stdio.resolve_command('C:/proj/.venv/Scripts/python', {}) == 'C:/proj/.venv/Scripts/python'  # a path runs as written
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='POSIX shell wrapper')
@@ -177,12 +177,13 @@ for line in sys.stdin:
 
 def test_unloadable_mcp_server_is_reported_to_the_desktop(tmp_path):
     from types import SimpleNamespace
-    from process.app_core.desktop.state import get_desktop_state
+    from process.app_core.desktop.state import DesktopState
     (tmp_path / 'mcp.json').write_text('{"mcpServers": {"broken": {"command": "riko-missing-mcp"}}}', encoding='utf-8')
-    config = SimpleNamespace(root=tmp_path, tools=SimpleNamespace(mcp_config=tmp_path / 'mcp.json', timeout_seconds=5, require_approval=True))
-    registry = ToolRegistry.from_config(config)
+    config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), tools=SimpleNamespace(mcp_config=tmp_path / 'mcp.json', timeout_seconds=5, require_approval=True))
+    state = DesktopState()
+    registry = ToolRegistry.from_config(config, activity=state.activity)  # what the factory injects: the desktop's ActivityLog
     try:
-        notice = get_desktop_state().notifications[0]
+        notice = state.snapshot()['notifications'][0]
         assert notice['source'] == 'tools' and notice['level'] == 'error' and 'broken' in notice['text'] and 'riko-missing-mcp' in notice['text']
     finally: registry.close()
 

@@ -4,23 +4,56 @@ from datetime import datetime
 import json
 import math
 import os
-from pathlib import Path
 import re
 import threading
 import time
-from .workers import DaemonExecutor
+from ..kernel.workers import DaemonExecutor
 
 from ..events.bus import event_bus
-from ..conversation.messages import ChatMessage, conversation_sections
+from ..kernel.background_budget import validate_budget
+from ..kernel.messages import ChatMessage, conversation_sections
+from ..kernel.schema import Section, Setting, register
+from ..kernel.validation import section
 from ..persistence.atomic import atomic_write
 
 
-DEFAULTS = {'enabled': False, 'observe_idle': False, 'observe_active_app': False,
-            'max_output_tokens': 1024, 'context_window_tokens': 4096,
-            'interval_seconds': 120, 'idle_seconds': 300, 'cooldown_seconds': 300,
-            'spoken_enabled': False, 'allow_urgent_spoken': False,
-            'rules': [{'id': 'periodic', 'enabled': True, 'event': 'initiative.tick', 'instruction': 'Offer relevant help or start a considerate conversation only if useful.', 'presentation': 'bubble', 'cooldown_seconds': 300},
-                       {'id': 'return', 'enabled': True, 'event': 'environment.user_returned', 'instruction': 'Consider welcoming the user back or offering to resume an ongoing task.', 'presentation': 'bubble', 'cooldown_seconds': 300}]}
+DEFAULT_RULES = [{'id': 'periodic', 'enabled': True, 'event': 'initiative.tick', 'instruction': 'Offer relevant help or start a considerate conversation only if useful.', 'presentation': 'bubble', 'cooldown_seconds': 300},
+                 {'id': 'return', 'enabled': True, 'event': 'environment.user_returned', 'instruction': 'Consider welcoming the user back or offering to resume an ongoing task.', 'presentation': 'bubble', 'cooldown_seconds': 300}]
+
+
+def yaml_settings(raw):
+    """initiative.* as load_config reads it: DEFAULTS and the YAML's known keys (it reports the rest), budgets checked."""
+    settings = {**deepcopy(DEFAULTS), **{key: value for key, value in section('initiative', raw).items() if key in DEFAULTS}}
+    validate_budget(settings['context_window_tokens'], settings['max_output_tokens'], 'initiative')
+    return settings
+
+
+def review_budgets(candidate, draft, changes):
+    """Settings: saving also writes the edited budgets into initiative_settings.json, which overrides the YAML, so the
+    candidate takes them before the KV pool is sized from it (inference/settings.py)."""
+    runtime = candidate.runtime
+    runtime.initiative_n_ctx = changes.get('initiative.context_window_tokens', runtime.initiative_n_ctx)
+    runtime.initiative_max_output_tokens = changes.get('initiative.max_output_tokens', runtime.initiative_max_output_tokens)
+    validate_budget(runtime.initiative_n_ctx, runtime.initiative_max_output_tokens, 'initiative')
+    return {}
+
+
+def effective_budgets(config, values):  # Settings shows the budgets in force: initiative_settings.json overrides the YAML
+    values['initiative.context_window_tokens'] = config.runtime.initiative_n_ctx
+    values['initiative.max_output_tokens'] = config.runtime.initiative_max_output_tokens
+
+
+BUDGET = dict(group='models', section='Token budgets', live='initiative_budgets')  # applied to the running initiative; the KV pool needs a restart
+SETTINGS = register(Section('initiative', group='initiative', title='Settings', strict=True, check=yaml_settings, review=review_budgets,
+    effective=effective_budgets, settings=(
+        Setting('enabled', False), Setting('observe_idle', False), Setting('observe_active_app', False),
+        Setting('max_output_tokens', 1024, range=(1, 1048575), **BUDGET,
+            help='Output budget including reasoning. Invalid/empty/truncated decisions fail the attempt; no repair inference.'),
+        Setting('context_window_tokens', 4096, range=(256, 1048576), **BUDGET,
+            help='Total initiative context including output/tools. Older recent dialogue is token-trimmed while character/emotion state stays. Restart to resize the managed KV pool.'),
+        Setting('interval_seconds', 120), Setting('idle_seconds', 300), Setting('cooldown_seconds', 300),
+        Setting('spoken_enabled', False), Setting('allow_urgent_spoken', False), Setting('rules', DEFAULT_RULES))))
+DEFAULTS = SETTINGS.defaults()
 
 
 class InitiativeDecisionError(ValueError):
@@ -95,7 +128,7 @@ class Initiative:
     def __init__(self, session, *, adapter=None, triggers=None, start_worker=True):
         self.session = session
         self.adapter = adapter or WindowsActivity()
-        self.path = Path(session.config.root) / 'persistent_memories' / 'initiative_settings.json'
+        self.path = session.config.paths.initiative_settings
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.closed = threading.Event()
@@ -118,8 +151,9 @@ class Initiative:
         self.app_identity = None
         self.task_version = None
         self.version = 0
-        settings = {**deepcopy(DEFAULTS), **session.config.raw.get('initiative', {})}
         try:
+            # A YAML key DEFAULTS lacks keeps no value (load_config reports it); the app-written JSON stays strict.
+            settings = {**deepcopy(DEFAULTS), **{key: value for key, value in (session.config.raw.get('initiative') or {}).items() if key in DEFAULTS}}
             if self.path.exists(): settings.update(json.loads(self.path.read_text(encoding='utf-8')))
             self.settings = self.validate(settings)
         except (ValueError, TypeError, OSError) as exc:
@@ -141,7 +175,6 @@ class Initiative:
 
     def validate(self, settings):
         if set(settings) - set(DEFAULTS): raise ValueError('Unknown initiative setting')
-        from ..inference.background_budget import validate_budget
         validate_budget(settings['context_window_tokens'], settings['max_output_tokens'], 'initiative')
         for key in ('enabled', 'observe_idle', 'observe_active_app', 'spoken_enabled', 'allow_urgent_spoken'):
             if not isinstance(settings[key], bool): raise ValueError(f'{key} must be boolean')
@@ -197,7 +230,7 @@ class Initiative:
             return
         with self.lock:
             if not self.settings['enabled']: return
-            task_store = getattr(self.session.chat, 'task_store', None)
+            task_store = self.session.chat.deps.task_store
             if event.type == 'task.changed' and task_store: self.task_version = task_store.change_version()
             if event.type in {'environment.user_idle', 'environment.user_returned'} and not self.settings['observe_idle']: return
             if event.type == 'environment.active_app_changed' and not self.settings['observe_active_app']: return
@@ -225,7 +258,7 @@ class Initiative:
         if not settings['enabled']: return
         if now - self.last_sample >= 2:
             self.last_sample = now
-            task_store = getattr(self.session.chat, 'task_store', None)
+            task_store = self.session.chat.deps.task_store
             if task_store and not getattr(task_store, 'events_managed', False):
                 task_version = task_store.change_version()
                 if self.task_version is not None and task_version != self.task_version:
@@ -265,9 +298,9 @@ class Initiative:
             event_bus.publish('initiative.tick')
 
     def available(self):
-        s = self.session
-        return not (s._closed or s._generation_active or s._playing or s._speech_pending or s._user_speaking
-                    or s.state.sleep_mode or s.wake.calibrating or s.wake.testing)
+        """Foreground interaction is idle (RuntimeStatus.idle_for_background). It takes the session's _voice_lock, so never
+        call it holding self.lock (a component lock); evaluate's cancel poll reads an unlocked status instead."""
+        return self.session.status().idle_for_background()
 
     def evaluate(self, rule, event, *, version=None):
         with self.lock:
@@ -275,34 +308,35 @@ class Initiative:
             environment = deepcopy(self.environment)
             version = self.version if version is None else version
         now = time.monotonic()
-        if not settings['enabled'] or not self.available(): return False
+        status = self.session.status()
+        if not settings['enabled'] or not status.idle_for_background(): return False
         if now - self.last_evaluation < min(settings['interval_seconds'], 30): return False
         if now - self.last_presented < settings['cooldown_seconds'] or now - self.rule_last.get(rule['id'], float('-inf')) < rule.get('cooldown_seconds', 0): return False
         if rule.get('min_idle_seconds', 0) and environment.get('idle_seconds', -1) < rule['min_idle_seconds']: return False
         if rule.get('app_contains') and rule['app_contains'].casefold() not in environment.get('active_app', {}).get('window_title', '').casefold(): return False
-        revision = self.session._interaction_revision
+        revision = status.interaction_revision
         self.last_evaluation = now
         with self.lock:
             self.last_check = datetime.now().astimezone().isoformat(timespec='seconds')
         event_bus.publish('initiative.check_started')
-        def cancelled():
-            return self.closed.is_set() or version != self.version or revision != self.session._interaction_revision or not self.available()
+        def cancelled():  # polled by the provider and tools, maybe under their own locks: an unlocked reading
+            if self.closed.is_set() or version != self.version: return True
+            current = self.session.status(locked=False)
+            return revision != current.interaction_revision or not current.idle_for_background()
         def delta(_text):
             if cancelled(): raise RuntimeError('Initiative superseded by foreground activity/settings')
         chat = self.session.chat
-        with self.session._voice_lock:
-            dialogue = [m for m in chat.history if m.role in {'user', 'assistant'} and m.content and not m.tool_calls]
-            history = [{'role': m.role, 'content': m.content} for m in dialogue]
-        with self.session.state._lock:
-            emotion = self.session.state.emotion_state
-            emotion_state = deepcopy(emotion.as_dict()) if emotion else None
+        dialogue = [m for m in self.session.history_snapshot() if m.role in {'user', 'assistant'} and m.content and not m.tool_calls]
+        history = [{'role': m.role, 'content': m.content} for m in dialogue]
+        emotion_state = self.session.state.emotion_snapshot()
         payload = {'rule_instruction': rule['instruction'], 'event_type': event.get('type', ''),
                    'emotion': emotion_state,
                    'model_state': {'generating': False, 'speaking': False, 'user_speaking': False,
                        'sleep_mode': bool(self.session.state.sleep_mode)},
                    'recent_messages': history}
         registry = chat.tool_registry
-        read_tools = [tool for tool in registry.definitions('openai') if tool['function']['name'] in {'task_list', 'task_get'}] if registry else []
+        read_tools = registry.definitions('openai', read_only=True) if registry else []  # the tools that declare read_only
+        readable = {tool['function']['name'] for tool in read_tools}
         idle_check = event.get('type') == 'environment.user_idle' or environment.get('idle_seconds', 0) >= settings['idle_seconds']
         try:
             messages = [
@@ -320,8 +354,8 @@ class Initiative:
                  ChatMessage('user', json.dumps(payload, ensure_ascii=False), context_kind='initiative')]
             for _ in range(3):
                 if cancelled(): return False
-                from ..inference.background_budget import check_budget
-                provider = getattr(chat, 'initiative_provider', chat.provider)
+                from ..kernel.background_budget import check_budget
+                provider = chat.deps.initiative_provider or chat.provider
                 check_budget(provider, messages, read_tools, settings['context_window_tokens'], settings['max_output_tokens'])
                 response = provider.generate(messages, tools=read_tools or None,
                     max_output_tokens=settings['max_output_tokens'], context_limit=settings['context_window_tokens'], on_delta=delta, cancelled=cancelled)
@@ -329,7 +363,7 @@ class Initiative:
                 if not response.message.tool_calls: break
                 messages.append(response.message)
                 for call in response.message.tool_calls:
-                    if call.name not in {'task_list', 'task_get'} or not registry: raise ValueError('Initiative only permits read-only task tools')
+                    if call.name not in readable: raise ValueError('Initiative only permits read-only tools')
                     result = registry.execute(call.name, call.arguments, call.id, cancelled=cancelled)
                     messages.append(ChatMessage('tool', str(result.content), tool_call_id=result.tool_call_id, name=result.name))
             else: raise ValueError('Initiative exceeded its task lookup limit')
@@ -343,7 +377,7 @@ class Initiative:
             self.error = ''
         event_bus.publish('initiative.checked', **self.last_decision)
         if not proposal['initiate']: return False
-        from ..conversation.output_filter import clean_output
+        from ..kernel.output_filter import clean_output
         message = ' '.join(clean_output(proposal['message']).split()[:120])
         if not message: return False
         spoken = (rule['presentation'] == 'spoken' and settings['spoken_enabled']) or (proposal['urgent'] and settings['allow_urgent_spoken'])
@@ -360,9 +394,10 @@ class Initiative:
             self.wake.clear()
             try:
                 self.poll()
+                idle = self.available()  # before self.lock: a component lock never waits for the session's _voice_lock
                 with self.lock:
                     job = next(iter(self.pending.values()), None)
-                    if job and not self.busy and self.available():
+                    if job and not self.busy and idle:
                         rule, event, queued = job
                         self.pending.pop(rule['id'], None)
                         self.busy = True
@@ -376,7 +411,7 @@ class Initiative:
                 event_bus.publish('initiative.error', error=str(exc))
             with self.lock:
                 deadlines = [self.last_tick + self.settings['interval_seconds']] if self.settings['enabled'] else []
-                task_store = getattr(self.session.chat, 'task_store', None)
+                task_store = self.session.chat.deps.task_store
                 external_tasks = task_store and not getattr(task_store, 'events_managed', False)
                 if self.settings['enabled'] and (self.settings['observe_idle'] or self.settings['observe_active_app'] or external_tasks):
                     deadlines.append(self.last_sample + 2)

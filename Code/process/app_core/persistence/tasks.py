@@ -197,8 +197,10 @@ class TaskMCP:
                         'task_get': f'Retrieve a task with its newest changes and their provenance: {TOOL_HISTORY_DEFAULT} unless history_limit asks for up to {TOOL_HISTORY_MAX}. history_omitted counts older changes.',
                         'task_create': 'Track an explicit or agreed ongoing user goal; avoid casual mentions and duplicate tasks.',
                         'task_update': 'Update confirmed task progress, blockers, next steps or status. Requires current revision and evidence/reason; stale revisions are rejected.'}
-        return [{'name': name, 'description': descriptions[name], 'inputSchema': {'type': 'object', 'properties': properties, 'required': required, 'additionalProperties': False}}
-                for name, (properties, required) in schemas.items()]
+        # MCP annotations: the reads change nothing, so the initiative check may call them (ToolRegistry believes them only from
+        # this in-process server, registered as Riko's own; never from a configured one, task_mcp_server.py included).
+        return [{'name': name, 'description': descriptions[name], 'inputSchema': {'type': 'object', 'properties': properties, 'required': required, 'additionalProperties': False},
+                 'annotations': {'readOnlyHint': name in {'task_list', 'task_get'}}} for name, (properties, required) in schemas.items()]
 
     def call(self, name, arguments):
         try:

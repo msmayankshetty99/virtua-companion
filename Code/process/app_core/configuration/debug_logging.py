@@ -23,11 +23,11 @@ def configure_logging(config):
     if level not in {'DEBUG','INFO','WARNING','ERROR'}: level = 'INFO'
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     for name in ('process.app_core','desktop_server'): logging.getLogger(name).setLevel(level)
-    if not settings.get('inference_timings', True): logging.getLogger('process.app_core.inference.metrics').setLevel(logging.WARNING)
+    if not settings.get('inference_timings', True): logging.getLogger('process.app_core.kernel.metrics').setLevel(logging.WARNING)
     if settings.get('file_enabled', True):
-        directory = config.root / 'logs'
+        directory = config.paths.logs
         directory.mkdir(parents=True, exist_ok=True)
-        secrets = [value for key,value in {**dotenv_values(config.root / '.env'), **os.environ}.items() if any(word in key.lower() for word in ('token','secret','password','api_key'))]
+        secrets = [value for key,value in {**dotenv_values(config.paths.env_file), **os.environ}.items() if any(word in key.lower() for word in ('token','secret','password','api_key'))]
         secrets.append(getattr(config.runtime,'api_key',None))
         handler = RotatingFileHandler(directory / 'debug.log', maxBytes=int(settings.get('max_mb',5))*1024*1024,
             backupCount=int(settings.get('backups',3)), encoding='utf-8')

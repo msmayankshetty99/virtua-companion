@@ -2,8 +2,8 @@
 import json
 from dataclasses import replace
 
-from ..conversation.messages import ChatMessage, ModelResponse, ToolCall
-from ..conversation.streaming import WordDeltas
+from ..kernel.messages import ChatMessage, ModelResponse, ToolCall
+from ..kernel.streaming import WordDeltas
 
 
 def response_input(messages):
@@ -38,6 +38,10 @@ def template_messages(messages):
     request or moving changing metadata ahead of all cached history. An observation
     stays on the input it followed once a reply comes after it, so each tool-loop
     request extends the previous one (KV cache, Responses ids). Originals are untouched.
+
+    Strict templates (Gemma, older Mistral) also require alternating roles, but history
+    keeps the user's message of a stopped, failed or unheard turn, so consecutive user
+    messages (or plain assistant messages) are joined into one.
     """
     result, context = [], []
     def attach(message):
@@ -65,7 +69,14 @@ def template_messages(messages):
             if context: attach_latest()
             result.append(replace(message))
     if context: attach_latest()
-    return result
+    merged = []
+    for message in result:
+        previous = merged[-1] if merged else None
+        if (previous and message.role == previous.role and message.role in {'user', 'assistant'}
+                and not (message.tool_calls or previous.tool_calls or message.tool_call_id or previous.tool_call_id)):
+            merged[-1] = replace(previous, content=previous.content + '\n\n' + message.content)
+        else: merged.append(message)
+    return merged
 
 
 def response_result(raw):

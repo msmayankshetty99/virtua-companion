@@ -3,21 +3,26 @@ failed or interrupted turns keep the user's message, and unreadable stores fail 
 import asyncio
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from process.app_core.conversation.chat import ChatService
-from process.app_core.conversation.messages import ChatMessage, ModelResponse
+from process.app_core.conversation.chat import ChatDeps, ChatService
+from process.app_core.conversation.history import ConversationHistory
+from process.app_core.kernel.messages import ChatMessage, ModelResponse
 from process.app_core.desktop.state import DesktopState
 from process.app_core.emotion.julia import JuliaEmotionEngine
 from process.app_core.emotion.probe import EmotionProbe, ProbeConfig, build_network
 from process.app_core.events.bus import EventBus, RuntimeEvent, event_bus
-from process.app_core.runtime.cancellation import TurnCancelled
+from process.app_core.kernel.cancellation import TurnCancelled
 from process.app_core.runtime.session import SessionManager
 from process.app_core.tools.approval import ToolApprovals
+from process.app_core.inference.provider import BaseProvider
+from process.app_core.kernel.audio_config import audio_sections
+from process.app_core.configuration.paths import DataPaths
 
 
 class FakeSpeech:
@@ -32,8 +37,8 @@ class FakeSpeech:
 @pytest.fixture
 def session_parts(monkeypatch):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', FakeSpeech)
-    chat = SimpleNamespace(history=[], _save_history=lambda: None, provider=SimpleNamespace(close=lambda: None))
-    config = SimpleNamespace(raw={}, root=Path('.'), character_name='Riko', tools=SimpleNamespace(max_iterations=8))
+    chat = SimpleNamespace(conversation=ConversationHistory(), deps=ChatDeps(), provider=BaseProvider())
+    config = SimpleNamespace(raw={}, root=Path('.'), paths=DataPaths.at(Path('.')), character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
     session = SessionManager(config, chat, DesktopState())
     events = []
     unsubscribe = event_bus.subscribe(lambda event: events.append(event.type))
@@ -45,12 +50,12 @@ def session_parts(monkeypatch):
 def answer(chat, text):
     def respond(user_text, user_name, **kwargs):
         kwargs['on_delta'](text)
-        chat.history.extend([ChatMessage('user', f'{user_name}: {user_text}'), *kwargs['response_history'](text)])
+        chat.conversation.append([ChatMessage('user', f'{user_name}: {user_text}'), *kwargs['response_history'](text)])
         return ModelResponse(ChatMessage('assistant', text))
     return respond
 
 
-def contents(chat): return [(message.role, message.content) for message in chat.history]
+def contents(chat): return [(message.role, message.content) for message in chat.conversation.snapshot()]
 
 
 def test_stop_sleep_and_shutdown_after_a_finished_reply_keep_it(session_parts):
@@ -95,12 +100,13 @@ def test_shutdown_during_a_reply_keeps_the_users_message(session_parts):
         raise TurnCancelled()
     chat.respond = respond
     with pytest.raises(TurnCancelled): session.respond('hello')
-    assert chat.history[0].content == 'User: hello'
+    assert chat.conversation.snapshot()[0].content == 'User: hello'
 
 
 def test_a_bad_voice_setting_fails_the_turn_with_the_real_error_and_keeps_the_message(session_parts):
     session, chat, events = session_parts
-    session.config.raw['voice'] = {'interjection_debounce_seconds': 0}  # hand-edited YAML
+    # load_config rejects this value (tests/test_config.py); a voice section built another way must still fail the turn cleanly.
+    session.config.voice = replace(session.config.voice, interjection_debounce_seconds=0)
     with pytest.raises(ValueError, match='debounce'): session.respond('hello')
     assert contents(chat) == [('user', 'User: hello')]
     assert 'model.error' in events
@@ -117,7 +123,7 @@ def test_only_real_speech_failures_count_as_not_heard(session_parts):
 
 def test_muted_voice_continuation_drops_the_cut_reply_fragment(session_parts):
     session, chat, _ = session_parts
-    session.state.audio_enabled = False
+    session.state.toggle_audio()  # muted
     def respond(text, user_name, **kwargs):
         anchor = session.voice_anchor()  # the user is still talking; nothing is visible yet
         kwargs['on_delta']('Sure, the capital of')
@@ -148,7 +154,7 @@ def test_turn_lock_is_released_when_superseding_previous_speech_fails(session_pa
     session.speech.cancel = lambda: None
     chat.respond = answer(chat, 'Second reply.')
     session.respond('second')  # must not fail with "already handling another turn"
-    assert chat.history[-1].content == 'Second reply.'
+    assert chat.conversation.snapshot()[-1].content == 'Second reply.'
 
 
 def provider(text='hi'):
@@ -172,7 +178,7 @@ def test_chat_history_is_never_saved_over_a_file_that_could_not_be_kept(tmp_path
     path.write_text('{"not": "a list"}', encoding='utf-8')
     original = path.read_bytes()
     def locked(path): raise PermissionError('locked by another program')
-    monkeypatch.setattr('process.app_core.conversation.chat.preserve_unreadable', locked)
+    monkeypatch.setattr('process.app_core.conversation.history.preserve_unreadable', locked)
     service = ChatService(provider(), system_prompt='test', history_file=path)
     service.respond('hello')
     assert path.read_bytes() == original
@@ -198,7 +204,7 @@ def test_permission_denied_files_are_moved_aside_instead_of_blocking_forever(tmp
     finally: gate.close()
     assert not denied  # both reads were denied once
     assert [record['content'] for record in json.loads(history.read_text(encoding='utf-8'))] == ['User: hello', 'hi']
-    assert json.loads(approvals.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True}
+    assert json.loads(approvals.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True, 'version': 2, 'sources': {'riko': {'calculator': False, 'task_create': True}}}
     assert {kept.name.split('.unreadable-')[0] for kept in tmp_path.glob('*.unreadable-*')} == {history.name, approvals.name}
 
 
@@ -210,7 +216,7 @@ def test_unreadable_tool_approval_policy_requires_approval_for_every_tool(tmp_pa
         assert gate.snapshot()['error']
         assert gate.authorize('calculator', {}, 'call-1', timeout=0.05) is False  # not silently allowed
         gate.configure({'calculator': False}, names=['calculator', 'task_create'])
-        assert json.loads(path.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True}
+        assert json.loads(path.read_text(encoding='utf-8')) == {'calculator': False, 'task_create': True, 'version': 2, 'sources': {'riko': {'calculator': False, 'task_create': True}}}
         assert gate.snapshot()['error'] == ''
         assert len(list(tmp_path.glob('tool_approvals.json.unreadable-*'))) == 1
     finally: gate.close()

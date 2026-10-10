@@ -26,9 +26,28 @@ HOSTS = {'127.0.0.1', 'localhost'}
 WEBSOCKET_ORIGINS = {'null', 'file://', 'http://localhost:5173', 'http://127.0.0.1:5173'}
 SIGNATURE = re.compile(r'[0-9a-f]{64}')
 SECRET = re.compile(r'[A-Za-z0-9_-]{32,256}')  # what Electron and secrets.token_urlsafe produce
+DEFAULT_PORT = 8765  # electron/backend_origin.cjs holds Electron's copy of the default
 
 
-def secret_path(root, name): return Path(root) / 'persistent_memories' / name
+def backend_port(env=None):
+    """The loopback port this backend binds and its clients reach: RIKO_PORT (1024-65535), else 8765. Packaged Electron
+    passes the free port it chose; in development set it here and RIKO_BACKEND_URL for Electron. The guard checks the Host
+    name, never the port, so it holds on any port."""
+    value = (os.environ if env is None else env).get('RIKO_PORT', '').strip()
+    if not value: return DEFAULT_PORT
+    if not (value.isascii() and value.isdigit() and 1024 <= int(value) <= 65535):
+        raise ValueError(f'RIKO_PORT must be a port from 1024 to 65535, not {value!r}')
+    return int(value)
+
+
+def backend_url(env=None):
+    """This backend's address for a client: always 127.0.0.1, since 'localhost' may resolve to ::1."""
+    return f'http://127.0.0.1:{backend_port(env)}'
+
+
+def secret_path(root, name):
+    """A client's view of DataPaths.api_token and .confirm_key (configuration/paths.py), from the data root alone."""
+    return Path(root) / 'persistent_memories' / name
 
 
 def write_secret(path, value):
@@ -46,8 +65,9 @@ def write_secret(path, value):
         raise
 
 
-def issue_secrets(root):
-    """Fresh (token, confirmation key) for this backend start; call once the port is bound.
+def issue_secrets(paths):
+    """Fresh (token, confirmation key) for this backend start; call once the port is bound. paths: the backend's DataPaths
+    (configuration/paths.py), whose api_token and confirm_key files electron/main.cjs reads in development.
 
     Values passed by packaged Electron are used as given. Both are removed from os.environ
     so tool workers, MCP servers and other children never inherit them.
@@ -55,8 +75,8 @@ def issue_secrets(root):
     token, key = os.environ.pop('RIKO_API_TOKEN', ''), os.environ.pop('RIKO_CONFIRM_KEY', '')
     if SECRET.fullmatch(token) and SECRET.fullmatch(key) and token != key: return token, key
     token, key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-    write_secret(secret_path(root, 'api_token'), token)
-    write_secret(secret_path(root, 'confirm_key'), key)
+    write_secret(paths.api_token, token)
+    write_secret(paths.confirm_key, key)
     return token, key
 
 

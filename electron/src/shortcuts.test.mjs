@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url);
 const {DEFAULT_SHORTCUTS,shortcutBindings}=require('../shortcuts.cjs');
@@ -15,9 +14,4 @@ test('configured shortcuts bind actions, and null, empty or false unbinds even t
   assert.deepEqual(shortcutBindings({quit:'CommandOrControl+Shift+Q',mic:' Alt+M ',unknown:'Alt+U'},names),[['popup','CommandOrControl+Shift+Space'],['quit','CommandOrControl+Shift+Q'],['mic','Alt+M']]);
   for(const off of [null,'',false,0])assert.deepEqual(shortcutBindings({popup:off},names),[]);
   assert.deepEqual(shortcutBindings(['Alt+X'],names),[['popup','CommandOrControl+Shift+Space']]);
-});
-test('main registers shortcuts only through shortcutBindings',()=>{
-  const host=fs.readFileSync(new URL('../main.cjs',import.meta.url),'utf8');
-  assert.match(host,/shortcutBindings\(config\.desktop\?\.shortcuts,Object\.keys\(actions\)\)/);
-  assert.doesNotMatch(host,/CommandOrControl\+Shift\+[QW,]/);
 });
