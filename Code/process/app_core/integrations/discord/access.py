@@ -54,10 +54,11 @@ class DiscordAccess:
         from dotenv import dotenv_values
         with self.lock:
             path = self.paths.env_file
-            key = (self.signature(path), tuple(sorted((name,value) for name,value in os.environ.items() if name.startswith('Discord_'))))
+            overrides = BotSettings.overrides(os.environ)  # matched without case: Windows reports DISCORD_BACKEND_URL
+            key = (self.signature(path), tuple(sorted(overrides.items())))
             if self._credentials is not None and key == self._credentials_key: return self._credentials
             env = {name: value for name, value in dotenv_values(path).items() if value is not None}
-            settings = BotSettings.from_env(self.paths.root, {**env, **os.environ})
+            settings = BotSettings.from_env(self.paths.root, {**env, **overrides})
             self._credentials_key, self._credentials = key, settings
             return settings
 

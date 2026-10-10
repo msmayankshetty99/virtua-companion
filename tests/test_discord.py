@@ -54,6 +54,9 @@ def test_the_backend_url_defaults_to_the_backends_port_and_a_started_worker_reac
     paths.env_file.write_text('Discord_backend_url=http://127.0.0.1:8765\n', encoding='utf-8')
     monkeypatch.setenv('Discord_backend_url', 'http://127.0.0.1:9123')  # what DiscordLauncher hands the worker
     assert DiscordAccess(paths).settings().backend_url == 'http://127.0.0.1:9123'
+    monkeypatch.delenv('Discord_backend_url')
+    monkeypatch.setenv('DISCORD_BACKEND_URL', 'http://127.0.0.1:9124')  # how Windows reports the launcher's variable
+    assert DiscordAccess(paths).settings().backend_url == 'http://127.0.0.1:9124'
 
 
 def test_discord_preferences_roundtrip_and_bad_data_preserved(tmp_path):

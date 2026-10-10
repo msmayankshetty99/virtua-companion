@@ -24,6 +24,16 @@ class BotSettings:
     allow_dms: bool = True
     admin_actions: bool = True
 
+    # Every key from_env reads; environment overrides are matched to them without case (Windows upper-cases names).
+    KEYS = ('Discord_backend_url', 'RIKO_PORT', 'Discord_camera_url', 'Discord_bot_token', 'Discord_admins', 'Discord_allowed_users',
+        'Discord_Channel_whitelist', 'Discord_ffmpeg', 'Discord_sync_guild')
+
+    @classmethod
+    def overrides(cls, environ):
+        """The process environment's values for KEYS, under their own spelling whatever case the OS reports."""
+        canonical = {key.casefold(): key for key in cls.KEYS}
+        return {canonical[name.casefold()]: value for name, value in environ.items() if name.casefold() in canonical}
+
     @classmethod
     def from_env(cls, root, env):
         from ...desktop.api_guard import backend_url
