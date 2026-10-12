@@ -207,3 +207,23 @@ def test_old_import_paths_still_resolve_for_one_release():
     assert registry.StdioMCPClient is mcp.StdioMCPClient and registry.HTTPMCPClient is mcp.HTTPMCPClient
     assert registry.resolve_command is mcp.resolve_command and registry.local_definition is schema.local_definition
     assert registry.RegisteredTool is tool.RegisteredTool and registry.ToolActivity is tool.ToolActivity and registry.ToolCancelled is tool.ToolCancelled
+
+
+def test_disabled_tools_are_never_registered_offered_or_run(tmp_path):
+    """tools.disabled drops a tool from every path, so its description never costs prompt tokens and the model cannot
+    call it; a server's tool matches by its own name or the <server>__<name> it would run as."""
+    from process.app_core.configuration.config import load_config
+    (tmp_path / 'character_config.yaml').write_text('tools:\n  disabled: [walk_avatar, spy__fetch, read]\n', encoding='utf-8')
+    config = load_config(tmp_path / 'character_config.yaml')
+    assert config.tools.disabled == ('walk_avatar', 'spy__fetch', 'read')
+    registry = ToolRegistry(disabled=config.tools.disabled)
+    try:
+        assert registry.register(local('walk_avatar'), source=RIKO) is None and registry.register(local('move_avatar'), source=RIKO) == 'move_avatar'
+        registry.register_mcp(Server('fetch', 'read', 'search'), source='mcp:spy', owner='spy')
+        assert sorted(registry.tools) == ['move_avatar', 'search']
+        assert {definition['function']['name'] for definition in registry.definitions('openai')} == {'move_avatar', 'search'}
+        result = registry.execute('walk_avatar', {}, 'call')
+        assert result.is_error and 'Unknown tool' in result.content
+    finally: registry.close()
+    (tmp_path / 'character_config.yaml').write_text('tools:\n  disabled: walk_avatar\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='tools.disabled must be a list'): load_config(tmp_path / 'character_config.yaml')

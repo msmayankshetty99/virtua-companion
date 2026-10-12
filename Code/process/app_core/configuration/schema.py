@@ -7,6 +7,7 @@ from dataclasses import asdict
 from functools import cache
 import json
 import math
+import re
 
 from ..kernel import schema
 from ..kernel.background_budget import validate_budget
@@ -34,6 +35,9 @@ def check_tools(tools):
     for key, default in (('best_fit_timeout_seconds', .4), ('best_fit_min_confidence', .85)):
         value, (low, high) = tools.get(key, default), schema.REGISTRY.setting(f'tools.{key}').range
         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high: raise ValueError(f'tools.{key} must be between {low} and {high}')
+    disabled = tools.get('disabled') or []  # tool names as the model calls them (tools/tool.py NAME)
+    if not isinstance(disabled, list) or not all(isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name) for name in disabled):
+        raise ValueError('tools.disabled must be a list of tool names (letters, digits, _ or -)')
     return tools
 
 
@@ -77,7 +81,9 @@ register(
         Setting('require_approval', help='Default for new/unconfigured tools. Per-tool live permissions override this default; approval bubbles expire after two minutes without executing.'),
         Setting('best_fit_inputs', help='Correct finite-choice desktop inputs before approval. Reuses the enabled, already-loaded CPU Julia model; safe spelling normalization is the fallback. Never repairs file permissions, numeric values or arbitrary paths.'),
         Setting('timeout_seconds', range=(.1, 3600)), Setting('max_iterations', range=(1, 100)),
-        Setting('best_fit_timeout_seconds', range=(.05, 2)), Setting('best_fit_min_confidence', range=(.5, 1)))),
+        Setting('best_fit_timeout_seconds', range=(.05, 2)), Setting('best_fit_min_confidence', range=(.5, 1)),
+        Setting('disabled', [], label='Disabled tools',
+            help='JSON list of tool names Riko never sees or calls, e.g. ["pdf_extractor", "todo_list"]. Each tool\'s description is part of every prompt, so fewer tools mean faster replies. Restart Python.'))),
     Section('tasks', group='tools', title='Settings'),
     Section('logging', group='performance', title='Debug logging', settings=(
         Setting('file_enabled', True, label='Write debug log file',

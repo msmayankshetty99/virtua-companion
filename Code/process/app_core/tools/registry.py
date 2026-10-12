@@ -25,9 +25,10 @@ INVALID = re.compile(r'[^a-zA-Z0-9_-]')
 
 
 class ToolRegistry:
-    def __init__(self, *, timeout_seconds=30.0, require_approval=False, activity=None):
+    def __init__(self, *, timeout_seconds=30.0, require_approval=False, activity=None, disabled=()):
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0: raise ValueError('Tool timeout must be positive and finite')
         self.tools: dict[str, Tool] = {}
+        self.disabled = frozenset(disabled)  # tools.disabled: never registered, so never offered to the model or run
         self.timeout_seconds = timeout_seconds
         self.require_approval = require_approval
         self.activity = activity if activity is not None else ToolActivity()
@@ -46,6 +47,11 @@ class ToolRegistry:
         (unless replace), raises ValueError, and a server's tool that has it is renamed. A server's tool whose own name
         is invalid or taken runs as <server>__<name>, with a warning, or is left out when that is invalid or taken too."""
         tool.source = source
+        original = tool.remote_name or tool.name
+        names = {tool.name, original, *([f'{INVALID.sub("_", source.removeprefix("mcp:"))}__{INVALID.sub("_", str(original))}'] if source != RIKO else [])}
+        if self.disabled & names:
+            logger.info('Tool %r from %s is disabled (tools.disabled)', original, source)
+            return None
         if source != RIKO: return self._add_external(tool)
         if not isinstance(tool.name, str) or not NAME.fullmatch(tool.name): raise ValueError(f'Invalid tool name {tool.name!r}: use 1-64 letters, digits, _ or -')
         held = self.tools.get(tool.name)
@@ -174,7 +180,8 @@ class ToolRegistry:
         imports desktop/), then the MCP servers mcp.json configures, which a local name never yields to (the factory adds
         TaskMCP's tools, SessionManager its own)."""
         servers = configured_servers(config.tools.mcp_config)
-        registry = cls(timeout_seconds=config.tools.timeout_seconds, require_approval=config.tools.require_approval, activity=activity)
+        registry = cls(timeout_seconds=config.tools.timeout_seconds, require_approval=config.tools.require_approval, activity=activity,
+            disabled=config.tools.disabled)
         from .approval import ToolApprovals
         registry.approvals = ToolApprovals(config.paths.tool_approvals, config.tools.require_approval)
         try:

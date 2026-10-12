@@ -79,6 +79,7 @@ class ToolConfig:
     best_fit_inputs: bool = True
     best_fit_timeout_seconds: float = .4
     best_fit_min_confidence: float = .85
+    disabled: tuple = ()  # tool names Riko never sees or calls (tools.disabled): fewer prompt tokens on every turn
 
 
 @dataclass
@@ -231,6 +232,7 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
             best_fit_inputs=tools_raw.get('best_fit_inputs', True),
             best_fit_timeout_seconds=float(tools_raw.get('best_fit_timeout_seconds', .4)),
             best_fit_min_confidence=float(tools_raw.get('best_fit_min_confidence', .85)),
+            disabled=tuple(tools_raw.get('disabled') or ()),
         ),
         memory=MemoryConfig(
             history_file=paths.chat_history,
