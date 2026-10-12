@@ -2,9 +2,11 @@
 library file names and their build flags. Electron's first-run setup (electron/native_backends.cjs), the
 `runtime.native_library: bundled:<backend>` resolution here and tools/release/build.py all read that one file; the
 frozen backend carries a copy (build.py adds it with --add-data). Every function takes the platform (sys.platform
-values), so tests check each OS on every host. Dependency-free: build.py loads this file by path."""
+values), so tests check each OS on every host. An optional backend (hip) resolves like the others but is left out of a
+default release (release_backends). Dependency-free: build.py loads this file by path."""
 from __future__ import annotations
 
+import fnmatch
 import functools
 import json
 import re
@@ -16,6 +18,8 @@ FROZEN_DIRECTORY = 'electron'  # the manifest's folder inside the frozen backend
 PLATFORMS = ('win32', 'linux', 'darwin')
 _ID = re.compile(r'[a-z][a-z0-9_]*')  # also the bundle's folder name: nothing that could leave resources/native
 _SWITCH = re.compile(r'GGML_[A-Z0-9_]+')
+# In a backend's cmake_flags: ggml builds its backends as modules that the bridge loads from its own folder at run time.
+DYNAMIC = '-DGGML_BACKEND_DL=ON'
 
 
 def manifest_path() -> Path:
@@ -53,14 +57,35 @@ def validate(data: dict) -> dict:
         if switch is not None and (not isinstance(switch, str) or not _SWITCH.fullmatch(switch) or switch in switches):
             fail(f'{name}.cmake_switch must be a GGML_ option no other backend uses, or null for a CPU-only build')
         switches.add(switch)
+        if type(backend.get('optional', False)) is not bool: fail(f'{name}.optional must be a boolean')
+        if 'rpath' in backend and not (isinstance(backend['rpath'], str) and backend['rpath'].startswith('/')):
+            fail(f'{name}.rpath must be an absolute directory searched after the platform\'s')
+        system = backend.get('system_libraries', [])
+        if not isinstance(system, list) or not all(isinstance(item, str) and item for item in system): fail(f'{name}.system_libraries must list file patterns')
         flags = backend.get('cmake_flags', [])
         if not isinstance(flags, list) or not all(isinstance(flag, str) and flag.startswith('-D') for flag in flags):
             fail(f'{name}.cmake_flags must be -D definitions')
+        if '-DGGML_CPU_ALL_VARIANTS=ON' in flags and DYNAMIC not in flags: fail(f'{name}: GGML_CPU_ALL_VARIANTS needs {DYNAMIC}')
+        for platform in shipped if DYNAMIC in flags else []:  # build.py stages a bundle's files by its platform's patterns
+            module = _modules(platform, switch)['cpu'][0]
+            if not any(fnmatch.fnmatch(module, pattern) for pattern in platforms[platform]['shared_libraries']):
+                fail(f'{platform}.shared_libraries must match {name}\'s GGML_BACKEND_DL modules ({module})')
         detect = backend.get('detect')
         if detect is not None and not (isinstance(detect, dict) and all(isinstance(detect.get(key), str) and detect[key] for key in ('command', 'label', 'missing'))
                 and isinstance(detect.get('args', []), list) and all(isinstance(item, str) for item in detect.get('args', []))
-                and type(detect.get('required', False)) is bool):
-            fail(f'{name}.detect needs a command, args, label, missing text and a boolean required')
+                and isinstance(detect.get('fallbacks', []), list) and all(isinstance(argv, list) and argv and all(isinstance(item, str) and item for item in argv)
+                    for argv in detect.get('fallbacks', []))
+                and isinstance(detect.get('pattern', ''), str) and type(detect.get('required', False)) is bool
+                and isinstance(detect.get('targets', ''), str) and isinstance(detect.get('runtime', []), list)
+                and all(isinstance(item, str) and item.startswith('/') for item in detect.get('runtime', []))):
+            fail(f'{name}.detect needs a command, args, label, missing text and a boolean required (fallbacks: argv lists; pattern, targets: text; runtime: absolute paths)')
+        if detect and detect.get('targets') and not any(flag.startswith(f"-D{detect['targets']}=") for flag in backend.get('cmake_flags', [])):
+            fail(f"{name}.detect.targets names -D{detect['targets']}=, which its cmake_flags do not set")
+        if detect and detect.get('pattern'):
+            try: re.compile(detect['pattern'])
+            except re.error as error: fail(f'{name}.detect.pattern: {error}')
+    for platform in platforms:  # the release builds these, and setup falls back to them
+        if backends_for(platform, data) and not release_backends(platform, data): fail(f'{platform} ships only optional backends')
     return data
 
 
@@ -90,6 +115,13 @@ def backends_for(platform: str | None = None, data: dict | None = None) -> list[
     return [backend['id'] for backend in (data or manifest())['backends'] if platform in backend['platforms']]
 
 
+def release_backends(platform: str | None = None, data: dict | None = None) -> list[str]:
+    """What a release builds and checks for the platform by default: its backends but the optional ones (hip), which
+    tools/release/build.py stages only when asked."""
+    platform = _platform(platform)
+    return [backend['id'] for backend in (data or manifest())['backends'] if platform in backend['platforms'] and not backend.get('optional')]
+
+
 def bundled_library(backend: str, bundle: str | Path | None, platform: str | None = None, data: dict | None = None) -> Path:
     """`bundled:<backend>` as a path inside the installed app (RIKO_BUNDLE_ROOT), so the configuration survives moving
     or upgrading the app; only backends shipped for this platform, whose ids are safe folder names, resolve."""
@@ -103,10 +135,42 @@ def bundled_library(backend: str, bundle: str | Path | None, platform: str | Non
     return Path(bundle) / 'native' / backend / library_name(platform, data)
 
 
+def _entry(backend, data):
+    entry = next((item for item in data['backends'] if item['id'] == backend), None)
+    if entry is None: raise ValueError(f'Unknown native backend {backend!r}')
+    return entry
+
+
+def rpath(backend: str, platform: str | None = None, data: dict | None = None) -> str | None:
+    """The bundle's install rpath as a CMake list: the platform's (each library finds the others beside it), then the
+    backend's own system directory (hip: /opt/rocm/lib, where AMD's ROCm packages put libamdhip64). None on Windows."""
+    data = data or manifest()
+    own = platform_build(platform, data).get('rpath')
+    return ';'.join(filter(None, [own, _entry(backend, data).get('rpath')])) if own else None
+
+
+def system_libraries(backend: str, data: dict | None = None) -> list[str]:
+    """Patterns of the libraries a bundle loads from the user's system rather than carrying (hip: ROCm's HIP runtime,
+    hipBLAS and rocBLAS); the release check accepts that they are missing on the build machine."""
+    return list(_entry(backend, data or manifest()).get('system_libraries', []))
+
+
 def cmake_flags(backend: str, data: dict | None = None) -> list[str]:
     """The backend's own switch ON, every other backend's OFF (macOS turns Metal on by default), then its flags."""
     data = data or manifest()
-    entry = next((item for item in data['backends'] if item['id'] == backend), None)
-    if entry is None: raise ValueError(f'Unknown native backend {backend!r}')
+    entry = _entry(backend, data)
     switches = [item['cmake_switch'] for item in data['backends'] if item.get('cmake_switch')]
     return [f'-D{switch}={"ON" if switch == entry.get("cmake_switch") else "OFF"}' for switch in switches] + list(entry.get('cmake_flags', []))
+
+
+def _modules(platform, switch):
+    prefix, extension = ('ggml-', '.dll') if platform == 'win32' else ('libggml-', '.so')  # ggml names modules .so on macOS too
+    return {'gpu': f'{prefix}{switch[5:].lower()}{extension}' if switch else None, 'cpu': [f'{prefix}cpu{extension}', f'{prefix}cpu-*{extension}']}
+
+
+def backend_modules(backend: str, platform: str | None = None, data: dict | None = None) -> dict | None:
+    """For a bundle built with GGML_BACKEND_DL, the module files ggml_backend_load_all_from_path loads from it, by name:
+    {'gpu': 'libggml-cuda.so' (from the cmake_switch; None for a CPU bundle), 'cpu': ['libggml-cpu.so', 'libggml-cpu-*.so']}
+    (ggml-*.dll on Windows), the CPU patterns covering GGML_CPU_ALL_VARIANTS' per-ISA builds. None when the backends are linked."""
+    entry = _entry(backend, data or manifest())
+    return _modules(_platform(platform), entry.get('cmake_switch')) if DYNAMIC in entry.get('cmake_flags', []) else None

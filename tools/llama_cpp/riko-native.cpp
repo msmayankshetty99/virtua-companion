@@ -12,6 +12,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,8 +22,16 @@
 
 #if defined(_WIN32)
 #define RIKO_EXPORT __declspec(dllexport)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
 #define RIKO_EXPORT __attribute__((visibility("default")))
+#include <dlfcn.h>
 #endif
 
 struct riko_runtime {
@@ -67,7 +76,8 @@ riko_log_capture & riko_log() {
 void riko_log_line(riko_log_capture & log, std::string line) {
     if (line.size() > 300) line.resize(300);
     // The --fit dry run logs below ERROR as DEBUG, so these come from the real load ("enabled" is INFO, "not supported" WARN).
-    if ((line.rfind("load_tensors: offloaded ", 0) == 0 || line.rfind("resolve_fused_ops: Flash Attention", 0) == 0) && log.notes.size() < 4) {
+    if ((line.rfind("load_tensors: offloaded ", 0) == 0 || line.rfind("resolve_fused_ops: Flash Attention", 0) == 0
+            || line.rfind("riko-native: ", 0) == 0) && log.notes.size() < 4) {
         log.notes.push_back(line);
     }
     if (log.level == GGML_LOG_LEVEL_INFO) return;
@@ -132,6 +142,78 @@ struct riko_log_scope {
     }
 };
 
+// The directory this library was loaded from, or empty when the loader cannot say.
+std::filesystem::path riko_directory() {
+    std::error_code failed;
+#if defined(_WIN32)
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&riko_directory), &module)) return {};
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(module, path.data(), (DWORD) path.size());
+    if (length == 0 || length >= path.size()) return {};
+    path.resize(length);
+    const auto file = std::filesystem::absolute(std::filesystem::path(path), failed);
+#else
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void *>(&riko_directory), &info) || !info.dli_fname) return {};
+    const auto file = std::filesystem::absolute(std::filesystem::path(info.dli_fname), failed);
+#endif
+    return failed ? std::filesystem::path() : file.parent_path();
+}
+
+// A GGML_BACKEND_DL build keeps each ggml backend in a module ([lib]ggml-<name>[-<variant>].so|dll; .so on macOS too) that
+// ggml looks for beside the executable (python, riko-backend) and in the working directory, never beside this library,
+// where a bundle keeps them. Load them from here first. A build that links its backends registers them on first use, so
+// the registry is not empty and this loads nothing; llama_backend_init loads ggml's defaults only into an empty registry.
+void riko_load_backends() {
+    if (ggml_backend_reg_count() > 0) return;
+    const auto directory = riko_directory();
+    if (directory.empty()) return;
+#if defined(_WIN32)
+    const std::wstring prefix = L"ggml-", extension = L".dll";
+#else
+    const std::string prefix = "libggml-", extension = ".so";
+#endif
+    const char * cpu_side[] = {"ggml-base", "ggml-cpu", "ggml-blas"};
+    std::vector<std::filesystem::path> modules;
+    std::error_code failed;
+    for (std::filesystem::directory_iterator it(directory, failed), end; !failed && it != end; it.increment(failed)) {
+        const auto name = it->path().filename().native();
+        if (name.rfind(prefix, 0) == 0 && it->path().extension().native() == extension) modules.push_back(it->path());
+    }
+#if defined(_WIN32)
+    // ggml loads a module with LoadLibraryW, which looks for its own dependencies (cudart, cuBLAS) beside the executable
+    // and on PATH. Loaded here first with the module's directory searched, ggml's load of the same path reuses it.
+    std::vector<HMODULE> preloaded;
+    for (const auto & module : modules) {
+        if (HMODULE handle = LoadLibraryExW(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) preloaded.push_back(handle);
+    }
+#endif
+    const auto utf8 = directory.u8string();
+    ggml_backend_load_all_from_path(std::string(utf8.begin(), utf8.end()).c_str());
+#if defined(_WIN32)
+    for (HMODULE handle : preloaded) FreeLibrary(handle); // ggml holds its own reference to the backends it kept
+#endif
+    std::string others; // the GPU modules: all but ggml-base and the CPU-side ones
+    for (const auto & module : modules) {
+        const auto name = module.filename().u8string();
+        const std::string stem(name.begin(), name.end() - (std::ptrdiff_t) extension.size());
+        if (std::none_of(std::begin(cpu_side), std::end(cpu_side), [&](const char * part) { return stem.find(part) != std::string::npos; })) {
+            others += (others.empty() ? "" : ", ") + stem;
+        }
+    }
+    if (others.empty()) return;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto type = ggml_backend_dev_type(ggml_backend_dev_get(i));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) return;
+    }
+    // The module did not load (a missing loader such as libvulkan, or ROCm's libamdhip64 for ggml-hip) or found no device
+    // (no driver): say so rather than run on the CPU unannounced. riko_create returns it with its notes.
+    const std::string warning = "riko-native: no GPU device from " + others + "; llama.cpp runs on the CPU (is the GPU driver installed? ggml-hip also needs ROCm)\n";
+    riko_log_callback(GGML_LOG_LEVEL_WARN, warning.c_str(), nullptr);
+}
+
 void riko_error(char * error, size_t capacity, const std::string & message) {
     if (!error || capacity == 0) return;
     const size_t length = std::min(capacity - 1, message.size());
@@ -150,7 +232,7 @@ RIKO_EXPORT void * riko_create(const char * arguments, int interval, char * erro
             throw std::runtime_error("missing native arguments");
         }
         static std::once_flag initialized;
-        std::call_once(initialized, []() { common_init(); llama_log_set(riko_log_callback, nullptr); llama_backend_init(); });
+        std::call_once(initialized, []() { common_init(); llama_log_set(riko_log_callback, nullptr); riko_load_backends(); llama_backend_init(); });
         const auto input = json::parse(arguments);
         if (!input.is_array() || input.empty() || input.size() > 256) {
             throw std::runtime_error("invalid native arguments");

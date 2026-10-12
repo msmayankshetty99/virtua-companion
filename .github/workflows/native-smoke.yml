@@ -2,6 +2,7 @@ name: Native smoke
 # Builds the patched riko-native bridge at the pinned llama.cpp with Metal, as a release does, and runs a small GGUF through
 # InProcessLlamaProvider (tests/test_native_smoke.py): the ctypes ABI, slots, streaming, cancellation and the emotion probe.
 # Hosted Apple silicon runners have a paravirtual GPU that llama.cpp's Metal backend can use (PyTorch MPS cannot).
+# The opt-in ROCm bundle's compile check lives in rocm-compile.yml (manual: twelve GPU targets take hours).
 on:
   push:
     branches: ['**']

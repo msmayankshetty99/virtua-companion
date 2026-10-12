@@ -333,7 +333,7 @@ def test_short_slots_and_cpu_fallback_are_reported(tmp_path, monkeypatch, caplog
     gguf(tmp_path / 'model.gguf', 32768)
     (tmp_path / 'riko-native.dll').write_bytes(b'test-library')
     runtime = fake_runtime([])
-    runtime.notes = 'load_tensors: offloaded 0/37 layers to GPU'
+    runtime.notes = 'riko-native: no GPU device from libggml-vulkan; llama.cpp runs on the CPU (is the GPU driver installed? ggml-hip also needs ROCm)\nload_tensors: offloaded 0/37 layers to GPU'
     def request(handle, path, body, output, cancel, user):
         data = json.dumps([{'n_ctx': 4096}, {'n_ctx': 4096}]).encode()
         buffer = ctypes.create_string_buffer(data)
@@ -347,6 +347,7 @@ def test_short_slots_and_cpu_fallback_are_reported(tmp_path, monkeypatch, caplog
         with caplog.at_level('WARNING'), pytest.raises(RuntimeError, match=r'allocated 2 slots of \[4096\] tokens, but Riko needs 2 slots of 8192'):
             provider.warmup()
         assert 'only 0 of 37 layers on the GPU' in caplog.text
+        assert 'WARNING' in caplog.text and 'no GPU device from libggml-vulkan; llama.cpp runs on the CPU' in caplog.text  # the bridge's notes
     finally:
         provider.close()
 

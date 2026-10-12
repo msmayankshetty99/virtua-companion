@@ -41,7 +41,7 @@ function desktopRoutes({app,dialog,screen,release,windows,backend,processes,disp
  const pointer=windows.pointer;
  return [
   // First run: the setup page alone exists, and only it may finish setup (release.saveSetup refuses an application folder).
-  handle('setup-hardware',['setup'],'Setup window required',async()=>{const hw=await release.hardware();try{hw.gpus=(await app.getGPUInfo('basic')).gpuDevice?.map(device=>device.deviceString||`GPU vendor ${device.vendorId}, device ${device.deviceId}`)||[];}catch{hw.gpus=[];}return hw;}),
+  handle('setup-hardware',['setup'],'Setup window required',async()=>{const hw=await release.hardware(resources);try{hw.gpus=(await app.getGPUInfo('basic')).gpuDevice?.map(device=>device.deviceString||`GPU vendor ${device.vendorId}, device ${device.deviceId}`)||[];}catch{hw.gpus=[];}return hw;}),
   handle('setup-directory',['setup'],'Setup window required',async({window})=>picked(await dialog.showOpenDialog(window,{properties:['openDirectory','createDirectory']}))),
   handle('setup-model',['setup'],'Setup window required',async({window})=>picked(await dialog.showOpenDialog(window,{properties:['openFile'],filters:[{name:'GGUF models',extensions:['gguf']}]}))),
   handle('setup-sovits',['setup'],'Setup window required',async({window})=>picked(await dialog.showOpenDialog(window,{properties:['openFile']}))),

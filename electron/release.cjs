@@ -5,15 +5,37 @@ const {execFile,spawn}=require('child_process');
 const native=require('./native_backends.cjs');
 const run=(file,args)=>new Promise(resolve=>execFile(file,args,{timeout:5000,windowsHide:true},(error,stdout)=>resolve(error?'':stdout.trim())));
 
-// Runs only the detection tools of this OS's bundles (macOS ships Metal and has neither nvidia-smi nor vulkaninfo).
-async function hardware(platform=process.platform,probe=run){
- const backends=native.backendsFor(platform),probed=backends.filter(backend=>backend.detect);
- const outputs=await Promise.all(probed.map(backend=>probe(backend.detect.command,backend.detect.args)));
+// One backend's detection (native_backends.json): its command, then each fallback argv until one answers; with a pattern,
+// only the matching output lines count (rocminfo lists the CPU too) and are what setup shows. '' when nothing found hardware.
+// The targets a backend was built for, from its -DGPU_TARGETS= flag (detect.targets names the flag).
+function builtTargets(backend){const flag=(backend.cmake_flags||[]).find(item=>item.startsWith(`-D${backend.detect.targets}=`));return new Set(flag?flag.split('=')[1].split(';'):[]);}
+async function detect(backend,probe,exists){
+ const spec=backend.detect,pattern=spec.pattern&&new RegExp(spec.pattern);
+ // A runtime the bundle links (ROCm 7's libamdhip64.so.7) must be installed, or its module cannot load.
+ if(spec.runtime&&!spec.runtime.some(file=>exists(file)))return '';
+ for(const [command,...args] of [[spec.command,...(spec.args||[])],...(spec.fallbacks||[])]){
+  const output=await probe(command,args);
+  const found=pattern?[...new Set(output.split(/\r?\n/).map(line=>line.trim()).filter(line=>pattern.test(line)))]:output?[output]:[];
+  if(!found.length)continue;
+  // ggml-hip uses every GPU it finds: one it has no code for (an RX 6700 XT, a Ryzen iGPU) aborts the backend.
+  if(spec.targets){const built=builtTargets(backend);if(!found.every(line=>built.has(line.match(/gfx[0-9a-f]+/)?.[0])))return '';}
+  return found.join('\n');
+ }
+ return '';
+}
+// Runs only the detection tools of the bundles this installation holds (resources/native/<id>: macOS ships Metal and has
+// neither nvidia-smi nor vulkaninfo; rocminfo runs only beside a hip bundle). An optional backend is offered only when its
+// required detection found hardware: HIP needs an AMD GPU with ROCm, and Vulkan stays the choice for AMD otherwise.
+async function hardware(resources,platform=process.platform,probe=run,exists=fs.existsSync){
+ const installed=native.installedBackends(resources,platform),probed=installed.filter(backend=>backend.detect);
+ const outputs=await Promise.all(probed.map(backend=>detect(backend,probe,exists)));
  const detected=Object.fromEntries(probed.map((backend,index)=>[backend.id,outputs[index]]));
+ const hidden=backend=>backend.optional&&backend.detect?.required&&!detected[backend.id],offered=installed.filter(backend=>!hidden(backend));
  return {cpu:os.cpus()[0]?.model||'Unknown',threads:os.cpus().length,ramGB:Math.round(os.totalmem()/2**30),platform,
-  backends:backends.map(({id,label,description})=>({id,label,description})),
+  backends:offered.map(({id,label,description})=>({id,label,description})),
+  unavailable:installed.filter(hidden).map(backend=>({id:backend.id,label:backend.label,reason:backend.detect.missing})),
   detections:probed.map(backend=>({backend:backend.id,label:backend.detect.label,required:!!backend.detect.required,output:detected[backend.id]||backend.detect.missing})),
-  preferred:native.preferredBackend(platform,detected)};
+  preferred:native.preferredBackend(platform,detected,native.MANIFEST,offered)};
 }
 // The folder an update replaces and an uninstall deletes (NSIS ends with RMDir /r $INSTDIR): the .app bundle on
 // macOS, the executable's folder elsewhere.

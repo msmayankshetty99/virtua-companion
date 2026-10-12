@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 import run_server
-from process.app_core.configuration.native_backends import backends_for, library_name
+from process.app_core.configuration.native_backends import backends_for, library_name, release_backends
 
 
 def release_build():
@@ -54,6 +54,24 @@ def test_upstream_patch_is_limited_to_probe_and_build_glue():
     assert files == {'tools/server/CMakeLists.txt', 'tools/server/server-context.cpp',
         'tools/server/server-context.h', 'tools/server/server-task.cpp', 'tools/server/server-task.h'}
     assert not (root / 'tools/llama_cpp/cuda-infinity.patch').exists()
+
+
+def test_bridge_loads_backend_modules_from_its_own_folder_and_builds_where_it_is_installed():
+    # GGML_BACKEND_DL: llama_backend_init loads modules from beside the executable (python, riko-backend) and the working
+    # directory, never from native/<backend>/, so the bridge loads them from its own folder into the still empty registry.
+    root = Path(__file__).resolve().parents[1]
+    bridge = (root / 'tools/llama_cpp/riko-native.cpp').read_text(encoding='utf-8')
+    assert 'llama_log_set(riko_log_callback, nullptr); riko_load_backends(); llama_backend_init();' in bridge
+    assert 'if (ggml_backend_reg_count() > 0) return;' in bridge and 'ggml_backend_load_all_from_path(' in bridge
+    assert 'dladdr(' in bridge and 'GetModuleHandleExW(' in bridge  # the library's own path, not the process's
+    # Windows resolves a module's dependencies (cudart, cuBLAS) from its own folder only when asked to.
+    assert 'LoadLibraryExW(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)' in bridge
+    assert 'line.rfind("riko-native: ", 0) == 0' in bridge  # the no-GPU-device warning reaches riko_create's notes
+    patch = (root / 'tools/llama_cpp/emotion-probe.patch').read_text(encoding='utf-8')
+    # server-context alone as PIC did not link a static Linux build (llama-common's objects are position-dependent too).
+    assert 'NOT BUILD_SHARED_LIBS AND NOT CMAKE_POSITION_INDEPENDENT_CODE AND NOT WIN32 AND NOT APPLE' in patch
+    assert '+            set_target_properties(riko-native PROPERTIES INSTALL_RPATH "@loader_path")' in patch
+    assert '+            set_target_properties(riko-native PROPERTIES INSTALL_RPATH "$ORIGIN")' in patch
 
 
 def test_frozen_backend_runs_in_utf8_mode():
@@ -105,6 +123,49 @@ def test_native_bundle_problems_name_shadowed_and_driver_libraries(tmp_path):
     toolkit = tmp_path / 'cuda' / 'lib64' / 'libcublasLt.so.12'
     problems = run_server.native_bundle_problems(library, {**loaded, 'libcublasLt.so.12': toolkit, 'libcuda.so.1': bundle / 'libcuda.so.1'})
     assert problems == [f'libcublasLt.so.12 was loaded from {toolkit}', f'libcuda.so.1 was loaded from {bundle / "libcuda.so.1"}']
+
+
+def test_native_release_check_proves_the_bridge_loads_backend_modules_from_its_own_folder(tmp_path, monkeypatch):
+    # GGML_BACKEND_DL: ggml looks for modules beside the executable and in the working directory only, so the CPU module
+    # loaded from the bundle is the bridge's doing; a module it did not keep must still load from the bundle by itself.
+    import ctypes
+    bundle = tmp_path / 'native' / 'cuda'
+    bundle.mkdir(parents=True)
+    names = ['libriko-native.so', 'libggml-base.so.0', 'libggml-cuda.so', 'libggml-cpu-x64.so', 'libggml-cpu-haswell.so', 'libcublas.so.12']
+    for name in names: (bundle / name).write_bytes(b'x')
+    library, modules, toolkit = bundle / names[0], {'gpu': 'libggml-cuda.so', 'cpu': ['libggml-cpu.so', 'libggml-cpu-*.so']}, tmp_path / 'cuda'
+
+    class Bridge:  # riko_create fails on empty arguments once it has loaded the backends
+        riko_request = riko_set_interval = riko_stop = riko_destroy = object()
+        def __init__(self, created):
+            def riko_create(arguments, interval, error, capacity):
+                assert arguments == b'[]' and interval == 0 and capacity == len(error)
+                loaded.update(created)
+            self.riko_create = riko_create
+    def run(created, cpu_loads=True):
+        loaded.clear(); loaded.update({name: bundle / name for name in names[:2]})
+        attempts.clear()
+        def load(path):
+            if Path(path) == library: return Bridge(created)
+            attempts.append(Path(path).name)
+            if not cpu_loads and 'cpu' in Path(path).name: raise OSError('undefined symbol')
+            loaded[Path(path).name] = Path(path)
+        monkeypatch.setattr(ctypes, 'CDLL', load)
+        return run_server.native_release_problems(library, modules)
+    loaded, attempts = {}, []
+    monkeypatch.setattr(run_server, 'loaded_libraries', lambda wanted: {name: path for name, path in loaded.items() if name in wanted or run_server.is_driver(name)})
+    # cudart may load the driver once CUDA starts: only a driver that loads with the bundle itself counts.
+    assert run({'libggml-cuda.so': bundle / 'libggml-cuda.so', 'libggml-cpu-haswell.so': bundle / 'libggml-cpu-haswell.so',
+        'libcublas.so.12': bundle / 'libcublas.so.12', 'libcuda.so.1': Path('/usr/lib/libcuda.so.1')}) == []
+    assert attempts == ['libggml-cpu-x64.so']  # the variant ggml did not pick
+    assert run({}) == [f'riko_create loaded no CPU backend module (libggml-cpu.so or libggml-cpu-*.so) from {bundle}']
+    assert attempts == ['libggml-cpu-haswell.so', 'libggml-cpu-x64.so', 'libggml-cuda.so']
+    problems = run({'libcublas.so.12': toolkit / 'libcublas.so.12'}, cpu_loads=False)
+    assert problems[1:] == ['libggml-cpu-haswell.so does not load: undefined symbol', 'libggml-cpu-x64.so does not load: undefined symbol',
+        f'libcublas.so.12 was loaded from {toolkit / "libcublas.so.12"}']
+    monkeypatch.setattr(ctypes, 'CDLL', lambda path: Bridge({}))
+    loaded.clear(); loaded['libriko-native.so'] = library
+    assert run_server.native_release_problems(library, None) == []  # linked backends (Metal): no module expectations
 
 
 def test_loaded_libraries_finds_this_process_system_library():
@@ -176,9 +237,13 @@ def test_each_os_builds_its_own_bundles_with_an_rpath_its_loader_expands():
         assert not any('MACOSX' in flag or '@loader_path' in flag or 'DEPLOYMENT_TARGET' in flag for flag in linux)
         windows = build.native_flags(backend, 'win32')  # multi-config Visual Studio: --config Release, and no rpath
         assert f'-DGGML_{backend.upper()}=ON' in windows and not any('RPATH' in flag or 'BUILD_TYPE' in flag for flag in windows)
+    hip = build.native_flags('hip', 'linux')  # ROCm's /opt/rocm/lib after the bundle's own folder (the manifest's rpath)
+    assert hip[-1] == '-DCMAKE_INSTALL_RPATH=$ORIGIN;/opt/rocm/lib' and '-DGGML_HIP=ON' in hip and '-DGGML_CUDA=OFF' in hip
+    assert any(flag.startswith('-DGPU_TARGETS=gfx') for flag in hip)
     source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
-    assert source.count('native.backends_for(sys.platform)') == 3  # what to build, what to release-check, what a smoke build may build
-    assert "('cuda', 'vulkan')" not in source and 'RPATH=$ORIGIN' not in source
+    # A default release builds the OS's default bundles (no hip), and release-checks those plus any optional one it staged.
+    assert 'for backend in native.release_backends(sys.platform):' in source and 'for backend in staged_backends(bundles):' in source
+    assert "('cuda', 'vulkan')" not in source and 'RPATH=$ORIGIN' not in source and '/opt/rocm' not in source
 
 
 def symlink_or_skip(target, link):
@@ -223,9 +288,12 @@ def test_cuda_redistributables_go_only_into_the_cuda_bundle_with_their_links(tmp
         symlink_or_skip(f'{library}.so.{version}', toolkit / f'{library}.so.12')
         symlink_or_skip(f'{library}.so.12', toolkit / f'{library}.so')
     (toolkit / 'libcuda.so').write_bytes(b'driver stub')
+    (toolkit / 'stubs').mkdir()  # link-time stubs share the real names; copied after the links, one replaced libcublas.so
+    for name in ('libcuda.so', 'libcublas.so', 'libcublasLt.so'): (toolkit / 'stubs' / name).write_bytes(b'stub')
     release.copy_cuda_redistributables(destination, 'linux', tmp_path / 'cuda')
     assert sorted(file.name for file in destination.iterdir() if not file.is_symlink()) == ['libcublas.so.12.4.5.8', 'libcublasLt.so.12.4.5.8', 'libcudart.so.12.4.127']
     assert os.readlink(destination / 'libcublasLt.so.12') == 'libcublasLt.so.12.4.5.8' and release.dangling_links(destination) == []
+    assert os.readlink(destination / 'libcublas.so') == 'libcublas.so.12'
     assert not (destination / 'libcuda.so').exists()
     with pytest.raises(RuntimeError, match='CUDA redistributable missing'): release.copy_cuda_redistributables(destination, 'linux', tmp_path / 'none')
 
@@ -251,9 +319,43 @@ def test_mac_icon_renders_with_the_system_tools(tmp_path):
     assert icns.read_bytes()[:4] == b'icns' and icns.stat().st_size > 10_000
 
 
-def test_frozen_backend_copy_keeps_pyinstaller_symlinks():
+def test_frozen_backend_is_moved_into_the_stage_with_its_symlinks():
+    # A copy that followed PyInstaller's links stored libtorch and friends twice; the stage holds PyInstaller's output once.
     source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
-    assert "shutil.copytree(STAGE / 'riko-backend', STAGE / 'backend', symlinks=True, dirs_exist_ok=True)" in source
+    assert "'--distpath', WORK / 'dist'" in source and "os.replace(WORK / 'dist' / 'riko-backend', STAGE / 'backend')" in source
+    assert 'copytree' not in source and "'--distpath', STAGE" not in source
+
+
+def test_release_build_refuses_to_build_over_an_earlier_run(tmp_path, monkeypatch):
+    # Merging into release-stage/ shipped an earlier run's libraries and Python modules and listed them in SHA256SUMS.json.
+    release, calls = release_build(), []
+    monkeypatch.setattr(release, 'run', lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(release, 'ROOT', tmp_path)
+    monkeypatch.setattr(release, 'STAGE', tmp_path / 'release-stage')
+    monkeypatch.setattr(release, 'WORK', tmp_path / 'release-build')
+    for stale in ('release-stage/native', 'release-build', '.native/llama.cpp-release'):
+        (tmp_path / stale).mkdir(parents=True)
+        with pytest.raises(RuntimeError, match='refusing to build over'): release.main()
+    with pytest.raises(RuntimeError, match='release-stage, release-build'): release.main()
+    assert calls == []
+    source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
+    assert "'tools/release/NOTICE.md', notices / 'NOTICE.md'" in source and "'tools/release/README.md'" not in source  # not maintainer notes
+
+
+def test_dynamic_backend_bundles_must_hold_their_gpu_and_a_cpu_module(tmp_path):
+    release = release_build()
+    for platform, files in (('linux', ['libriko-native.so', 'libggml-base.so.0', 'libggml-cuda.so', 'libggml-cpu-x64.so', 'libggml-cpu-haswell.so']),
+            ('win32', ['riko-native.dll', 'ggml-base.dll', 'ggml-cuda.dll', 'ggml-cpu-sse42.dll'])):
+        bundle = tmp_path / platform / 'cuda'
+        bundle.mkdir(parents=True)
+        for name in files: (bundle / name).write_bytes(b'x')
+        assert release.missing_modules(bundle, 'cuda', platform) == []
+        for name in files[2:]: (bundle / name).unlink()
+        assert release.missing_modules(bundle, 'cuda', platform) == [files[2], ' or '.join(release.native.backend_modules('cuda', platform)['cpu'])]
+    assert release.missing_modules(tmp_path / 'linux' / 'cuda', 'metal', 'darwin') == []  # linked backends: nothing to look for
+    flags = release.native_flags('vulkan', 'linux')
+    assert {'-DGGML_BACKEND_DL=ON', '-DGGML_CPU_ALL_VARIANTS=ON', '-DGGML_NATIVE=OFF', '-DBUILD_SHARED_LIBS=ON'} <= set(flags)
+    assert '-DGGML_BACKEND_DL=ON' not in release.native_flags('metal', 'darwin')
 
 
 def test_release_workflow_packages_a_macos_dmg_without_the_cuda_and_vulkan_steps():
@@ -274,7 +376,8 @@ def test_release_workflow_packages_a_macos_dmg_without_the_cuda_and_vulkan_steps
     assert 'CSC_LINK' not in package['env'] and script.index('if [ -n "$MAC_CSC_LINK" ]; then') < script.index('export CSC_LINK=')
     assert script.index('export CSC_LINK=') < script.index('export APPLE_API_KEY=') < script.index('npx --no-install electron-builder')
     upload = job['steps'][-1]['with']
-    assert 'electron/release/*.dmg' in upload['path'] and upload['name'] == "Riko-${{ runner.os }}-${{ runner.os == 'macOS' && 'arm64' || 'x64' }}"
+    assert 'electron/release/*.dmg' in upload['path']
+    assert upload['name'] == "Riko-${{ runner.os }}-${{ runner.os == 'macOS' && 'arm64' || 'x64' }}${{ runner.os == 'Linux' && needs.hip.result == 'success' && '-hip' || '' }}"
 
 
 def test_pyinstaller_sees_the_app_package_when_its_spec_collects_submodules():
@@ -314,8 +417,12 @@ def test_release_check_runs_per_shipped_bundle_on_the_stage_and_inside_the_signe
     release.check_app(app)
     resources = app / 'Contents' / 'Resources'
     assert [call[0] for call in calls] == [[str(resources / 'backend' / 'riko-backend'), '--release-check', str(resources / 'native' / backend / library_name())]
-        for backend in backends_for()]
+        for backend in release_backends()]  # an optional bundle (hip) only when the stage holds one:
     assert all(call[1] == release.release_check_environment(os.environ) for call in calls)
+    bundles = tmp_path / 'native'
+    assert release.staged_backends(bundles, 'linux') == ['cuda', 'vulkan'] and release.staged_backends(bundles, 'darwin') == ['metal']
+    (bundles / 'hip').mkdir(parents=True)
+    assert release.staged_backends(bundles, 'linux') == ['cuda', 'hip', 'vulkan'] and release.staged_backends(bundles, 'win32') == ['cuda', 'vulkan']
     source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
     assert "    release_check(executable, STAGE / 'native')\n" in source
     workflow = yaml.safe_load((Path(__file__).resolve().parents[1] / '.github/workflows/release.yml').read_text(encoding='utf-8'))
@@ -333,3 +440,114 @@ def test_probe_feature_version_matches_the_native_patch():
     patch = (Path(__file__).resolve().parents[1] / 'tools/llama_cpp/emotion-probe.patch').read_text(encoding='utf-8')
     assert f'"{FEATURE_VERSION}"' in patch and f'"{SAMPLE_EVENT}"' in patch and f'token.id_slot == {CAPTURE_SLOT} ' in patch
     assert f'std::vector<float> features({FEATURE_WIDTH});' in patch and f'riko_probe_features.size() == {FEATURE_WIDTH})' in patch
+
+
+HIP_IMAGE = 'rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df'
+
+
+def test_hip_bundle_is_opt_in_and_built_by_the_compile_checked_recipe():
+    # Tag pushes and default dispatches build what they always did; the hip input adds a job in the ROCm container whose
+    # bundle the ubuntu leg stages. rocm-compile.yml's compile job runs the same action in the same image (by digest).
+    root = Path(__file__).resolve().parents[1]
+    release = yaml.safe_load((root / '.github/workflows/release.yml').read_text(encoding='utf-8'))
+    smoke = yaml.safe_load((root / '.github/workflows/native-smoke.yml').read_text(encoding='utf-8'))
+    compile_workflow = yaml.safe_load((root / '.github/workflows/rocm-compile.yml').read_text(encoding='utf-8'))
+    triggers = release[True]  # PyYAML reads the key `on` as True
+    assert triggers['push'] == {'tags': ['v*']} and triggers['workflow_dispatch']['inputs']['hip'] == {
+        'description': triggers['workflow_dispatch']['inputs']['hip']['description'], 'type': 'boolean', 'default': False}
+    hip, compile_job = release['jobs']['hip'], compile_workflow['jobs']['hip']
+    assert hip['if'] == '${{ inputs.hip }}' and hip['container'] == compile_job['container'] == HIP_IMAGE
+    action = {'uses': './.github/actions/hip-bundle', 'with': {'destination': 'native-hip/hip'}}
+    assert hip['steps'][1] == compile_job['steps'][1] == action and compile_job['steps'][0]['uses'] == 'actions/checkout@v4'
+    assert hip['steps'][-2]['run'] == 'tar -C native-hip -cf native-hip.tar hip'  # an artifact upload would copy every link
+    assert hip['steps'][-1]['with']['name'] == 'native-hip' and hip['steps'][-1]['with']['path'] == 'native-hip.tar'
+    package = release['jobs']['package']
+    # Windows and macOS never wait on hip; a requested hip that did not build (failed or timed out) stops only Linux.
+    assert package['needs'] == 'hip' and package['if'] == '${{ !cancelled() }}'
+    steps = {step.get('name'): step for step in package['steps']}
+    assert package['steps'][0]['name'] == 'Requested HIP bundle was not built' and steps['Requested HIP bundle was not built']['if'] == (
+        "runner.os == 'Linux' && inputs.hip && needs.hip.result != 'success'") and 'exit 1' in steps['Requested HIP bundle was not built']['run']
+    assert steps['Opt-in HIP bundle']['if'] == steps['Unpack the HIP bundle']['if'] == "runner.os == 'Linux' && needs.hip.result == 'success'"
+    assert steps['Build the native backends and freeze Python']['env']['RIKO_OPTIONAL_BUNDLES'] == (
+        "${{ runner.os == 'Linux' && needs.hip.result == 'success' && format('{0}/optional', runner.temp) || '' }}")
+    assert '"$RUNNER_TEMP/optional"' in steps['Unpack the HIP bundle']['run']
+    names = [step.get('name') for step in package['steps']]
+    assert names.index('Unpack the HIP bundle') < names.index('Build the native backends and freeze Python')
+    # Twelve GPU targets take hours: the compile job runs only when asked, and a later push never cancels it.
+    assert compile_workflow[True] == {'workflow_dispatch': None} and compile_workflow['concurrency']['cancel-in-progress'] is False
+    assert 'hip' not in smoke['jobs'] and not any('hip' in path for event in ('push', 'pull_request') for path in smoke[True][event]['paths'])
+    recipe = yaml.safe_load((root / '.github/actions/hip-bundle/action.yml').read_text(encoding='utf-8'))
+    script = '\n'.join(step['run'] for step in recipe['runs']['steps'])
+    assert 'apt-get install -y --no-install-recommends git cmake hipblas-dev rocblas-dev' in script
+    assert 'python3 tools/release/build.py --smoke-bundle hip "$RUNNER_TEMP/llama.cpp-hip" "${{ inputs.destination }}"' in script
+    assert 'python3 tools/release/build.py --check-bundle "${{ inputs.destination }}/libriko-native.so"' in script
+    assert '$ORIGIN:/opt/rocm/lib' in script and 'RIKO_BUILD_JOBS="$(nproc)"' in script and 'HIPCXX="$(/opt/rocm/bin/hipconfig -l)/clang"' in script
+
+
+def test_optional_bundles_are_staged_only_for_this_os_and_checked_like_built_ones(tmp_path):
+    release = release_build()
+    assert release.optional_bundles(None, 'linux') == {} and release.optional_bundles('', 'linux') == {}
+    prebuilt = tmp_path / 'optional' / 'hip'
+    prebuilt.mkdir(parents=True)
+    for name in ('libriko-native.so', 'libggml-base.so.0.9.4', 'libggml-hip.so', 'libggml-cpu-haswell.so', 'libggml-cpu-x64.so'): (prebuilt / name).write_bytes(b'x')
+    symlink_or_skip('libggml-base.so.0.9.4', prebuilt / 'libggml-base.so.0')
+    assert release.optional_bundles(tmp_path / 'optional', 'linux') == {'hip': prebuilt}
+    for platform in ('win32', 'darwin'):  # hip ships only for Linux
+        with pytest.raises(RuntimeError, match='no optional backend ships for ' + platform): release.optional_bundles(tmp_path / 'optional', platform)
+    with pytest.raises(RuntimeError, match='not a folder'): release.optional_bundles(tmp_path / 'missing', 'linux')
+    (tmp_path / 'optional' / 'cuda').mkdir()  # default bundles are built, never taken from elsewhere
+    with pytest.raises(RuntimeError, match='named hip; found cuda'): release.optional_bundles(tmp_path / 'optional', 'linux')
+    (tmp_path / 'optional' / 'cuda').rmdir()
+    staged = tmp_path / 'stage' / 'native' / 'hip'
+    assert release.stage_bundle(prebuilt, 'hip', staged, 'linux') == staged / 'libriko-native.so'
+    assert os.readlink(staged / 'libggml-base.so.0') == 'libggml-base.so.0.9.4'  # links stay links
+    (prebuilt / 'libggml-hip.so').unlink()
+    with pytest.raises(RuntimeError, match=r"modules missing from the bundle: \['libggml-hip.so'\]"):
+        release.stage_bundle(prebuilt, 'hip', tmp_path / 'stage2' / 'hip', 'linux')
+    source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
+    assert "optional = optional_bundles(os.environ.get('RIKO_OPTIONAL_BUNDLES'))" in source  # checked before the hours of building
+    assert "for backend, folder in optional.items(): stage_bundle(folder, backend, STAGE / 'native' / backend)" in source
+
+
+def test_build_jobs_default_to_two_and_follow_riko_build_jobs():
+    release = release_build()
+    assert release.build_jobs({}) == '2' and release.build_jobs({'RIKO_BUILD_JOBS': '4'}) == '4' and release.build_jobs({'RIKO_BUILD_JOBS': ''}) == '2'
+    for value in ('0', '-1', 'all', '2 3'):
+        with pytest.raises(RuntimeError, match='RIKO_BUILD_JOBS'): release.build_jobs({'RIKO_BUILD_JOBS': value})
+
+
+def test_release_check_accepts_a_missing_system_library_only_where_the_manifest_names_it(tmp_path, monkeypatch):
+    # The hip bundle links the user's ROCm, which the release runner lacks: ggml-hip cannot load there, and that is expected.
+    import ctypes
+    from process.app_core.configuration.native_backends import backend_modules, system_libraries
+    bundle = tmp_path / 'native' / 'hip'
+    bundle.mkdir(parents=True)
+    names = ['libriko-native.so', 'libggml-base.so.0', 'libggml-hip.so', 'libggml-cpu-haswell.so']
+    for name in names: (bundle / name).write_bytes(b'x')
+    library, loaded = bundle / names[0], {}
+
+    class Bridge:  # riko_create loads the CPU module ggml picked; ggml-hip's ROCm is missing
+        riko_request = riko_set_interval = riko_stop = riko_destroy = object()
+        def __init__(self): self.riko_create = lambda arguments, interval, error, capacity: loaded.update({'libggml-cpu-haswell.so': bundle / 'libggml-cpu-haswell.so'})
+    def load(path, missing='libamdhip64.so.7'):
+        if Path(path) == library: return Bridge()
+        raise OSError(f'{missing}: cannot open shared object file: No such file or directory')
+    monkeypatch.setattr(ctypes, 'CDLL', load)
+    monkeypatch.setattr(run_server, 'loaded_libraries', lambda wanted: {name: path for name, path in {'libriko-native.so': library, **loaded}.items() if name in wanted})
+    modules = backend_modules('hip', 'linux')
+    assert run_server.native_release_problems(library, modules, system_libraries('hip')) == []
+    assert run_server.native_release_problems(library, modules) == ['libggml-hip.so does not load: libamdhip64.so.7: cannot open shared object file: No such file or directory']
+    monkeypatch.setattr(ctypes, 'CDLL', lambda path: load(path, 'libggml-base.so.0'))  # a bundle library is never the system's
+    assert run_server.native_release_problems(library, modules, system_libraries('hip')) == [
+        'libggml-hip.so does not load: libggml-base.so.0: cannot open shared object file: No such file or directory']
+    source = (Path(__file__).resolve().parents[1] / 'Code/run_server.py').read_text(encoding='utf-8')
+    assert 'native_release_problems(library, backend_modules(backend), system_libraries(backend))' in source
+
+
+def test_check_bundle_is_the_strict_native_check_for_a_build_machine_with_the_system_libraries(tmp_path):
+    # In the ROCm container ROCm is installed, so build.py --check-bundle passes no system patterns: ggml-hip must load.
+    release = release_build()
+    source = (Path(__file__).resolve().parents[1] / 'tools/release/build.py').read_text(encoding='utf-8')
+    assert 'problems = server.native_release_problems(library, native.backend_modules(backend))\n' in source
+    for library in (tmp_path / 'native' / 'other' / library_name(), tmp_path / 'native' / backends_for()[0] / 'riko-native.bogus'):
+        with pytest.raises(SystemExit, match='is not a native/'): release.check_bundle(library)

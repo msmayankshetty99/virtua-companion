@@ -323,6 +323,8 @@ class InProcessLlamaProvider(LlamaContextProvider):
             logger.info('Inference transport=in_process requested_gpu_layers=%s threads=%s flash_attention=%s kv_k=%s kv_v=%s slots=%s probe_interval=%s native=%r',
                 self.config.n_gpu_layers, self.config.n_threads, self.config.flash_attn, self.config.type_k, self.config.type_v,
                 self.config.parallel_slots, interval, notes)
+            for line in notes.splitlines():  # a GGML_BACKEND_DL bundle whose GPU module did not load or found no device
+                if line.startswith('riko-native: '): logger.warning('%s', line.removeprefix('riko-native: '))
             offload = re.search(r'offloaded (\d+)/(\d+) layers', notes)
             if offload and self.config.n_gpu_layers == -1 and int(offload[1]) < int(offload[2]):
                 logger.warning('llama.cpp put only %s of %s layers on the GPU to keep 1 GiB of GPU memory free; replies will be slower. '

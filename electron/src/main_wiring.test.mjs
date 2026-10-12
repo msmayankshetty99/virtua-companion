@@ -103,6 +103,7 @@ test('first run: only the setup page, with no backend, and only it can finish se
   assert.deepEqual([h.release.started.length,h.trays.length,h.webRequest.listener],[0,0,undefined]);assert.deepEqual(h.log.filter(e=>e.method==='freePort'),[]);
   await assert.rejects(h.invoke('setup-finish',9999,{directory:'/data/Riko',settings:{}}),/Setup window required/);
   assert.deepEqual(await h.invoke('setup-hardware',setup),{cpu:'Test CPU',gpus:['Test GPU']});
+  assert.deepEqual(h.log.find(e=>e.method==='hardware').args,[h.resources],'detects only the bundles these resources hold');
   assert.equal(await h.invoke('setup-model',setup),'/picked');
   assert.deepEqual(h.calls(h.module.dialog,'showOpenDialog').at(-1).args,[setup,{properties:['openFile'],filters:[{name:'GGUF models',extensions:['gguf']}]}]);
   h.state.openDialog={canceled:true,filePaths:[]};assert.equal(await h.invoke('setup-directory',setup),null);

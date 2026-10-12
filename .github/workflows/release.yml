@@ -1,12 +1,45 @@
 name: Desktop release
 on:
   workflow_dispatch:
+    inputs:
+      hip:
+        description: Also ship the opt-in ROCm (HIP) bundle in the Linux packages; it needs ROCm 7 on users' machines and only compiles in CI
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 permissions:
   contents: read
 jobs:
+  hip:
+    # Only when asked (never on a tag push), so a default release's size and time do not change: the Linux hip bundle, built
+    # in native-smoke.yml's compile container by the same action, for the ubuntu leg below to stage (RIKO_OPTIONAL_BUNDLES).
+    if: ${{ inputs.hip }}
+    runs-on: ubuntu-22.04
+    container: rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/hip-bundle
+        with:
+          destination: native-hip/hip
+      - name: Pack the hip bundle
+        # A tar keeps the versioned library links, which an artifact upload would turn into copies.
+        run: tar -C native-hip -cf native-hip.tar hip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-hip
+          path: native-hip.tar
+          if-no-files-found: error
+          retention-days: 3
   package:
+    needs: hip
+    # hip is skipped unless asked, which must not skip the packages; asked for and not built (failed or timed out), it
+    # stops only the Linux packages (first step), never Windows or macOS.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -20,6 +53,9 @@ jobs:
         # bash -eo pipefail stops a step at its first failing command; Windows' default pwsh checks only the last one.
         shell: bash
     steps:
+      - name: Requested HIP bundle was not built
+        if: runner.os == 'Linux' && inputs.hip && needs.hip.result != 'success'
+        run: echo "::error::The hip job ended '${{ needs.hip.result }}'; the Linux packages are not built without the requested HIP bundle" && exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -76,8 +112,20 @@ jobs:
         env:
           RIKO_RELEASE_BUILD: '1'
         run: python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q --timeout=300
+      - name: Opt-in HIP bundle
+        if: runner.os == 'Linux' && needs.hip.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: native-hip
+          path: ${{ runner.temp }}/native-hip
+      - name: Unpack the HIP bundle
+        if: runner.os == 'Linux' && needs.hip.result == 'success'
+        run: mkdir -p "$RUNNER_TEMP/optional" && tar -C "$RUNNER_TEMP/optional" -xf "$RUNNER_TEMP/native-hip/native-hip.tar"
       - name: Build the native backends and freeze Python
-        # CUDA and Vulkan on Windows and Linux, Metal on macOS: the backends electron/native_backends.json ships for the OS.
+        # CUDA and Vulkan on Windows and Linux, Metal on macOS: the default backends electron/native_backends.json ships for
+        # the OS; plus hip on Linux when asked, staged from the hip job and release-checked without ROCm on this runner.
+        env:
+          RIKO_OPTIONAL_BUNDLES: ${{ runner.os == 'Linux' && needs.hip.result == 'success' && format('{0}/optional', runner.temp) || '' }}
         run: python tools/release/build.py
       - name: Package installers
         timeout-minutes: 60
@@ -110,7 +158,7 @@ jobs:
         run: python tools/release/build.py --check-app electron/release/mac-arm64/Riko.app
       - uses: actions/upload-artifact@v4
         with:
-          name: Riko-${{ runner.os }}-${{ runner.os == 'macOS' && 'arm64' || 'x64' }}
+          name: Riko-${{ runner.os }}-${{ runner.os == 'macOS' && 'arm64' || 'x64' }}${{ runner.os == 'Linux' && needs.hip.result == 'success' && '-hip' || '' }}
           path: |
             electron/release/*.exe
             electron/release/*.AppImage
