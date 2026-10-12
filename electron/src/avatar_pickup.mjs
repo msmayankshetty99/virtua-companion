@@ -17,10 +17,12 @@ export class AvatarPickup{
   if(settings.ragdollEnabled&&!this.ragdoll&&(Math.hypot(point.x-this.origin.x,point.y-this.origin.y)>settings.distanceThreshold||speed>settings.speedThreshold)){this.ragdoll=true;this.onTrigger('ragdoll');}
  }
  release(){if(this.active&&this.held){this.held=false;this.age=0;if(this.ragdoll)this.onTrigger('recover');}}
- restore(){if(!this.saved)return;const root=this.vrm.scene;root.position.copy(this.saved.position);root.quaternion.copy(this.saved.quaternion);for(const [node,q] of this.saved.bones)node.quaternion.copy(q);this.saved=null;}
+ restore(){if(!this.saved)return;const root=this.vrm.scene;root.position.copy(this.saved.position);root.rotation.copy(this.saved.rotation);for(const [node,q] of this.saved.bones)node.quaternion.copy(q);this.saved=null;}
  step(settings,dt){
   if(!this.active)return;if(!settings.enabled){this.active=false;return;}
-  const root=this.vrm.scene;this.saved={position:root.position.clone(),quaternion:root.quaternion.clone(),bones:[]};
+  // Save the Euler angles, not the quaternion: copying a quaternion back re-derives them, and a VRM 0.x root turned by PI
+  // comes back as (PI, -yaw, PI), so the renderer's own rotation.y write would then face the avatar away every other frame.
+  const root=this.vrm.scene;this.saved={position:root.position.clone(),rotation:root.rotation.clone(),bones:[]};
   if(!this.held)this.age+=dt;const blend=this.held?1:Math.max(0,1-this.age/settings.recoverySeconds);
    const limit=settings.maxSwing*Math.PI/180;
   const n=Math.max(1,Math.ceil(Math.min(.1,dt)*120)),h=Math.min(.1,dt)/n;

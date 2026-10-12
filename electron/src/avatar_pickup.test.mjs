@@ -19,3 +19,13 @@ test('ragdoll thresholds and disable switch are respected',()=>{
  pickup.move({x:2000,y:0},1,{...settings,ragdollEnabled:false});assert.deepEqual(events,[]);
  pickup.step({...settings,enabled:false},.1);assert.equal(pickup.active,false);
 });
+test('a VRM 0.x root turned by PI keeps facing the camera while held and after recovery',()=>{
+ const scene=new Group(),feet=new Bone(),chest=new Bone(),head=new Bone();chest.position.set(0,1,.05);head.position.set(0,.5,.05);scene.add(feet);feet.add(chest);chest.add(head);
+ const vrm={scene,humanoid:{getRawBoneNode:()=>chest}},pickup=new AvatarPickup(vrm,boneCatalog(vrm,'fixture')),settings=normalizeProfile({}).pickup;
+ const facing=()=>new Vector3(0,0,-1).applyQuaternion(scene.quaternion).z;  // a VRM 0.x model faces -z, so turned by PI it faces +z
+ const frame=(time,held)=>{pickup.restore();scene.rotation.y=Math.PI+Math.sin(time*.7)*.025;if(held)pickup.move({x:10*time,y:0},1/60,settings);pickup.step(settings,1/60);};
+ scene.rotation.y=Math.PI;pickup.start('chest',{x:0,y:0});
+ for(let i=0;i<120;i++){frame(i/60,true);assert.ok(facing()>0,`frame ${i} faces away while held`);}
+ pickup.release();for(let i=120;i<400&&pickup.active;i++){frame(i/60,false);assert.ok(facing()>0,`frame ${i} faces away while recovering`);}
+ assert.equal(pickup.active,false);scene.rotation.y=Math.PI;assert.ok(facing()>.99);  // the renderer's next yaw write leaves her facing front
+});
