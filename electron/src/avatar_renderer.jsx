@@ -7,7 +7,7 @@ import {MotionEngine, BODY_BONES} from './motion_engine.mjs';
 import {DesktopWalker, nearbyPointer} from './motion_geometry.mjs';
 import {cameraDistance, resizeHeldAvatar} from './avatar_geometry.mjs';
 import {API, request} from './api.mjs';
-import {avatarModelURL,validateAvatarFormat} from './avatar_model.mjs';
+import {avatarModelURL,validateAvatarFormat,keepAvatarDrawn} from './avatar_model.mjs';
 import {pointerSampler} from './avatar_pointer.mjs';
 import {AvatarBoneBVH} from './avatar_bvh.mjs';
 import {AvatarHitOutlines} from './avatar_hit_outlines.mjs';
@@ -102,6 +102,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       try{validateAvatarFormat(vrm.meta?.metaVersion,modelFormat);}catch(error){VRMUtils.deepDispose(gltf.scene);vrm=null;errorRef.current?.(error.message);return;}
       errorRef.current?.('');
       VRMUtils.rotateVRM0(vrm);
+      keepAvatarDrawn(vrm.scene);
       scene.add(vrm.scene);
       catalog=boneCatalog(vrm,modelPath||'models/Mita.vrm');publishCatalog(catalog);
       secondary=new AvatarSecondaryMotion(vrm,catalog);skeletonDebug=new AvatarSkeletonDebug(vrm,catalog,scene);
