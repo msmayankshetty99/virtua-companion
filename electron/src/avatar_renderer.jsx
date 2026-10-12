@@ -20,6 +20,7 @@ import {AvatarGesture,AvatarHover} from './avatar_input.mjs';
 import {AvatarMouseSphere} from './avatar_mouse_sphere.mjs';
 import {normalizeGraphics,applyTextureFiltering} from './avatar_graphics.mjs';
 import {AvatarEyeGaze} from './avatar_gaze.mjs';
+import {AvatarInertia,withSpringForce} from './avatar_inertia.mjs';
 
 const EXPRESSION_NAMES = ['happy', 'sad', 'angry', 'surprised', 'neutral'];
 const EMOTION_MAP = {joy: 'happy', love: 'happy', affection: 'happy', sadness: 'sad', anger: 'angry', surprise: 'surprised', calm: 'neutral', neutral: 'neutral'};
@@ -63,6 +64,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     loader.register(parser => new VRMLoaderPlugin(parser));
     const report=(id,status,error='')=>{request('/api/avatar/animation/result',{method:'POST',body:{action_id:id,status,error}}).catch(()=>{});};
     const walker=new DesktopWalker(report);
+    const inertia=new AvatarInertia(),springForce=new THREE.Vector3();
     let motion=null;
     const interaction={held:false,pointer:null,reaction:'',until:0,target:null,rule:null};
     let lastPointerPost=0,lastHoldPost=0;
@@ -278,7 +280,10 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         vrm.expressionManager?.update();
         vrm.nodeConstraintManager?.update();
         if(profile.tPose!==previousTPose){vrm.scene.updateMatrixWorld(true);vrm.springBoneManager?.reset();previousTPose=profile.tPose;}
-        if(!profile.tPose)vrm.springBoneManager?.update(delta);
+        // Dragging or walking moves the window, not the skeleton: its motion reaches the springs as an inertial force.
+        inertia.track(geometryRef.current.x,geometryRef.current.y,delta);
+        const worldPerPixel=2*Math.tan(camera.fov*Math.PI/360)*camera.position.distanceTo(modelCenter||camera.position)/Math.max(1,canvas.clientHeight);
+        if(!profile.tPose&&vrm.springBoneManager)withSpringForce(vrm.springBoneManager.joints,inertia.force(worldPerPixel,profile.pickup.bounce,delta,springForce),()=>vrm.springBoneManager.update(delta));
         for(const material of vrm.materials||[])material.update?.(delta);
         secondary.update(profile,delta);
         if(!profile.tPose)pickup?.step(profile.pickup,delta);
