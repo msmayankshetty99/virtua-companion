@@ -22,6 +22,7 @@ test('studio normalization bounds bone physics, offsets, lights and shader impor
  assert.equal(p.lighting.lights.length,8);assert.equal(p.lighting.lights[0].intensity,20);assert.equal(p.effect.exposure,0);assert.equal(p.effect.glsl,'');
  assert.deepEqual(normalizeStudio({avatarStudioProfiles:null}),{avatarStudioProfiles:{}});
  assert.equal(normalizeBone({}).enabled,false);
+ assert.deepEqual(normalizeProfile({}).face,{restingSmile:.15,intensity:1});assert.deepEqual(normalizeProfile({face:{restingSmile:2,intensity:-1}}).face,{restingSmile:.6,intensity:0});
 });
 test('position calibration is non-cumulative and removing overrides restores imported springs',()=>{
  const {hair,joint,catalog,secondary}=fixture(),id=catalog.entries.find(e=>e.node===hair).id;

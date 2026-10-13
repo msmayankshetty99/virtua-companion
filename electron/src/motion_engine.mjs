@@ -3,6 +3,9 @@ import * as THREE from 'three';
 export const BODY_BONES=['hips','spine','chest','upperChest','neck','head','leftShoulder','rightShoulder','leftUpperArm','rightUpperArm','leftLowerArm','rightLowerArm','leftHand','rightHand','leftUpperLeg','rightUpperLeg','leftLowerLeg','rightLowerLeg','leftFoot','rightFoot','leftToes','rightToes'];
 const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 const quaternion=rotation=>new THREE.Quaternion().setFromEuler(new THREE.Euler(...rotation,'XYZ'));
+/** A VRM 0.x normalized rig negates x and z against VRM 1.0 (three-vrm-animation's createVRMAnimationClip flips .vrma the same way).
+ * Its own inverse: canonical (VRM 1.0) to native and back. */
+export const flipVRM0=q=>new THREE.Quaternion(-q.x,q.y,-q.z,q.w);
 
 export function proceduralPose(mode,time,strength=.65,walkSpeed=1) {
   const pose=Object.fromEntries(BODY_BONES.map(b=>[b,[0,0,0]]));
@@ -48,14 +51,18 @@ export class PoseInterpolator {
   }
 }
 
-/** Sole writer of normalized skeletal motion; secondary VRM updates run afterward. */
+/** Sole writer of normalized skeletal motion; secondary VRM updates run afterward.
+ * Procedural, gesture, .pose.json and gaze targets, the rest pose and the blend are all in canonical VRM 1.0 axes; a VRM 0.x model
+ * is flipped once on write, and samples read back from its nodes (.vrma, sample.native) are flipped to canonical before they merge.
+ * Asset expression targets are exposed as expressionTargets for the face layer, which owns every expression write. */
 export class MotionEngine {
   constructor(vrm,sampler,report=()=>{}) {
-    this.vrm=vrm;this.sampler=sampler;this.report=report;this.time=0;this.ages=new Map();
-    const initial=new Map(BODY_BONES.map(name=>[name,vrm.humanoid.getNormalizedBoneNode(name)?.quaternion.clone()]).filter(([,value])=>value));
+    this.vrm=vrm;this.sampler=sampler;this.report=report;this.time=0;this.ages=new Map();this.vrm0=vrm.meta?.metaVersion==='0';
+    const initial=new Map(BODY_BONES.map(name=>[name,vrm.humanoid.getNormalizedBoneNode(name)?.quaternion]).filter(([,value])=>value).map(([name,value])=>[name,this.canonical(value)]));
     this.blender=new PoseInterpolator(initial);this.gaze=new THREE.Quaternion();
-    this.rest=new Map(initial);this.expressionNames=new Set();
+    this.rest=new Map(initial);this.expressionTargets=new Map();
   }
+  canonical(q){return this.vrm0?flipVRM0(q):q.clone();}
   age(action,dt){if(!action)return 0;const next=(this.ages.get(action.id)||0)+dt;this.ages.set(action.id,next);return next;}
   update({actions=[],emotion={},interaction={},walking=false,walkSpeed=1,settings={}},dt) {
     this.time+=dt;
@@ -78,7 +85,7 @@ export class MotionEngine {
       const asset=action.payload.asset||(action.kind==='wake_animation'?{id:action.id,kind:'vrma',path:action.payload.path,mask:[],loop:false,speed:1}:null);
       if(!asset)continue;
       const sample=this.sampler.sample(asset,age,action.id,(status,error)=>this.report(action.id,status,error));
-      if(sample){for(const [bone,rotation]of sample.bones)target.set(bone,rotation);for(const [name,value]of sample.expressions||[])expressionTargets.set(name,value);assetKeys.push(asset.id);}
+      if(sample){for(const [bone,rotation]of sample.bones)target.set(bone,sample.native?this.canonical(rotation):rotation);for(const [name,value]of sample.expressions||[])expressionTargets.set(name,value);assetKeys.push(asset.id);}
     }
     if(gesture&&!interaction.held){
       const age=this.age(gesture,dt),envelope=Math.max(0,Math.min(1,age*5,(gesture.duration-age)*5));
@@ -92,15 +99,8 @@ export class MotionEngine {
     const key=[base?.id,preview?.id,wake?.id,gesture?.id,mode,...assetKeys].join(':');
     for(const bone of this.blender.displayed.keys())if(!target.has(bone))target.set(bone,this.rest.get(bone)||new THREE.Quaternion());
     const pose=this.blender.step(target,key,dt,preview?.payload.transition_seconds||base?.payload.transition_seconds||settings.transition_seconds||.3);
-    for(const [bone,rotation]of pose){const node=this.vrm.humanoid.getNormalizedBoneNode(bone);if(node)node.quaternion.copy(rotation);}
-    for(const name of expressionTargets.keys())this.expressionNames.add(name);
-    for(const name of this.expressionNames){
-      if(['aa','ih','ou','ee','oh','blink','blinkLeft','blinkRight'].includes(name))continue;
-      const manager=this.vrm.expressionManager;
-      const fallback=name==='happy'&&['joy','love','amusement','excitement'].includes(emotion.primary)?emotion.intensity||.65:name==='sad'&&emotion.primary==='sadness'?emotion.intensity||.65:name==='angry'&&emotion.primary==='anger'?emotion.intensity||.65:0;
-      manager?.setValue(name,THREE.MathUtils.damp(manager.getValue(name)||0,expressionTargets.get(name)??fallback,8,dt));
-      if(!expressionTargets.has(name)&&Math.abs((manager?.getValue(name)||0)-fallback)<.001)this.expressionNames.delete(name);
-    }
+    for(const [bone,rotation]of pose){const node=this.vrm.humanoid.getNormalizedBoneNode(bone);if(node)node.quaternion.copy(this.vrm0?flipVRM0(rotation):rotation);}
+    this.expressionTargets=expressionTargets;
     this.sampler.retain(new Set(overlays.filter(Boolean).map(a=>a.payload.asset?.id||a.id)));
   }
   dispose(){this.sampler.dispose();}

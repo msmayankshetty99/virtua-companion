@@ -16,6 +16,9 @@ test('settings search indexes hidden runtime fields, categories, graphics and mo
  assert.ok(searchSettings(items,'maximum token budget',groups).some(i=>i.path==='runtime.n_ctx'));
  assert.ok(searchSettings(items,'desktop model convergence',groups).some(i=>i.path==='profile.gaze.convergence'));
  assert.ok(searchSettings(items,'anti-aliasing',groups).some(i=>i.path==='avatarGraphics.antialias'));
+ assert.ok(searchSettings(items,'resting smile',groups).some(i=>i.path==='profile.face.restingSmile'&&i.section==='Face & reactions'));
+ assert.ok(searchSettings(items,'neutral smile',groups).some(i=>i.path==='profile.face.restingSmile'),'the label says it also shows for a neutral or calm emotion');
+ assert.ok(searchSettings(items,'reaction expression strength',groups).some(i=>i.path==='profile.face.intensity'));
  assert.ok(searchSettings(items,'  ',groups).every(i=>i.kind==='section'));
  assert.equal(searchSettings(items,'not-a-real-setting',groups).length,0);
  assert.equal(new Set(items.map(i=>i.id)).size,items.length);

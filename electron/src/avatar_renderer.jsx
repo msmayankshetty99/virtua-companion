@@ -21,11 +21,7 @@ import {AvatarMouseSphere} from './avatar_mouse_sphere.mjs';
 import {normalizeGraphics,applyTextureFiltering} from './avatar_graphics.mjs';
 import {AvatarEyeGaze} from './avatar_gaze.mjs';
 import {AvatarInertia,withSpringForce} from './avatar_inertia.mjs';
-
-const EXPRESSION_NAMES = ['happy', 'sad', 'angry', 'surprised', 'neutral'];
-const EMOTION_MAP = {joy: 'happy', love: 'happy', affection: 'happy', sadness: 'sad', anger: 'angry', surprise: 'surprised', calm: 'neutral', neutral: 'neutral'};
-
-function clamp(value, min = 0, max = 1) { return Math.max(min, Math.min(max, Number(value) || 0)); }
+import {AvatarFace,registerFaceParts,reportedExpressions} from './avatar_face.mjs';
 
 /** Native VRM presentation layer. The runtime supplies intent; this loop owns animation frames. */
 export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', fov=30, actions = [], animation={}, preferences={}, geometry = {x:0,y:0,width:480,height:720}, onPosition,onError,onDragging}) {
@@ -65,7 +61,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     const report=(id,status,error='')=>{request('/api/avatar/animation/result',{method:'POST',body:{action_id:id,status,error}}).catch(()=>{});};
     const walker=new DesktopWalker(report);
     const inertia=new AvatarInertia(),springForce=new THREE.Vector3();
-    let motion=null;
+    let motion=null,face=null;
     const interaction={held:false,pointer:null,reaction:'',until:0,target:null,rule:null};
     let lastPointerPost=0,lastHoldPost=0;
     function interact(kind,pointer=null,target=interaction.target){
@@ -81,9 +77,6 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     let pickBVH=null,hitOutlines=null;
     let disposed = false;
     let frame = 0;
-    const targetExpressions = Object.fromEntries(EXPRESSION_NAMES.map(name => [name, 0]));
-    let blink = 0;
-    let blinkCooldown = 2.5;
     const clock = new THREE.Clock();
     let modelSize, modelCenter;
     function fitModel() {
@@ -121,8 +114,10 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       hitOutlines=new AvatarHitOutlines(pickBVH,scene);
       fitModel();
       motion=new MotionEngine(vrm,new MotionAssetSampler(vrm),report);
+      // Face parts register after the bone catalog (its ids never move) and before the capabilities report (64 names of 1-64 characters at most).
+      registerFaceParts(vrm);face=vrm.expressionManager?new AvatarFace(vrm.expressionManager):null;
       const bones=Object.keys(vrm.humanoid.normalizedHumanBones||{}).filter(name=>vrm.humanoid.getNormalizedBoneNode(name));
-      request('/api/animation/capabilities',{method:'POST',body:{bones:bones.length?bones:BODY_BONES.filter(name=>vrm.humanoid.getNormalizedBoneNode(name)),expressions:Object.keys(vrm.expressionManager?.expressionMap||{})}}).catch(()=>{});
+      request('/api/animation/capabilities',{method:'POST',body:{bones:bones.length?bones:BODY_BONES.filter(name=>vrm.humanoid.getNormalizedBoneNode(name)),expressions:reportedExpressions(vrm.expressionManager)}}).catch(()=>{});
     }, undefined, error => {if(!disposed){console.warn(`VRM model unavailable (${modelPath || source}):`, error);errorRef.current?.('Avatar model could not be loaded. Check the selected VRM file.');}});
 
     const resize = () => {
@@ -157,7 +152,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       if(performance.now()-lastPointerPost>150){lastPointerPost=performance.now();interact('pointer',interaction.pointer);}
       if (drag) {
         if(gesture.move(point,profile.input.dragThreshold)){
-         drag.started=true;interaction.held=drag.kind==='body';interaction.reaction='';walker.stop();interact('hold',interaction.pointer);
+         drag.started=true;interaction.held=drag.kind==='body';interaction.reaction='';walker.stop();interact('hold',interaction.pointer);face?.event(drag.kind==='spring'?'tug':'grab');
           if(drag.kind==='spring'){mouseSphere.start(drag.entry,drag.springGrab);mouseSphere.aim(point,canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);interaction.reaction='idle';interaction.until=performance.now()+60000;}else if(profile.pickup.enabled)pickup?.start(interaction.target.bone,gesture.press.origin,camera);
         }
         if(!drag.started)return;
@@ -183,7 +178,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
        drag = {x: event.clientX, y: event.clientY, left: geometryRef.current.x, top: geometryRef.current.y, geometry: {...geometryRef.current},started:false,kind:entry&&(entry.joint||!entry.human&&profile.bones[entry.id]?.enabled)?'spring':'body',entry};
        window.overlayInputBridge?.drag('avatar',true);
        if(drag.kind==='spring')drag.springGrab=mouseSphere.prepare(entry,{x:event.clientX,y:event.clientY},canvas.getBoundingClientRect(),camera);
-      interaction.localDrag=drag.kind==='spring';
+      interaction.localDrag=drag.kind==='spring';face?.event('press');
       hover.update(interaction.target,performance.now(),profile.input.hoverDelay);
       gesture.down({x:event.clientX,y:event.clientY},{...interaction.target});mouseSphere?.aim({x:event.clientX,y:event.clientY},canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);
        lastMousePoint={x:event.clientX,y:event.clientY};draggingRef.current?.(true);interaction.grabTarget={...interaction.target};lastDragPoint=performance.now();
@@ -199,7 +194,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
          window.overlayInputBridge?.drag('avatar',false);
         const clicked=!origin.started;gesture.up();
         interaction.held=false;interaction.reaction=clicked?'clicked':origin.kind==='spring'?'idle':'settling';interaction.until=performance.now()+800;
-        interact(clicked?'click':'release',interaction.pointer);
+        interact(clicked?'click':'release',interaction.pointer);face?.event(clicked?'poke':origin.kind==='spring'?'untug':'release');
         const final=clicked||origin.kind==='spring'?origin.geometry:{...origin.geometry,x:origin.left+event.clientX-origin.x,y:origin.top+event.clientY-origin.y};
         if(!clicked&&origin.kind==='body')positionRef.current?.(final.x,final.y,true,final);
         if(clicked)mouseSphere?.click();mouseSphere?.release();
@@ -210,7 +205,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     };
      const pointercancel = () => {
        window.overlayInputBridge?.drag('avatar',false);
-      if (drag?.started){if(drag.kind==='body')positionRef.current?.(drag.geometry.x, drag.geometry.y, true, drag.geometry);interact('release');interaction.held=false;interaction.reaction='settling';interaction.until=performance.now()+800;}
+      if (drag?.started){if(drag.kind==='body')positionRef.current?.(drag.geometry.x, drag.geometry.y, true, drag.geometry);interact('release');face?.event(drag.kind==='spring'?'untug':'release');interaction.held=false;interaction.reaction='settling';interaction.until=performance.now()+800;}
       gesture.up();mouseSphere?.release();
       drag = null;pickup?.release();draggingRef.current?.(false); hit = false;samples.clear(); setInteractive(false);feedback();
     };
@@ -251,18 +246,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         eyeGaze?.restore();mouseSphere?.restore();pickup?.restore();secondary.restore();
         if(!drag&&(!interaction.reaction||interaction.reaction==='idle'))for(const event of hover.update(interaction.target,performance.now(),profile.input.hoverDelay))interact(event.kind,interaction.pointer,event.target);
         const filter=preferencesRef.current.avatarGraphics?.anisotropy??8;if(filter!==lastFilter){lastFilter=filter;applyTextureFiltering(vrm.scene,renderer,{anisotropy:filter});}
-        const expression = vrm.expressionManager;
         const custom=(interaction.held||performance.now()<interaction.until)?interaction.rule:null;
-        const active = custom?.expression&&custom.expression!=='default'?custom.expression:EMOTION_MAP[current.primary] || 'neutral';
-        for (const name of EXPRESSION_NAMES) {
-          targetExpressions[name] = name === active ? clamp(custom?.expression&&custom.expression!=='default'?custom.intensity:current.intensity ?? 0.65) : 0;
-          const existing = expression?.getValue(name) || 0;
-          expression?.setValue(name, THREE.MathUtils.damp(existing, targetExpressions[name], 8, delta));
-        }
-        blinkCooldown -= delta;
-        if (blinkCooldown <= 0) { blink = 1; blinkCooldown = 3 + Math.random() * 4; }
-        blink = Math.max(0, blink - delta * 7);
-        expression?.setValue('blink', blink);
 
         // Small procedural idle motion keeps the model alive without tracking.
         vrm.scene.rotation.y = (vrm.meta?.metaVersion === '0' ? Math.PI : 0) + Math.sin(elapsed * 0.7) * 0.025;
@@ -276,7 +260,8 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         // Same order as VRM.update, with non-destructive calibration before springs
         // and rotational secondary motion after them. Never simulate springs twice.
         vrm.humanoid.update();secondary.calibrate(profile);
-        if(custom?.expression&&custom.expression!=='default')for(const name of EXPRESSION_NAMES)expression?.setValue(name,name===active?custom.intensity:0);
+        // The face writes last: base emotion (or a resting smile) crossfaded against the reaction or a hit rule's expression, then blinks.
+        if(face)for(const [name,value] of face.step(delta,{emotion:emotionRef.current,rule:custom?.expression&&custom.expression!=='default'?custom:null,assets:profile.tPose?null:motion?.expressionTargets,settings:profile.face}))vrm.expressionManager.setValue(name,value);
         vrm.expressionManager?.update();
         vrm.nodeConstraintManager?.update();
         if(profile.tPose!==previousTPose){vrm.scene.updateMatrixWorld(true);vrm.springBoneManager?.reset();previousTPose=profile.tPose;}
