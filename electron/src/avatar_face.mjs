@@ -1,7 +1,7 @@
 import {VRMExpression,VRMExpressionMorphTargetBind} from '@pixiv/three-vrm';
 
 /** The reaction face: robust expression names, face-part expressions from VRoid Fcl_* morphs, a base face crossfaded against a
- * reaction, and eased, event-driven blinks. AvatarFace is the API the hold behaviour drives: react(intent), sequence(steps), blink(kind). */
+ * reaction, and eased, event-driven blinks. AvatarFace is the API the hold behaviour (avatar_hold.mjs) drives: react(intent), sequence(steps), blink(kind). */
 export const FACE_PARTS={browUp:'Fcl_BRW_Surprised',browAngry:'Fcl_BRW_Angry',browWorry:'Fcl_BRW_Sorrow',eyeWide:'Fcl_EYE_Surprised',eyeSquint:'Fcl_EYE_Angry',eyeSmile:'Fcl_EYE_Joy',eyeSad:'Fcl_EYE_Sorrow',mouthSurprised:'Fcl_MTH_Surprised',mouthSmall:'Fcl_MTH_Small',mouthAngry:'Fcl_MTH_Angry',mouthSad:'Fcl_MTH_Sorrow',mouthWide:'Fcl_MTH_Large',fang:'Fcl_MTH_SkinFung'};
 export const MAX_EXPRESSIONS=64;  // the backend's report_capabilities limit
 /** The names the backend accepts in a capabilities report: 1-64 characters each (counted as Python counts them), 64 names at most. */
@@ -61,7 +61,7 @@ export function measureLidClosure(manager){
  return result;
 }
 
-const BLINK_SHAPES={spontaneous:{close:.09,hold:.04,open:.17},press:{close:.07,hold:.04,open:.15},startle:{close:.07,hold:.04,open:.15},gaze:{close:.09,hold:.04,open:.17},relief:{close:.1,hold:.25,open:.25}};
+const BLINK_SHAPES={spontaneous:{close:.09,hold:.04,open:.17},press:{close:.07,hold:.04,open:.15},startle:{close:.07,hold:.04,open:.15},gaze:{close:.09,hold:.04,open:.17},relief:{close:.1,hold:.25,open:.25},sleepy:{close:.1,hold:.06,open:.25}};  // sleepy: resigned eyes open slowly
 const INTERVALS={calm:[2,6],anxious:[1.5,3.5],resigned:[4,7]};
 
 /** Eyelid 0..1: fast ease-in close, a short hold, slower ease-out open; occasional doubles; forced blinks on events. */
@@ -79,7 +79,7 @@ export class Blinker{
   if(due>=0){const p=this.pending.splice(due,1)[0];advance=clamp(this.time-p.at,0,h);this.current={kind:p.kind,age:0,from:this.lid,shape:BLINK_SHAPES[p.kind]||BLINK_SHAPES.startle};this.double=false;}
   else if(!this.current){this.next-=h;if(this.next<=0){
    if(this.time<this.quietUntil)this.next=this.quietUntil-this.time+this.random()*.3;
-   else{advance=clamp(-this.next,0,h);this.current={kind:'spontaneous',age:0,from:this.lid,shape:BLINK_SHAPES.spontaneous};this.double=!this.double&&this.random()<.12;}
+   else{advance=clamp(-this.next,0,h);this.current={kind:'spontaneous',age:0,from:this.lid,shape:this.mood==='resigned'?BLINK_SHAPES.sleepy:BLINK_SHAPES.spontaneous};this.double=!this.double&&this.random()<.12;}
   }}
   if(!this.current)return this.lid=0;
   const b=this.current,s=b.shape;b.age+=advance;
@@ -104,7 +104,9 @@ export const INTENTS={
  pout:{parts:{browAngry:.5,mouthSmall:.6,fang:.4},attack:.3,release:.5,breath:1.4,fallback:{angry:.6}},
  annoyed:{parts:{browAngry:.4,mouthAngry:.35},attack:.25,release:.5,fallback:{angry:.5}},
  resigned:{parts:{browWorry:.3},lid:.3,attack:.4,release:.6,mood:'resigned',fallback:{sad:.3}},
- relief:{parts:{relaxed:.45},attack:.25,release:.6},
+ relief:{parts:{relaxed:.45},oh:.2,attack:.25,release:.6},
+ perk:{parts:{browUp:.5},attack:.05,release:.35,fallback:{surprised:.3}},
+ sigh:{parts:{browWorry:.3},lid:.35,oh:.25,attack:.3,release:.6,mood:'resigned',fallback:{sad:.3}},
  wince:{parts:{eyeSquint:.5,browAngry:.4,mouthSmall:.4},attack:.06,release:.5,fallback:{angry:.4}},
 };
 /** The base face per backend emotion (scaled by its intensity); neutral, calm and no emotion add the resting smile. */
@@ -194,16 +196,6 @@ export class FaceMixer{
  }
 }
 
-/** Today's interaction events as timed reaction steps. The hold behaviour will replace this table. */
-export const FACE_EVENTS={
- press:[{intent:'poke',duration:.6,blink:'press',blinkDelay:.03}],
- grab:[{intent:'startle',duration:.12,suppress:.9},{intent:'surprise',duration:.78},{intent:'worried'}],
- poke:[{intent:'poke',duration:.6}],
- release:[{intent:'relief',duration:1.5,blink:'relief',blinkDelay:.05}],
- tug:[{intent:'wince'}],
- untug:[],
-};
-
 /** One face per model: a queue of reaction steps over the mixer. */
 export class AvatarFace{
  constructor(manager,{random=Math.random}={}){this.mixer=new FaceMixer(manager,{random});this.queue=[];this.age=0;}
@@ -214,7 +206,6 @@ export class AvatarFace{
  /** Steps: {intent, duration (s, default until replaced), intensity, blink (a Blinker kind), blinkDelay, suppress (s)}. */
  sequence(steps){this.queue=steps.map(step=>({...step}));this.age=0;this.begin();return this;}
  blink(kind='startle',delay=0){this.mixer.blinker.trigger(kind,delay);}
- event(kind){if(FACE_EVENTS[kind])this.sequence(FACE_EVENTS[kind]);}
  begin(){const step=this.queue[0];if(!step)return;if(step.blink)this.blink(step.blink,step.blinkDelay||0);if(step.suppress)this.mixer.blinker.suppress(step.suppress);}
  /** Options: emotion, rule (a hit rule), assets (MotionEngine's expression targets), breathPhase (radians, so the breathing mouth
   * follows the body's breath), settings ({restingSmile, intensity}). */

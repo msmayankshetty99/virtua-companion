@@ -21,6 +21,8 @@ export class AvatarInertia{
   if(size>MAX_ACCELERATION){ax*=MAX_ACCELERATION/size;ay*=MAX_ACCELERATION/size;}
   this.velocity=velocity;this.acceleration={x:ease(this.acceleration.x,ax,dt),y:ease(this.acceleration.y,ay,dt)};
  }
+ /** The window moved by (dx, dy) px without moving her (a wheel resize about the cursor): the next track() sees no motion from it. */
+ shift(dx,dy){if(this.position&&Number.isFinite(dx)&&Number.isFinite(dy))this.position={x:this.position.x+dx,y:this.position.y+dy};}
  /** The force three-vrm adds to a spring tail per update (gravityDir × gravityPower: displacement per second of a
   * frame, so an acceleration a contributes a·dt), in world units, x right and y up. Bounce 0 is none; at 1 a brisk drag
   * swings VRoid hair and bust about 30 degrees, and they settle within a few seconds. */

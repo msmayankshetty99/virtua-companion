@@ -115,16 +115,18 @@ test('forced blinks start in the same step, suppress blocks only spontaneous one
  const anxious=new Blinker({random:never,mood:'anxious'});let first=null;for(let i=0;i<60*8&&first===null;i++)if(anxious.step(1/60)>0)first=(i+1)/60;assert.ok(first<=3.5+1/60);
 });
 
-test('AvatarFace: a grab startles, then surprises, then worries while held; release gives relief and the resting smile returns',()=>{
+// The reaction steps the hold behaviour (avatar_hold.mjs) produces for a press, a grab, a release and a tug, as AvatarFace sequences.
+const STEPS={press:[{intent:'poke',duration:.6,blink:'press',blinkDelay:.03}],grab:[{intent:'startle',duration:.12,suppress:.9},{intent:'surprise',duration:.78},{intent:'worried'}],release:[{intent:'relief',duration:1.5,blink:'relief',blinkDelay:.05}]};
+test('AvatarFace sequences: a grab startles, then surprises, then worries while held; release gives relief and the resting smile returns',()=>{
  const face=new AvatarFace(manager(...VROID,...Object.keys(FACE_PARTS)),{random:never});
  const step=seconds=>{let out=new Map();for(let t=0;t<seconds-1e-9;t+=1/60)out=face.step(1/60,{settings:{restingSmile:.15,intensity:1}});return out;};
- step(1);face.event('press');let out=step(.08);assert.ok(out.get('blink')>0,'press blinks at once');assert.ok(out.get('browUp')>.1,'press pops the brows');
- face.event('grab');out=step(.1);assert.equal(face.intent,'startle');assert.ok(out.get('browAngry')>.15);
+ step(1);face.sequence(STEPS.press);let out=step(.08);assert.ok(out.get('blink')>0,'press blinks at once');assert.ok(out.get('browUp')>.1,'press pops the brows');
+ face.sequence(STEPS.grab);out=step(.1);assert.equal(face.intent,'startle');assert.ok(out.get('browAngry')>.15);
  out=step(.4);assert.equal(face.intent,'surprise');assert.ok(out.get('browUp')>.9&&out.get('eyeWide')>.6&&out.get('mouthSurprised')>.4);
  out=step(2);assert.equal(face.intent,'worried');assert.ok(out.get('browWorry')>.45);assert.ok(out.get('browUp')<.05);
- face.event('release');out=step(.6);assert.equal(face.intent,'relief');assert.ok(out.get('relaxed')>.35);assert.ok(out.get('browWorry')<.2);
+ face.sequence(STEPS.release);out=step(.6);assert.equal(face.intent,'relief');assert.ok(out.get('relaxed')>.35);assert.ok(out.get('browWorry')<.2);
  out=step(3);assert.equal(face.intent,null);assert.ok(Math.abs(out.get('relaxed')-.15)<.02);
- face.event('tug');out=step(.3);assert.ok(out.get('eyeSquint')>.4&&out.get('browAngry')>.3);face.event('untug');out=step(2);assert.ok(!(out.get('eyeSquint')>.01));
+ face.react('wince');out=step(.3);assert.ok(out.get('eyeSquint')>.4&&out.get('browAngry')>.3);face.react(null);out=step(2);assert.ok(!(out.get('eyeSquint')>.01));
  face.react('pout',{duration:.5,then:'annoyed'});step(.6);assert.equal(face.intent,'annoyed');face.react(null);assert.equal(face.intent,null);
 });
 
@@ -162,8 +164,8 @@ test('after warm-up a step never copies the expression map, and fresh spec objec
  const m=manager(...VROID,...Object.keys(FACE_PARTS)),getter=Object.getOwnPropertyDescriptor(VRMExpressionManager.prototype,'expressionMap').get;let copies=0;
  Object.defineProperty(m,'expressionMap',{get(){copies++;return getter.call(this);}});
  const face=new AvatarFace(m,{random:never}),options={emotion:{primary:'joy',intensity:.6},assets:new Map([['surprised',.2]]),rule:null,settings:{}};
- for(let i=0;i<10;i++)face.step(1/60,options);face.event('grab');for(let i=0;i<70;i++)face.step(1/60,options);
- copies=0;for(let i=0;i<120;i++)face.step(1/60,options);face.event('release');for(let i=0;i<120;i++)face.step(1/60,options);
+ for(let i=0;i<10;i++)face.step(1/60,options);face.sequence(STEPS.grab);for(let i=0;i<70;i++)face.step(1/60,options);
+ copies=0;for(let i=0;i<120;i++)face.step(1/60,options);face.sequence(STEPS.release);for(let i=0;i<120;i++)face.step(1/60,options);
  assert.equal(copies,0);assert.ok(face.mixer.cache instanceof WeakMap,'ad-hoc specs are cached weakly');
  const mixer=new FaceMixer(m,{random:never});for(let i=0;i<5;i++)assert.ok(mixer.step(1/60,{intent:{...INTENTS.worried}}).get('browWorry')>0);
 });

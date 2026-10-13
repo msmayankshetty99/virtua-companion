@@ -29,3 +29,10 @@ test('the force is added to each joint\'s gravity for one update, then their own
  assert.deepEqual(joints.map(({settings})=>settings.gravityPower),[.2,0]);
  let calls=0;withSpringForce(joints,new Vector3(),()=>calls++);assert.equal(calls,1);
 });
+test('a resize about a fixed point is not motion: shifting the tracked position leaves velocity and acceleration as they were',()=>{
+ const inertia=run(new AvatarInertia(),Array.from({length:30},(_,i)=>[i*5,0])),velocity={...inertia.velocity};
+ inertia.shift(-40,-60);run(inertia,[[30*5-40,-60]]);
+ assert.ok(Math.abs(inertia.velocity.x-velocity.x)<1&&Math.abs(inertia.velocity.y)<1e-9,`velocity ${JSON.stringify(inertia.velocity)}`);
+ assert.ok(Math.abs(inertia.acceleration.y)<1e-9);
+ const fresh=new AvatarInertia();fresh.shift(10,10);assert.equal(fresh.position,null,'nothing to shift before the first sample');
+});
