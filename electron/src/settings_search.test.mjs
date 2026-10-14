@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {settingsIndex,searchSettings,localSettingValue,localSettingPatch,focusSetting} from './settings_search.mjs';
 import {normalizePreferences} from './ui_preferences.mjs';
 import {settingsPatch} from './settings_model.mjs';
-import {PICKUP_FIELDS,REACTION_FIELDS,FACE_FIELDS,PICKUP_TOGGLES,REACTION_TOGGLES} from './avatar_studio_settings.mjs';
+import {PICKUP_FIELDS,REACTION_FIELDS,FACE_FIELDS,PICKUP_TOGGLES,REACTION_TOGGLES,GAZE_FIELDS,GAZE_TOGGLES,RELEASE_STYLES} from './avatar_studio_settings.mjs';
 
 const groups=[['models','Models'],['appearance','Desktop model'],['graphics','Graphics'],['interface','Chat layout'],['voice','Microphone']];
 const catalog={key:'avatar.vrm#one',bones:[{id:'root/0',name:'Hair',spring:true,settings:{stiffness:2,dragForce:.6}},{id:'root/1',name:'Hair',spring:true,settings:{stiffness:3}}]};
@@ -70,12 +70,16 @@ test('navigation opens collapsed sections and focuses a matching control or sect
 test('without an avatar catalog the index still offers model section navigation but no stale profile edits',()=>{
  const empty=settingsIndex(fields,groups,null);assert.ok(empty.some(i=>i.id==='section:appearance-avatar-studio'));assert.ok(!empty.some(i=>i.profilePath));
 });
-test('every shared pickup, reaction and face field is indexed under its studio section; grab style lists its options',()=>{
- for(const [section,label,fields] of [['pickup','Pickup & carrying',PICKUP_FIELDS],['reactions','Held reactions',REACTION_FIELDS],['face','Face & reactions',FACE_FIELDS]])for(const [key,name,min,max] of fields){
+test('every shared pickup, reaction, face and gaze field is indexed under its studio section; grab and release styles list their options',()=>{
+ for(const [section,label,fields] of [['pickup','Pickup, throwing & landing',PICKUP_FIELDS],['reactions','Held reactions',REACTION_FIELDS],['face','Face & reactions',FACE_FIELDS],['gaze','Eye tracking & pupil convergence',GAZE_FIELDS]])for(const [key,name,min,max] of fields){
   const entry=item('profile.'+section+'.'+key);assert.ok(entry,`${section}.${key} indexed`);assert.equal(entry.label,name);assert.equal(entry.section,label);assert.deepEqual([entry.min,entry.max],[min,max]);
  }
- for(const [key] of PICKUP_TOGGLES)assert.equal(item('profile.pickup.'+key).section,'Pickup & carrying');for(const [key] of REACTION_TOGGLES)assert.equal(item('profile.reactions.'+key).kind,'boolean');
+ for(const [key] of PICKUP_TOGGLES)assert.equal(item('profile.pickup.'+key).section,'Pickup, throwing & landing');for(const [key] of REACTION_TOGGLES)assert.equal(item('profile.reactions.'+key).kind,'boolean');
+ for(const [key,label] of GAZE_TOGGLES){const entry=item('profile.gaze.'+key);assert.equal(entry.kind,'boolean');assert.equal(entry.label,label);assert.equal(entry.section,'Eye tracking & pupil convergence');}
  const style=searchSettings(items,'grab style',groups)[0];assert.equal(style.path,'profile.pickup.grabStyle');assert.deepEqual(style.options,['scruff','bone']);
+ const release=searchSettings(items,'release',groups)[0];assert.equal(release.path,'profile.pickup.release');assert.deepEqual(release.options,RELEASE_STYLES.map(([key])=>key));assert.match(release.help,/flick/);
+ for(const [query,path] of [['throw speed','throwSpeed'],['fall gravity','fallGravity'],['landing squash','landingSquash'],['recovery time','recoverySeconds']])assert.equal(searchSettings(items,query,groups)[0].path,'profile.pickup.'+path,query);
+ assert.equal(searchSettings(items,'saccades',groups)[0].path,'profile.gaze.saccades');assert.ok(searchSettings(items,'throw',groups).some(i=>i.id==='section:appearance-avatar-studio'),'the section is found by throw');
  assert.ok(searchSettings(items,'scruff tilt',groups).some(i=>i.path==='profile.pickup.scruffPitch'));assert.ok(searchSettings(items,'kick size',groups).some(i=>i.path==='profile.reactions.kickAmplitude'));
  assert.ok(searchSettings(items,'swing damping',groups).some(i=>i.path==='profile.pickup.swingDamping'));assert.equal(items.some(i=>/maxSwing|bodySpring|jointLimit|pickup\.gravity/.test(i.path||'')),false);
 });
@@ -85,4 +89,6 @@ test('inline edits of a renamed pickup key round-trip without touching other pro
  assert.equal(localSettingValue(item('profile.pickup.swingLimit'),next,catalog),40);assert.equal(next.avatarStudioProfiles['other.vrm#two'].pickup.carryGain,2);
  assert.equal('maxSwing' in next.avatarStudioProfiles[catalog.key].pickup,false);
  assert.ok(localSettingPatch(item('profile.pickup.grabStyle'),'tail',p,catalog).error);assert.equal(localSettingPatch(item('profile.pickup.grabStyle'),'bone',p,catalog).changes.avatarStudioProfiles[catalog.key].pickup.grabStyle,'bone');
+ assert.ok(localSettingPatch(item('profile.pickup.release'),'yeet',p,catalog).error);assert.equal(localSettingPatch(item('profile.pickup.release'),'place',p,catalog).changes.avatarStudioProfiles[catalog.key].pickup.release,'place');
+ const off=localSettingPatch(item('profile.gaze.saccades'),false,p,catalog);assert.equal(off.changes.avatarStudioProfiles[catalog.key].gaze.saccades,false);assert.equal(off.changes.avatarStudioProfiles['other.vrm#two'].pickup.carryGain,2);
 });

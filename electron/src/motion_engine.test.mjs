@@ -183,6 +183,17 @@ test('the in-place settle bends the knees on top of idle, a backend or hit-rule 
   for(const e of [engine,plain,rule])e.dispose();
 });
 
+test('a fall shows the falling pose; landing then recovering is one settle whose crossfade never restarts',()=>{
+  const {nodes,vrm}=armRig('0'),engine=new MotionEngine(vrm,still);
+  for(let i=0;i<10;i++)engine.update({interaction:{hold:hold('falling',{fall:1},.2)},held:{pitch:30}},.05);
+  assert.ok(nodes.get('leftUpperArm').quaternion.angleTo(expect('0',heldPose(hold('falling',{fall:1}),engine.time,{pitch:30}).get('leftUpperArm')))<1e-6,'the falling pose, flipped once');
+  const landing=hold('landing',{squash:.6},.08);engine.update({interaction:{hold:landing}},.04);const mid=nodes.get('leftLowerLeg').quaternion.clone();
+  engine.update({interaction:{hold:{...landing,state:'recovering',pose:{...landing.pose,squash:.6}}}},.04);
+  const settled=expect('0',settlePose(proceduralPose('idle',engine.time),.6).get('leftLowerLeg'));
+  assert.ok(nodes.get('leftLowerLeg').quaternion.angleTo(settled)<1e-6,'the landing crossfade (0.08 s) finished across the change to recovering');assert.ok(mid.angleTo(settled)>1e-3,'it was still blending at 0.04 s');
+  engine.dispose();
+});
+
 test('reversing a drag mid-hold crossfades the legs and never moves a displayed bone more than a few degrees in a frame',()=>{
   for(const random of [()=>.8,()=>.5]){  // the reach and tuck variants
     const {nodes,vrm}=armRig('0'),engine=new MotionEngine(vrm,still),hold=new HoldBehaviour({random}),settings={enabled:true,protestSeconds:6,resignSeconds:18,recoverySeconds:2.5};

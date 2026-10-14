@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Group,Mesh,BufferGeometry,Float32BufferAttribute} from 'three';
 import {VRMExpression,VRMExpressionManager,VRMExpressionMorphTargetBind} from '@pixiv/three-vrm';
-import {resolveExpression,registerFaceParts,measureLidClosure,reportedExpressions,FaceMixer,Blinker,AvatarFace,FACE_PARTS,INTENTS,MAX_EXPRESSIONS} from './avatar_face.mjs';
+import {resolveExpression,registerFaceParts,measureLidClosure,reportedExpressions,FaceMixer,Blinker,AvatarFace,FACE_PARTS,INTENTS,MAX_EXPRESSIONS,GAZE_BLINK_GAP} from './avatar_face.mjs';
 
 const seeded=(seed=7)=>()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return ((t^t>>>14)>>>0)/4294967296;};
 const never=()=>.999;  // the longest blink interval, so no spontaneous blink lands inside a short test
@@ -116,6 +116,17 @@ test('forced blinks start in the same step, suppress blocks only spontaneous one
 });
 
 // The reaction steps the hold behaviour (avatar_hold.mjs) produces for a press, a grab, a release and a tug, as AvatarFace sequences.
+test('a big gaze shift blinks only when no blink runs or waits, blinks are not suppressed (eyes held wide) and the last gaze blink is 2 s old',()=>{
+ const face=new AvatarFace(manager(...VROID),{random:never});face.step(1/60);
+ assert.equal(face.gazeShift(),true);assert.equal(face.blinker.busy,true);assert.equal(face.gazeShift(),false,'one is already queued');
+ for(let i=0;i<30;i++)face.step(1/60);assert.equal(face.blinker.busy,false);assert.equal(face.gazeShift(),false,'0.5 s after the last gaze blink');
+ for(let i=0;i<Math.round((GAZE_BLINK_GAP-.5)*60)+1;i++)face.step(1/60);face.blinker.suppress(.3);assert.equal(face.blinker.quiet,true);assert.equal(face.gazeShift(),false,'falling or surprised: her eyes stay wide');
+ for(let i=0;i<20;i++)face.step(1/60);assert.equal(face.blinker.quiet,false);assert.equal(face.gazeShift(),true,'a suppressed shift never used up the 2 s');
+ // a cursor sweeping past her face: a big shift every half second for 10 s blinks her at most every 2 s
+ const sweep=new AvatarFace(manager(...VROID),{random:never}),at=[];for(let i=0;i<600;i++){sweep.step(1/60);if(i%30===0&&sweep.gazeShift())at.push(i/60);}
+ assert.ok(at.length>=4&&at.length<=5&&at.every((t,i)=>!i||t-at[i-1]>=GAZE_BLINK_GAP-1e-9),`gaze blinks at ${at.join(', ')} s`);
+});
+
 const STEPS={press:[{intent:'poke',duration:.6,blink:'press',blinkDelay:.03}],grab:[{intent:'startle',duration:.12,suppress:.9},{intent:'surprise',duration:.78},{intent:'worried'}],release:[{intent:'relief',duration:1.5,blink:'relief',blinkDelay:.05}]};
 test('AvatarFace sequences: a grab startles, then surprises, then worries while held; release gives relief and the resting smile returns',()=>{
  const face=new AvatarFace(manager(...VROID,...Object.keys(FACE_PARTS)),{random:never});

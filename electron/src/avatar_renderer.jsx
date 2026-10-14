@@ -14,15 +14,24 @@ import {AvatarHitOutlines} from './avatar_hit_outlines.mjs';
 import {boneCatalog,publishCatalog,AvatarSecondaryMotion,AvatarSkeletonDebug} from './avatar_secondary.mjs';
 import {normalizeProfile} from './avatar_studio_settings.mjs';
 import {AvatarEffects} from './avatar_effects.mjs';
-import {AvatarPickup} from './avatar_pickup.mjs';
+import {AvatarPickup,shoeTips} from './avatar_pickup.mjs';
 import {useAvatarEditorOpen} from './avatar_editor_channel.mjs';
 import {AvatarGesture,AvatarHover} from './avatar_input.mjs';
 import {AvatarMouseSphere} from './avatar_mouse_sphere.mjs';
 import {normalizeGraphics,applyTextureFiltering} from './avatar_graphics.mjs';
-import {AvatarEyeGaze} from './avatar_gaze.mjs';
+import {AvatarEyeGaze,gazeActive} from './avatar_gaze.mjs';
 import {AvatarInertia,withSpringForce} from './avatar_inertia.mjs';
 import {AvatarFace,registerFaceParts,reportedExpressions} from './avatar_face.mjs';
-import {HoldBehaviour,HoldFace,HELD_STATES,passiveHold} from './avatar_hold.mjs';
+import {HoldBehaviour,HoldFace,HELD_STATES,DROP_STATES,passiveHold} from './avatar_hold.mjs';
+import {Release,workArea} from './avatar_drop.mjs';
+
+/** Where the hold reactions look, from her (world metres): the holder's hand above and in front of the scruff, the floor ahead of her feet. */
+const HOLDER=new THREE.Vector3(0,.3,.35),FLOOR=new THREE.Vector3(0,-1,.6);
+/** The bones whose projection bounds her body for the walls a throw bounces off, re-measured every frame of the flight (her arms fling
+ * out on the way): the skin reaches about 8 cm past them, the hair about 24 cm above the head bone (Miku tilted 30 degrees in the air). */
+const BOX_BONES=['head','neck','hips','leftUpperArm','rightUpperArm','leftLowerArm','rightLowerArm','leftHand','rightHand','leftFoot','rightFoot','leftToes','rightToes'];
+/** The depth (world z) of her shoe tips standing (avatar_pickup.mjs shoeTips; Miku: 96 mm, the screen-lowest shoe vertex). */
+function shoeDepth(vrm,fallback){const tips=shoeTips(vrm.humanoid);return tips.length?tips.reduce((sum,tip)=>sum+tip.z,0)/tips.length:fallback;}
 
 /** Native VRM presentation layer. The runtime supplies intent; this loop owns animation frames. */
 export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', fov=30, actions = [], animation={}, preferences={}, geometry = {x:0,y:0,width:480,height:720}, onPosition,onError,onDragging}) {
@@ -55,7 +64,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     setShaderError('');
     let catalog=null,secondary=null,skeletonDebug=null,pickup=null,mouseSphere=null,eyeGaze=null,previousTPose=false,cursorPending=false,lastDragPoint=performance.now(),lastFilter=null,lastMousePoint=null;
     const gesture=new AvatarGesture(),hover=new AvatarHover();
-    let profile=normalizeProfile({}),profileSource,holdSettings={...profile.reactions,recoverySeconds:profile.pickup.recoverySeconds};
+    let profile=normalizeProfile({}),profileSource,holdSettings={...profile.reactions,recoverySeconds:profile.pickup.recoverySeconds,landingSquash:profile.pickup.landingSquash};
 
     const loader = new GLTFLoader();
     loader.register(parser => new VRMLoaderPlugin(parser));
@@ -65,7 +74,28 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     const inertia=new AvatarInertia(),cursorMotion=new AvatarInertia(),springForce=new THREE.Vector3(),hold=new HoldBehaviour();
     let motion=null,face=null,holdFace=new HoldFace(null);
     const interaction={held:false,pointer:null,reaction:'',until:0,target:null,rule:null,hold:null};
-    let lastPointerPost=0,lastHoldPost=0;
+    let lastPointerPost=0,lastHoldPost=0,lastWorldPerPixel=0;
+    const lookPoint=new THREE.Vector3(),scratch=new THREE.Vector3(),ground=new THREE.Vector3(),restCamera=new THREE.PerspectiveCamera();
+    // Letting go (avatar_drop.mjs): the work area of the overlay's display, where her soles are in the canvas with the current camera
+    // (the safety net may still be easing back) or the one at rest, and her body's extent in the canvas for the walls.
+    const area=()=>workArea(window.screen,{x:window.screenX,y:window.screenY},{width:innerWidth,height:innerHeight});
+    // Her soles are at y 0, and the tips of her shoes are the lowest point she shows: in perspective, nearer the camera is lower on screen
+    // (on Miku the shoe tip is 6.5 px below a point at the model's centre depth; modelFront puts it within 0.1 px).
+    function footLine(rest=false){
+     if(!modelCenter)return canvas.clientHeight;let view=camera;
+     if(rest&&pickup?.cameraActive&&pickup.cameraRest){view=restCamera.copy(camera);view.position.copy(pickup.cameraRest.position);view.quaternion.copy(pickup.cameraRest.quaternion);view.updateMatrixWorld(true);}
+     ground.set(modelCenter.x,0,modelFront).project(view);return (1-ground.y)/2*canvas.clientHeight;
+    }
+    function bodyBox(){
+     const w=canvas.clientWidth,h=canvas.clientHeight,box={left:w,right:0,top:h};
+     for(const name of BOX_BONES){const node=vrm?.humanoid.getRawBoneNode(name);if(!node)continue;const p=node.getWorldPosition(scratch).project(camera),x=(p.x+1)/2*w,y=(1-p.y)/2*h;box.left=Math.min(box.left,x);box.right=Math.max(box.right,x);box.top=Math.min(box.top,y);}
+     const pad=lastWorldPerPixel>0?.08/lastWorldPerPixel:0;
+     return box.left<=box.right?{left:box.left-pad,right:box.right+pad,top:box.top-3*pad}:{left:0,right:w,top:0};
+    }
+    function headPoint(){return vrm?.humanoid.getRawBoneNode('head')?.getWorldPosition(scratch)||scratch.copy(modelCenter||camera.position);}
+    // The release lifecycle (throw, fall, set-down, catch and the one final PATCH); the carry rig joins it once the model has loaded.
+    const release=new Release({place:(g,final)=>{geometryRef.current=g;positionRef.current?.(g.x,g.y,final,g);},dragging:value=>draggingRef.current?.(value),interact:kind=>interact(kind),hold,
+     measure:{area,foot:footLine,box:bodyBox,worldPerPixel:()=>lastWorldPerPixel,height:()=>canvas.clientHeight}});
     function interact(kind,pointer=null,target=interaction.target){
       if(['hold','click','release','hover','leave','hoverDelayed'].includes(kind)){
        interaction.rule=preferencesRef.current.avatarHitRules?.[target?.bone]?.[kind]||null;
@@ -80,7 +110,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     let disposed = false;
     let frame = 0;
     const clock = new THREE.Clock();
-    let modelSize, modelCenter;
+    let modelSize, modelCenter, modelFront=0;
     function fitModel() {
       if (!modelSize) return;
       const distance = cameraDistance(modelSize, camera.aspect, camera.fov);
@@ -105,13 +135,13 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       secondary=new AvatarSecondaryMotion(vrm,catalog);skeletonDebug=new AvatarSkeletonDebug(vrm,catalog,scene);
       mouseSphere=new AvatarMouseSphere(catalog,scene);
       eyeGaze=new AvatarEyeGaze(vrm);
-      pickup=new AvatarPickup(vrm,catalog,kind=>{interaction.rule=preferencesRef.current.avatarHitRules?.[interaction.grabTarget?.bone]?.[kind]||null;if(interaction.rule?.assetId)request('/api/animation/assets/'+encodeURIComponent(interaction.rule.assetId)+'/preview',{method:'POST'}).catch(()=>{});if(kind==='recover'&&interaction.held)lastHoldPost=0;else if(kind==='recover'&&!profile.reactions.enabled){interaction.reaction='settling';interaction.until=performance.now()+800;}request('/api/animation/interaction',{method:'POST',body:{kind,pointer:interaction.pointer,target:interaction.grabTarget}}).catch(()=>{});});
+      pickup=release.pickup=new AvatarPickup(vrm,catalog,kind=>{interaction.rule=preferencesRef.current.avatarHitRules?.[interaction.grabTarget?.bone]?.[kind]||null;if(interaction.rule?.assetId)request('/api/animation/assets/'+encodeURIComponent(interaction.rule.assetId)+'/preview',{method:'POST'}).catch(()=>{});if(kind==='recover'&&interaction.held)lastHoldPost=0;else if(kind==='recover'&&!profile.reactions.enabled){interaction.reaction='settling';interaction.until=performance.now()+800;}request('/api/animation/interaction',{method:'POST',body:{kind,pointer:interaction.pointer,target:interaction.grabTarget}}).catch(()=>{});});
       const bounds = new THREE.Box3().setFromObject(vrm.scene);
       const size = bounds.getSize(new THREE.Vector3());
       vrm.scene.position.y -= bounds.min.y;
       vrm.scene.updateMatrixWorld(true);
       modelSize = size;
-      modelCenter = new THREE.Box3().setFromObject(vrm.scene).getCenter(new THREE.Vector3());
+      modelCenter=new THREE.Box3().setFromObject(vrm.scene).getCenter(new THREE.Vector3());modelFront=shoeDepth(vrm,modelCenter.z);
       pickBVH=AvatarBoneBVH.fromVRM(vrm,size.y,catalog);
       hitOutlines=new AvatarHitOutlines(pickBVH,scene);
       fitModel();
@@ -152,15 +182,24 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       return !!interaction.target;
     }
     const mousemove = event => {samples.queue(event);};
+    /** The drag threshold was crossed (or she was caught mid-fall): she is held. */
+    function startGrab(point){
+     drag.started=true;interaction.held=drag.kind==='body';interaction.reaction='';walker.stop();interact('hold',interaction.pointer);hold.grab(performance.now()/1000,{region:interaction.grabTarget?.region,kind:drag.kind,emotion:emotionRef.current,caught:!!drag.caught});
+     if(drag.kind==='spring'){mouseSphere.start(drag.entry,drag.springGrab);mouseSphere.aim(point,canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);interaction.reaction='idle';interaction.until=performance.now()+60000;}else if(profile.pickup.enabled)pickup?.start(interaction.target.bone,gesture.press.origin,camera,{style:profile.pickup.grabStyle,pointer:drag.ndc});
+    }
+    /** A body drag ended at canvas position `final` with the cursor's velocity (px/s): thrown (she flies to the floor) or set down in
+     * place (onto the floor when her feet would end below it or just above it). Release sends the one PATCH (final=true) once she
+     * stands and the camera's safety net is back at rest. */
+    function letGo(origin,final,velocity){
+     cursorMotion.shift(origin.slid?.x||0,origin.slid?.y||0);  // it tracked the canvas without the scruff slide; from now on with it
+     release.letGo(performance.now()/1000,final,velocity,{slid:origin.slid,settings:profile.pickup});
+    }
     function processPointer(point){
       lastMousePoint=point;mouseSphere?.aim(point,canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);
       interaction.pointer=nearbyPointer(geometryRef.current,point,interaction.pointer?.near);
       if(performance.now()-lastPointerPost>150){lastPointerPost=performance.now();interact('pointer',interaction.pointer);}
       if (drag) {
-        if(gesture.move(point,profile.input.dragThreshold)){
-         drag.started=true;interaction.held=drag.kind==='body';interaction.reaction='';walker.stop();interact('hold',interaction.pointer);hold.grab(performance.now()/1000,{region:interaction.grabTarget?.region,kind:drag.kind,emotion:emotionRef.current});
-          if(drag.kind==='spring'){mouseSphere.start(drag.entry,drag.springGrab);mouseSphere.aim(point,canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);interaction.reaction='idle';interaction.until=performance.now()+60000;}else if(profile.pickup.enabled)pickup?.start(interaction.target.bone,gesture.press.origin,camera,{style:profile.pickup.grabStyle,pointer:drag.ndc});
-        }
+        if(gesture.move(point,profile.input.dragThreshold))startGrab(point);
         if(!drag.started)return;
         if(drag.kind==='spring')return;
         pickup?.move(point,(performance.now()-lastDragPoint)/1000,profile.pickup);lastDragPoint=performance.now();
@@ -176,10 +215,14 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       // Do not rely on the last throttled hover result for pickup.
       hit=pick(event.clientX,event.clientY,true);
       if(!hit)return;
+      // A press on her mid-fall catches her (a bigger surprise): the flight, or a glide onto the floor, stops where she is and she is held
+      // at once, with no drag threshold. Standing, she is only waiting for the camera to settle: her place is sent now.
+      const {caught,grabbed}=release.grab();
+      if(grabbed)cursorMotion.reset();  // it tracked the flight; from now on only the hand moves her
       samples.clear();
       interaction.pointer=nearbyPointer(geometryRef.current,{x:event.clientX,y:event.clientY},interaction.pointer?.near);
       const entry=catalog.entries.find(e=>e.id===interaction.target.bone||e.human===interaction.target.bone);
-       drag = {x: event.clientX, y: event.clientY, point:{x:event.clientX,y:event.clientY}, ndc:{x:ndc.x,y:ndc.y}, left: geometryRef.current.x, top: geometryRef.current.y, geometry: {...geometryRef.current},started:false,kind:entry&&(entry.joint||!entry.human&&profile.bones[entry.id]?.enabled)?'spring':'body',entry};
+       drag = {x: event.clientX, y: event.clientY, point:{x:event.clientX,y:event.clientY}, ndc:{x:ndc.x,y:ndc.y}, left: geometryRef.current.x, top: geometryRef.current.y, geometry: {...geometryRef.current},started:false,kind:!grabbed&&entry&&(entry.joint||!entry.human&&profile.bones[entry.id]?.enabled)?'spring':'body',entry,caught};
        window.overlayInputBridge?.drag('avatar',true);
        if(drag.kind==='spring')drag.springGrab=mouseSphere.prepare(entry,{x:event.clientX,y:event.clientY},canvas.getBoundingClientRect(),camera);
       interaction.localDrag=drag.kind==='spring';hold.press(performance.now()/1000);
@@ -187,6 +230,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       gesture.down({x:event.clientX,y:event.clientY},{...interaction.target});mouseSphere?.aim({x:event.clientX,y:event.clientY},canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);
        lastMousePoint={x:event.clientX,y:event.clientY};draggingRef.current?.(true);interaction.grabTarget={...interaction.target};lastDragPoint=performance.now();
       if(event.pointerId!==undefined)try{canvas.setPointerCapture(event.pointerId);}catch{}
+      if(grabbed){gesture.press.dragging=true;startGrab({x:event.clientX,y:event.clientY});}
       setInteractive(true);
       feedback();
       event.preventDefault();
@@ -199,22 +243,21 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         const clicked=!origin.started,now=performance.now(),slid=slidePx(origin);gesture.up();
         interaction.held=false;interaction.reaction=clicked?'clicked':origin.kind==='spring'?'idle':'settling';interaction.until=now+800;
         interact(clicked?'click':'release',interaction.pointer);
-        // A held body settles in place (segment C adds throws); 'recover' gives the backend its 2 s of settling, unless the ragdoll's release already sent it.
-        if(clicked)hold.click(now/1000);else if(hold.release(now/1000,{vx:inertia.velocity.x,vy:inertia.velocity.y})==='recovering'&&!pickup?.ragdoll)interact('recover');
-        const final=clicked||origin.kind==='spring'?origin.geometry:{...origin.geometry,...dragPosition(origin,{x:event.clientX,y:event.clientY},slid)};
-        if(!clicked&&origin.kind==='body')positionRef.current?.(final.x,final.y,true,final);
         if(clicked)mouseSphere?.click();mouseSphere?.release();
-        geometryRef.current=final;draggingRef.current?.(false);pickup?.release();
+        if(!clicked&&origin.kind==='body')letGo(origin,{...origin.geometry,...dragPosition(origin,{x:event.clientX,y:event.clientY},slid)},{x:cursorMotion.velocity.x,y:cursorMotion.velocity.y});
+        else{if(clicked)hold.click(now/1000);else hold.release(now/1000);geometryRef.current=origin.geometry;draggingRef.current?.(false);pickup?.release();}
         if(event.pointerId!==undefined&&canvas.hasPointerCapture(event.pointerId))canvas.releasePointerCapture(event.pointerId);
       }
       samples.clear();hit=pick(event.clientX,event.clientY);setInteractive(hit);feedback();
     };
      const pointercancel = () => {
        window.overlayInputBridge?.drag('avatar',false);
-      if (drag?.started){if(drag.kind==='body')positionRef.current?.(drag.geometry.x, drag.geometry.y, true, drag.geometry);interact('release');if(hold.release(performance.now()/1000)==='recovering'&&!pickup?.ragdoll)interact('recover');interaction.held=false;interaction.reaction='settling';interaction.until=performance.now()+800;}
-      else if(drag)hold.release(performance.now()/1000);
-      gesture.up();mouseSphere?.release();
-      drag = null;pickup?.release();draggingRef.current?.(false); hit = false;samples.clear(); setInteractive(false);feedback();
+      const origin=drag;drag=null;gesture.up();mouseSphere?.release();
+      if(origin?.started){interact('release');interaction.held=false;interaction.reaction='settling';interaction.until=performance.now()+800;}
+      // A cancelled body drag is set down where it was (onto the floor if her feet are under it); anything else just ends.
+      if(origin?.started&&origin.kind==='body')letGo(origin,origin.geometry,{x:0,y:0});
+      else{if(origin)hold.release(performance.now()/1000);pickup?.release();draggingRef.current?.(false);}
+      hit = false;samples.clear(); setInteractive(false);feedback();
     };
     const leave=()=>{if(!drag){for(const event of hover.update(null,performance.now(),profile.input.hoverDelay))interact(event.kind,null,event.target);interaction.pointer=null;interaction.target=null;hit=false;samples.clear();if(mouseSphere)mouseSphere.active=false;setInteractive(false);feedback();}};
     addEventListener('mouseleave',leave);
@@ -251,7 +294,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       if(drag&&!cursorPending&&window.avatarCursorBridge){cursorPending=true;const currentDrag=drag;window.avatarCursorBridge.position().then(point=>{if(!disposed&&drag===currentDrag){if(point.buttons===0)pointerup({clientX:point.x,clientY:point.y});else samples.queue({clientX:point.x,clientY:point.y});}}).catch(()=>{}).finally(()=>{cursorPending=false;});}
       const current = emotionRef.current || {};
       const nextProfile=preferencesRef.current.avatarStudioProfiles?.[catalog?.key];
-      if(nextProfile!==profileSource){profileSource=nextProfile;profile=normalizeProfile(nextProfile);holdSettings={...profile.reactions,recoverySeconds:profile.pickup.recoverySeconds};}
+      if(nextProfile!==profileSource){profileSource=nextProfile;profile=normalizeProfile(nextProfile);holdSettings={...profile.reactions,recoverySeconds:profile.pickup.recoverySeconds,landingSquash:profile.pickup.landingSquash};}
       if (vrm) {
         eyeGaze?.restore();mouseSphere?.restore();pickup?.restore();secondary.restore();
         if(!drag&&(!interaction.reaction||interaction.reaction==='idle'))for(const event of hover.update(interaction.target,performance.now(),profile.input.hoverDelay))interact(event.kind,interaction.pointer,event.target);
@@ -265,22 +308,33 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         vrm.scene.position.x = Math.sin(elapsed * 0.45) * 0.006;
         if(performance.now()>interaction.until)interaction.reaction='';
         if(interaction.held&&performance.now()-lastHoldPost>500){lastHoldPost=performance.now();interact('drag',interaction.pointer);}
-        const walk=profile.tPose?null:walker.step(actionsRef.current.find(a=>a.kind==='motion.locomotion'&&a.status==='running'),geometryRef.current,{width:innerWidth,height:innerHeight},delta,interaction.held||!!drag?.started);
+        const walk=profile.tPose?null:walker.step(actionsRef.current.find(a=>a.kind==='motion.locomotion'&&a.status==='running'),geometryRef.current,{width:innerWidth,height:innerHeight},delta,interaction.held||!!drag?.started||release.active);
         if(walk){positionRef.current?.(walk.x,walk.y,walk.final,walk);vrm.scene.rotation.y+=(walk.facing<0?.35:-.35);}
-        // Frame order: window motion (the scruff slide, then both trackers), the hold, MotionEngine, the carry rig on the normalized bones,
-        // humanoid.update, the anchor translation, springs with the window's inertial force, then the face last.
+        // Frame order: window motion (a throw's flight or a set-down's glide, the scruff slide, then both trackers), the hold, MotionEngine,
+        // the carry rig on the normalized bones (with the head look), humanoid.update, the anchor translation, springs with the window's
+        // inertial force, the face, then the eyes.
+        if(release.active){
+         release.step(now/1000,delta);
+         // She moves under a cursor that may not: keep the hit test current so a press can catch her.
+         if(release.flying&&lastMousePoint){hit=pick(lastMousePoint.x,lastMousePoint.y);setInteractive(hit);feedback();}
+        }
         if(drag?.started&&drag.kind==='body'){const s=slidePx(drag);if(s.x!==drag.slid?.x||s.y!==drag.slid?.y)placeDrag();}
         inertia.track(geometryRef.current.x,geometryRef.current.y,delta);
         const slid=drag?.slid||{x:0,y:0};cursorMotion.track(geometryRef.current.x-slid.x,geometryRef.current.y-slid.y,delta);
-        const worldPerPixel=2*Math.tan(camera.fov*Math.PI/360)*camera.position.distanceTo(modelCenter||camera.position)/Math.max(1,canvas.clientHeight);
+        const worldPerPixel=2*Math.tan(camera.fov*Math.PI/360)*camera.position.distanceTo(modelCenter||camera.position)/Math.max(1,canvas.clientHeight);lastWorldPerPixel=worldPerPixel;
         const held=hold.step(now/1000,delta,{vx:cursorMotion.velocity.x,vy:cursorMotion.velocity.y,ax:cursorMotion.acceleration.x,ay:cursorMotion.acceleration.y,ragdoll:!!pickup?.ragdoll},holdSettings);
         interaction.hold=held?.pose?held:interaction.held&&!profile.reactions.enabled?passiveHold(!!pickup?.ragdoll):null;
         // While a hold reaction runs it is the reaction: hover events and backend base overlays stay suppressed until it ends.
-        if(held?.pose)interaction.reaction=held.state;else if(HELD_STATES.has(interaction.reaction)||interaction.reaction==='recovering')interaction.reaction='';
+        if(held?.pose)interaction.reaction=held.state;else if(HELD_STATES.has(interaction.reaction)||DROP_STATES.has(interaction.reaction))interaction.reaction='';
         holdFace.apply(held);
+        // Where the reaction looks: a world point for the eyes and the carry rig's head (the viewer, the holder's hand, the floor), the
+        // cursor even when it is not near her, 'ahead' (dizzy: the eyes rest), or nothing: normal tracking (gazeActive).
+        const look=held?.state?held.look:null;
+        const lookAt=look==='viewer'?lookPoint.copy(camera.position):look==='holder'?lookPoint.copy(pickup?.active&&pickup.anchorPoint?pickup.anchorPoint:headPoint()).add(HOLDER):look==='floor'?lookPoint.copy(headPoint()).add(FLOOR):null;
+        const headLook=lookAt||(look==='cursor'&&eyeGaze?.tracking?eyeGaze.target:null);
         if(profile.tPose)secondary.preview();
         else motion?.update({actions:actionsRef.current,emotion:current,interaction,walking:!!walker.active,walkSpeed:walker.velocity/(animationRef.current.settings?.walk_speed||240),settings:{...animationRef.current.settings,enabled:animationRef.current.enabled},held:{pitch:profile.pickup.scruffPitch,kickAmplitude:profile.reactions.kickAmplitude}},delta);
-        if(!profile.tPose)pickup?.pose(profile.pickup,delta,{ax:inertia.acceleration.x,ay:inertia.acceleration.y,vx:inertia.velocity.x,vy:inertia.velocity.y,worldPerPixel,hold:interaction.hold});
+        if(!profile.tPose)pickup?.pose(profile.pickup,delta,{ax:inertia.acceleration.x,ay:inertia.acceleration.y,vx:inertia.velocity.x,vy:inertia.velocity.y,worldPerPixel,hold:interaction.hold,look:headLook,eyeReach:eyeGaze?.reach});
         // Same order as VRM.update, with non-destructive calibration before springs
         // and rotational secondary motion after them. Never simulate springs twice.
         vrm.humanoid.update();secondary.calibrate(profile);
@@ -296,7 +350,8 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         if(face)for(const [name,value] of face.step(delta,{emotion:emotionRef.current,rule:custom?.expression&&custom.expression!=='default'?custom:null,assets:profile.tPose?null:motion?.expressionTargets,breathPhase:held?.breath.phase,settings:profile.face}))vrm.expressionManager.setValue(name,value);
         vrm.expressionManager?.update();
         vrm.scene.updateMatrixWorld(true);
-        eyeGaze?.update({...profile.gaze,enabled:profile.gaze.enabled&&!profile.tPose&&animationRef.current.settings?.mouse_tracking!==false},delta,lastMousePoint,canvas.getBoundingClientRect(),camera,mouseSphere,!!interaction.pointer?.near);
+        eyeGaze?.update({...profile.gaze,enabled:profile.gaze.enabled&&!profile.tPose&&animationRef.current.settings?.mouse_tracking!==false},delta,lastMousePoint,canvas.getBoundingClientRect(),camera,mouseSphere,gazeActive(look,interaction.pointer?.near),lookAt);
+        if(eyeGaze?.bigShift)face?.gazeShift();  // a big gaze shift comes with a blink (never two within 2 s, never while her eyes are held wide)
          vrm.expressionManager?.update();vrm.scene.updateMatrixWorld(true);
         if(preferencesRef.current.avatarHitOutlines)pickBVH?.refit(profile.springPickRadius);
         skeletonDebug.update(profile);hitOutlines?.update(preferencesRef.current,interaction.target);
@@ -307,7 +362,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     };
     animate();
     return () => {
-       disposed = true;
+       release.dispose();disposed = true;
        nativeOff?.();window.overlayInputBridge?.drag('avatar',false);
       cancelAnimationFrame(frame);
       removeEventListener('resize', resize);

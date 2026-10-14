@@ -71,8 +71,12 @@ export class Blinker{
  setMood(mood){if(!INTERVALS[mood]||mood===this.mood)return;this.mood=mood;this.next=Math.min(this.next,this.interval());}
  /** A forced blink ('startle', 'press', 'gaze' or 'relief') after `delay` seconds; suppress() never blocks it. */
  trigger(kind='startle',delay=0){this.pending.push({at:this.time+Math.max(0,delay),kind});}
+ /** A blink is running or queued (a gaze-evoked blink then adds nothing). */
+ get busy(){return !!this.current||this.pending.length>0;}
  /** No spontaneous blink for `seconds`. */
  suppress(seconds){this.quietUntil=Math.max(this.quietUntil,this.time+Math.max(0,seconds));}
+ /** Spontaneous blinks are suppressed now (eyes held wide: a surprise, a fall). */
+ get quiet(){return this.time<this.quietUntil;}
  step(dt){
   const h=clamp(dt,0,.1);this.time+=h;let advance=h;  // a blink that starts inside this step advances only from its start
   const due=this.pending.reduce((best,p,i)=>p.at<=this.time+1e-9&&(best<0||p.at<this.pending[best].at)?i:best,-1);
@@ -108,6 +112,8 @@ export const INTENTS={
  perk:{parts:{browUp:.5},attack:.05,release:.35,fallback:{surprised:.3}},
  sigh:{parts:{browWorry:.3},lid:.35,oh:.25,attack:.3,release:.6,mood:'resigned',fallback:{sad:.3}},
  wince:{parts:{eyeSquint:.5,browAngry:.4,mouthSmall:.4},attack:.06,release:.5,fallback:{angry:.4}},
+ falling:{parts:{browUp:.9,eyeWide:.8,mouthSurprised:.5},attack:.06,release:.3,mood:'anxious',breath:1.2,fallback:{surprised:.9}},
+ squeeze:{parts:{browAngry:.45,mouthSmall:.5},lid:1,attack:.03,release:.12,fallback:{angry:.3}},  // eyes shut on a hard landing
 };
 /** The base face per backend emotion (scaled by its intensity); neutral, calm and no emotion add the resting smile. */
 const EMOTION_FACE={joy:{parts:{happy:1}},love:{parts:{happy:1}},affection:{parts:{happy:1}},amusement:{parts:{happy:1}},excitement:{parts:{happy:1}},sadness:{parts:{sad:1}},anger:{parts:{angry:1}},surprise:{parts:{surprised:1}},fear:{parts:{surprised:1}},confusion:{parts:{browWorry:1},fallback:{sad:.5}},embarrassment:{parts:{eyeSmile:.4,mouthSmall:.3},fallback:{happy:.4}},calm:{parts:{neutral:1},resting:true},neutral:{parts:{neutral:1},resting:true}};
@@ -196,9 +202,11 @@ export class FaceMixer{
  }
 }
 
+/** The least time (s) between two gaze-evoked blinks. */
+export const GAZE_BLINK_GAP=2;
 /** One face per model: a queue of reaction steps over the mixer. */
 export class AvatarFace{
- constructor(manager,{random=Math.random}={}){this.mixer=new FaceMixer(manager,{random});this.queue=[];this.age=0;}
+ constructor(manager,{random=Math.random}={}){this.mixer=new FaceMixer(manager,{random});this.queue=[];this.age=0;this.gazeBlinkAt=-Infinity;}
  get blinker(){return this.mixer.blinker;}
  get intent(){return this.queue[0]?.intent||null;}
  /** Holds `intent` (an INTENTS name, a spec or null) for `duration` seconds, then `then` (or the base face). */
@@ -206,6 +214,10 @@ export class AvatarFace{
  /** Steps: {intent, duration (s, default until replaced), intensity, blink (a Blinker kind), blinkDelay, suppress (s)}. */
  sequence(steps){this.queue=steps.map(step=>({...step}));this.age=0;this.begin();return this;}
  blink(kind='startle',delay=0){this.mixer.blinker.trigger(kind,delay);}
+ /** A big gaze shift (AvatarEyeGaze.bigShift): a gaze-evoked blink, unless a blink is already running or queued, blinks are
+  * suppressed (her eyes held wide in a surprise or a fall), or the last gaze blink was under 2 s ago (a cursor sweeping past her face
+  * jumps her eyes past 25 degrees every half second; a blink with each read as twitching). Returns whether it blinked. */
+ gazeShift(){const b=this.mixer.blinker;if(b.busy||b.quiet||b.time-this.gazeBlinkAt<GAZE_BLINK_GAP)return false;this.gazeBlinkAt=b.time;this.blink('gaze');return true;}
  begin(){const step=this.queue[0];if(!step)return;if(step.blink)this.blink(step.blink,step.blinkDelay||0);if(step.suppress)this.mixer.blinker.suppress(step.suppress);}
  /** Options: emotion, rule (a hit rule), assets (MotionEngine's expression targets), breathPhase (radians, so the breathing mouth
   * follows the body's breath), settings ({restingSmile, intensity}). */

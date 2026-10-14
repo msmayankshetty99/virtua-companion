@@ -40,6 +40,15 @@ export function kickPose(phase,amplitude=22){
  const s=Math.sin(phase),thigh=x=>-amplitude*(x>0?.18:.45)*x,knee=p=>2.5*amplitude*Math.max(0,Math.sin(p-70*D)),arm=7.5*amplitude/22*Math.sin(phase+90*D);
  return {leftUpperLeg:[thigh(s),0,0],rightUpperLeg:[thigh(-s),0,0],leftLowerLeg:[knee(phase),0,0],rightLowerLeg:[knee(phase+Math.PI),0,0],leftUpperArm:[arm,0,0],rightUpperArm:[-arm,0,0]};
 }
+/** Falling (thrown or dropped): arms flung out just below level for balance with bent elbows and wrists up, the back arched a little,
+ * knees bent unevenly and toes pointed, flailing a little (arms at 2.2 Hz, legs in antiphase). The head-look (avatar_pickup.mjs) turns
+ * her face to the floor. Not arms over the head: on Miku any arm raised past level stretches the shirt's armpit 3-4.4x past anything
+ * idle or walking shows (38 degrees up: 4.1x); out 24-36 degrees below level it stays at 2.3-2.6x (the bind T-pose itself is 2.2x). */
+export function fallPose(time=0){
+ const a=Math.sin(TAU*2.2*time),b=Math.sin(TAU*2.2*time+1.3),l=Math.sin(TAU*1.7*time);
+ return {hips:[-6,0,0],spine:[-4,0,0],chest:[-3,0,0],neck:[3,0,0],head:[6,0,0],...both('Shoulder',[0,0,12]),leftUpperArm:[-25+5*a,0,-30+6*b],rightUpperArm:[-25-5*b,0,30+6*a],
+  ...both('LowerArm',[0,-45,0]),...both('Hand',[0,0,25]),leftUpperLeg:[-28+5*l,0,2],rightUpperLeg:[-20-5*l,0,-2],leftLowerLeg:[32+6*l,0,0],rightLowerLeg:[44-6*l,0,0],...both('Foot',[25,0,0])};
+}
 /** Landing or settling with weight s (knees, hips and ankles flex together so planted feet stay flat; below 0 a small stretch). */
 export function landingPose(s){
  const k=Math.max(0,s),u=Math.max(0,-s);
@@ -71,8 +80,8 @@ function mirrorLegs(table,u){
 export const toQuaternions=pose=>new Map(Object.entries(pose).map(([b,[x,y,z]])=>[b,new Quaternion().setFromEuler(new Euler(x*D,y*D,z*D,'XYZ'))]));
 
 /** The held pose as Euler degrees. hold is HoldBehaviour.step's result (state and pose: variant, startle, alarm, limp, kick, kickPhase,
- * sway, mirror) or a stand-in; time drives the playful and idle leg sways. mirror runs continuously from 1 (as authored) to -1 (the
- * legs swapped). */
+ * sway, fall, mirror) or a stand-in; time drives the playful and idle leg sways and the falling flail. mirror runs continuously from 1
+ * (as authored) to -1 (the legs swapped). */
 export function heldTable(hold,time=0,{pitch=30,kickAmplitude=22}={}){
  const P=clamp(pitch,0,60),pose=hold?.pose||{},breath=hold?.breath;
  const table=add(zero(),pose.variant==='reach'?reachPose(P):tuckPose(P));
@@ -84,6 +93,7 @@ export function heldTable(hold,time=0,{pitch=30,kickAmplitude=22}={}){
  add(table,STARTLE,clamp(pose.startle));
  if(kick)add(table,kickPose(pose.kickPhase||0,clamp(kickAmplitude,0,45)),kick);
  if(breath?.depth)add(table,breathPose(breath.phase||0,breath.depth));
+ const fall=clamp(pose.fall);if(fall)blend(table,fallPose(time),fall);
  limit(table);
  return mirrorLegs(table,clamp((1-(pose.mirror??1))/2));
 }

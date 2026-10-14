@@ -54,7 +54,7 @@ export class PoseInterpolator {
  * VRM 1.0 axes; a VRM 0.x model is flipped once on write, and samples read back from its nodes (.vrma, sample.native) are flipped to
  * canonical before they merge. While she is held, interaction.hold (HoldBehaviour's step) picks the held pose and its crossfade time,
  * and the pointer head-gaze stops: the carry rig owns the head then. 'held', 'settling' and 'recovering' modes from a hit rule or the
- * backend map to the plain dangle and an in-place settle. Asset expression targets are exposed as expressionTargets for the face
+ * backend map to the plain dangle and an in-place settle. Falling is the held pose with fall 1 (avatar_held_pose.mjs fallPose). Asset expression targets are exposed as expressionTargets for the face
  * layer, which owns every expression write. */
 export class MotionEngine {
   constructor(vrm,sampler,report=()=>{}) {
@@ -78,7 +78,8 @@ export class MotionEngine {
     const custom=(holding||interaction.reaction)&&interaction.rule?.animation!=='default'?interaction.rule?.animation:null;
     const mode=enabled?(custom|| (hold?'hold':interaction.held?'held':interaction.reaction|| (walking?'walking':base?.payload.procedural||'idle'))):'idle';
     let target,modeKey=mode;
-    if(mode==='hold'){target=hold.state==='recovering'?settlePose(proceduralPose('idle',this.time),hold.pose.squash):heldPose(hold,this.time,held);modeKey='hold:'+hold.state+':'+hold.pose.variant;}
+    // Landing and recovering are one settle (idle with the squash): one key, so the crossfade into it never restarts between them.
+    if(mode==='hold'){const settle=hold.state==='landing'||hold.state==='recovering';target=settle?settlePose(proceduralPose('idle',this.time),hold.pose.squash):heldPose(hold,this.time,held);modeKey=settle?'hold:settle':'hold:'+hold.state+':'+hold.pose.variant;}
     else if(mode==='held'){target=heldPose(hold,this.time,held);modeKey='held:'+(hold?hold.state+':'+hold.pose.variant:'');}
     else if(mode==='settling'||mode==='recovering')target=settlePose(proceduralPose('idle',this.time),.3);
     else target=proceduralPose(mode,this.time,emotion.intensity??.65,walkSpeed);

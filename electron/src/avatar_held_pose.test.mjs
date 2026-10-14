@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Group,Bone,Vector3,Quaternion,Euler} from 'three';
-import {heldTable,heldPose,mirrorPose,landingPose,settlePose,toQuaternions,kickPose,tuckPose,HELD_BONES,JOINT_LIMITS} from './avatar_held_pose.mjs';
+import {heldTable,heldPose,mirrorPose,landingPose,settlePose,toQuaternions,kickPose,tuckPose,fallPose,HELD_BONES,JOINT_LIMITS} from './avatar_held_pose.mjs';
 
 const D=Math.PI/180;
 // A canonical VRM 1.0 chain (faces +z, her left is +x) in the style of avatar_pickup.test.mjs.
@@ -50,6 +50,7 @@ test('kicks are thighs in antiphase with lagging knees that never hyperextend, a
  for(const variant of ['tuck','reach','swing'])for(const state of ['grabbed','dangling','carried','protesting','dizzy','resigned'])for(const P of [0,30,60])for(let phase=0;phase<2*Math.PI;phase+=.3)for(const mirror of [1,0,-1])for(const startle of [0,1])
   check(heldTable({state,pose:{variant,startle,alarm:state==='carried'?1:0,limp:state==='dizzy'||state==='resigned'?1:0,kick:state==='protesting'?1:0,kickPhase:phase,sway:1,mirror},breath:{phase,depth:3}},phase,{pitch:P,kickAmplitude:45}),`${variant} ${state} P${P}`);
  for(let s=-.15;s<=1.2;s+=.05)check({...tuckPose(0),...landingPose(s)},`landing ${s.toFixed(2)}`);
+ for(let t=0;t<2;t+=.02)for(const mirror of [1,-1])check(heldTable({state:'falling',pose:{variant:'tuck',fall:1,mirror},breath:{phase:t,depth:1.5}},t,{pitch:30}),`falling ${t.toFixed(2)}`);
 });
 
 test('mirror swaps only the legs, continuously: -1 puts the more bent knee on the other side, 0 is halfway, and the arms never swap',()=>{
@@ -83,4 +84,18 @@ test('startle, alarm, sway and breath layer onto the variant; the swing variant 
  const breath=heldTable({...hold('dangling'),breath:{phase:Math.PI/2,depth:1.5}},0,{pitch:30});assert.ok(Math.abs(breath.chest[0]-plain.chest[0]+1.5)<1e-9);assert.ok(breath.leftShoulder[2]>plain.leftShoulder[2]);
  const a=heldTable(hold('dangling',{variant:'swing'}),.3125,{pitch:30}),b=heldTable(hold('dangling',{variant:'swing'}),.9375,{pitch:30});assert.ok(Math.abs(a.leftUpperLeg[0]-b.leftUpperLeg[0])>15,'the playful swing moves the legs 10 degrees each way');
  assert.ok(toQuaternions({hips:[30,0,0]}).get('hips').angleTo(new Quaternion())-30*D<1e-9);
+});
+
+test('falling: arms flung out just below level with bent elbows, knees bent unevenly, toes pointed, a flail that moves, and the held tuck gone',()=>{
+ const rig=chain();
+ for(const t of [0,.1,.3]){
+  const table=heldTable({state:'falling',pose:{variant:'tuck',fall:1}},t,{pitch:30});const reach=heldTable({state:'falling',pose:{variant:'reach',fall:1}},t,{pitch:30});for(const bone in table)assert.ok(table[bone].every((v,i)=>Math.abs(v-reach[bone][i])<1e-9),`the variant no longer matters (${bone})`);
+  assert.ok(table.hips[0]<0,'no scruff tilt: the back arches a little');rig.apply(heldPose({state:'falling',pose:{variant:'tuck',fall:1}},t,{pitch:30}));
+  for(const s of ['left','right']){const arm=rig.dir(s+'UpperArm',s+'LowerArm');assert.ok(Math.abs(arm.x)>.8&&arm.y<0&&arm.y>-.5,`${s} arm out, just below level (${arm.toArray().map(v=>v.toFixed(2))})`);
+   assert.ok(rig.at(s+'Hand').y>rig.at(s+'LowerArm').y-.02,`${s} forearm not hanging`);assert.ok(rig.dir(s+'Foot',s+'Toes').y<-.3,'toes pointed');}
+  assert.ok(table.rightLowerLeg[0]-table.leftLowerLeg[0]>0,'uneven knees');
+ }
+ const a=fallPose(0),cycle=Array.from({length:50},(_,i)=>fallPose(i/110).leftUpperArm[2]);assert.ok(Math.max(...cycle)-Math.min(...cycle)>10,'the arms flail');
+ for(let t=0;t<1;t+=.01){const f=fallPose(t);assert.ok(f.leftUpperArm[2]<=-24+1e-9&&f.leftUpperArm[2]>=-36-1e-9&&f.rightUpperArm[2]>=24-1e-9,'never raised past 24 degrees below level (skin stretch)');}
+ const half=heldTable({state:'falling',pose:{variant:'tuck',fall:.5}},0,{pitch:30}),tuck=heldTable({state:'dangling',pose:{variant:'tuck'}},0,{pitch:30});assert.ok(Math.abs(half.hips[0]-(tuck.hips[0]+a.hips[0])/2)<1e-9,'fall weights blend from the held pose');
 });

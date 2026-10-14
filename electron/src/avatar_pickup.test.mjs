@@ -192,3 +192,90 @@ test('an arm hanging at her side rolls in toward her body at most 6 degrees; hel
   assert.ok(roll('rightUpperArm')>20,`${label}: the outward arm keeps its lag (${roll('rightUpperArm').toFixed(1)})`);
  }
 });
+
+test('thrown, nothing drives the swing and it relaxes; the shoe tips hand over to the line they stood on in the air; land() plants them and the recovery counts from the contact',()=>{
+ const fixture=rig(),{nodes}=fixture,settings=normalizeProfile({}).pickup,pickup=new AvatarPickup(fixture.vrm,fixture.catalog);
+ // the lowest shoe tip: the toes bone carried on along the foot by 40% (pointed toes put it below the toes bone, so she lands tip first)
+ const tip=side=>{const t=world(nodes.get(side+'Toes')).y,f=world(nodes.get(side+'Foot')).y;return t+.4*(t-f);},toe=()=>Math.min(tip('left'),tip('right')),standing=toe();
+ pickup.start('chest',{x:0,y:0},null);let i=0;for(;i<300;i++){frame(pickup,fixture,settings,carry(i*dt));if(i*dt>.9&&Math.abs(pickup.angle)>20*D)break;}
+ assert.ok(Math.abs(pickup.angle)>20*D,'thrown mid-swing');
+ pickup.release({flight:true});assert.equal(pickup.flying,true);
+ const angles=[];for(let k=0;k<60;k++){frame(pickup,fixture,settings,{ax:20/WPP,vx:3000,ay:2500});angles.push(Math.abs(pickup.angle)/D);}
+ assert.ok(angles.at(-1)<1.5,`the swing relaxed to ${angles.at(-1).toFixed(2)} degrees in 1 s whatever the window does`);
+ assert.ok(Math.abs(pickup.lift.x)<1e-9,'no lift reaction in free fall');
+ // the feet are held clear of the line by half their remaining sideways swing (as after a set-down), so the contact is continuous
+ assert.ok(Math.abs(toe()-standing)<.01,`in the air her shoe tips are ${((toe()-standing)*1000).toFixed(1)} mm from the line they stood on`);
+ for(let k=0;k<60;k++)frame(pickup,fixture,settings,{});assert.ok(Math.abs(toe()-standing)<.003,`and ${((toe()-standing)*1000).toFixed(1)} mm once the legs have settled`);
+ for(let k=0;k<60;k++)frame(pickup,fixture,settings,{});assert.equal(pickup.active,true,'still flying 3 s later: the rig waits for the contact');
+ pickup.land();assert.equal(pickup.flying,false);
+ const squat=new Map([['leftUpperLeg',-22],['rightUpperLeg',-22],['leftLowerLeg',45],['rightLowerLeg',45],['leftFoot',-23],['rightFoot',-23]].map(([bone,degrees])=>[bone,new Quaternion().setFromAxisAngle(new Vector3(1,0,0),degrees*D)]));
+ for(let k=0;k<30;k++)frame(pickup,fixture,settings,{},squat);
+ assert.ok(Math.abs(toe()-standing)<.001,`landed: shoe tips ${((toe()-standing)*1000).toFixed(2)} mm off the floor line`);assert.ok(world(nodes.get('hips')).y<.9-.03,'the knee bend drops her hips');
+ let frames=30;while(pickup.active&&frames<600){frame(pickup,fixture,settings,{});frames++;}
+ assert.ok(frames*dt>=settings.recoverySeconds&&frames*dt<settings.recoverySeconds+1.5,`the rig ended ${(frames*dt).toFixed(2)} s after the contact`);
+});
+
+test('the head look turns the head toward a world point by what the eyes cannot reach, at most 45 degrees of yaw and 30 of pitch, trailing the eyes',()=>{
+ const none=new Map();  // every bone at rest, so the look is all there is
+ const facing=(fixture,version='1')=>{const q=fixture.nodes.get('head').getWorldQuaternion(new Quaternion()),f=new Vector3(0,0,version==='0'?-1:1).applyQuaternion(q);return {yaw:Math.atan2(f.x,f.z)/D,pitch:Math.atan2(-f.y,Math.hypot(f.x,f.z))/D};};
+ const settle=(look,version='1',frames=150,reach)=>{const fixture=rig({version}),settings=normalizeProfile({}).pickup,pickup=new AvatarPickup(fixture.vrm,fixture.catalog);pickup.start('chest',{x:0,y:0},null);
+  const seen=[];for(let i=0;i<frames;i++){frame(pickup,fixture,settings,{look:look(fixture),eyeReach:reach},none);seen.push(facing(fixture,version));}return {fixture,seen,last:seen.at(-1)};};
+ const head=fixture=>world(fixture.nodes.get('head'));
+ let r=settle(f=>head(f).add(new Vector3(10,0,1)));assert.ok(Math.abs(r.last.yaw-45)<1,`far to her left: yaw ${r.last.yaw.toFixed(2)}`);
+ r=settle(f=>head(f).add(new Vector3(0,-10,1)));assert.ok(Math.abs(r.last.pitch-30)<1,`far below: pitch ${r.last.pitch.toFixed(2)}`);
+ r=settle(f=>head(f).add(new Vector3(Math.tan(30*D),0,1)));assert.ok(Math.abs(r.last.yaw-18)<.5,`30 degrees away the head takes 18 and the eyes 12 (${r.last.yaw.toFixed(2)})`);
+ assert.ok(r.seen[5].yaw<.5*18,`after 0.1 s the head has turned only ${r.seen[5].yaw.toFixed(1)} degrees: it trails the eyes`);
+ r=settle(f=>head(f).add(new Vector3(Math.tan(8*D),0,1)));assert.ok(Math.abs(r.last.yaw)<1e-6,'inside the eyes\' reach the head stays');
+ r=settle(f=>head(f).add(new Vector3(Math.tan(30*D),0,1)),'1',150,{yaw:20,pitch:10});assert.ok(Math.abs(r.last.yaw-10)<.5,'eyeReach comes from the model');
+ const vrm0=settle(()=>new Vector3(5,1.42,1),'0');assert.ok(vrm0.last.yaw>30,`a VRM 0.x head turns toward the point too (${vrm0.last.yaw.toFixed(1)})`);
+ const back=settle(f=>head(f).add(new Vector3(10,0,1))),fixture=back.fixture,settings=normalizeProfile({}).pickup,pickup=new AvatarPickup(fixture.vrm,fixture.catalog);pickup.start('chest',{x:0,y:0},null);
+ for(let i=0;i<150;i++)frame(pickup,fixture,settings,{look:null},none);assert.ok(Math.abs(facing(fixture).yaw)<.1,'no look: back to the front');
+});
+
+test('looking at the viewer while the body swings 25 degrees, the head\'s world roll stays within 0.4 of the swing',()=>{
+ const fixture=rig(),{nodes}=fixture,settings=normalizeProfile({}).pickup,pickup=new AvatarPickup(fixture.vrm,fixture.catalog);pickup.start('chest',{x:0,y:0},null);
+ const a=9.8*Math.tan(35*Math.atanh(25/35)*D),viewer=new Vector3(0,1.2,3);
+ for(let i=0;i<240;i++)frame(pickup,fixture,settings,{ax:-a/WPP,look:viewer});
+ const roll=node=>{const q=node.getWorldQuaternion(new Quaternion()),up=new Vector3(0,1,0).applyQuaternion(q);return Math.atan2(-up.x,up.y)/D;};
+ assert.ok(Math.abs(pickup.angle/D-25)<.5);assert.ok(Math.abs(roll(nodes.get('head')))<.4*25,`head roll ${roll(nodes.get('head')).toFixed(1)} against the body's 25`);
+ const f=new Vector3(0,0,1).applyQuaternion(nodes.get('head').getWorldQuaternion(new Quaternion())),toViewer=viewer.clone().sub(world(nodes.get('head'))).normalize();
+ assert.ok(f.angleTo(toViewer)/D<15,`she faces the viewer within the eyes' reach (${(f.angleTo(toViewer)/D).toFixed(1)} degrees off)`);
+});
+
+test('after a flight nothing drives her: the limbs relax onto the body in the air, the floor\'s stop at the contact never kicks the swing, and a short drop hands over to the feet by the contact',()=>{
+ const fixture=rig(),{nodes}=fixture,settings=normalizeProfile({}).pickup,pickup=new AvatarPickup(fixture.vrm,fixture.catalog);
+ const tip=side=>{const t=world(nodes.get(side+'Toes')).y,f=world(nodes.get(side+'Foot')).y;return t+.4*(t-f);},toe=()=>Math.min(tip('left'),tip('right')),standing=toe();
+ pickup.start('chest',{x:0,y:0},null);for(let i=0;i<300;i++){frame(pickup,fixture,settings,carry(i*dt));if(i*dt>.9&&Math.abs(pickup.angle)>20*D)break;}
+ pickup.release({flight:true,seconds:.5});assert.ok(Math.abs(pickup.airFrequency-2)<1e-9,'it relaxes at 1 / 0.5 s');assert.equal(pickup.handover,.35);
+ for(let k=0;k<30;k++)frame(pickup,fixture,settings,{ax:0,vx:1500});
+ assert.ok(Math.abs(pickup.angle)<2*D,`the swing is ${(pickup.angle/D).toFixed(2)} degrees at the contact`);
+ assert.ok(Math.abs(pickup.legs.x)<2*D&&Math.abs(pickup.arms.x)<2*D,`the limbs relaxed onto the body (legs ${(pickup.legs.x/D).toFixed(2)}, arms ${(pickup.arms.x/D).toFixed(2)}), not toward world-down`);
+ pickup.land();const angles=[];frame(pickup,fixture,settings,{ax:-1500*60,vx:0,ay:-2000*60});  // the window stops dead at the contact
+ for(let k=0;k<30;k++){frame(pickup,fixture,settings,{});angles.push(Math.abs(pickup.angle)/D);}
+ assert.ok(Math.max(...angles)<2,`no kick: at most ${Math.max(...angles).toFixed(2)} degrees after the contact`);assert.ok(Math.abs(pickup.lift.x)<1e-9,'and no lift reaction');
+ const short=rig(),hold=new AvatarPickup(short.vrm,short.catalog),shortTip=side=>{const t=world(short.nodes.get(side+'Toes')).y,f=world(short.nodes.get(side+'Foot')).y;return t+.4*(t-f);},shortToe=()=>Math.min(shortTip('left'),shortTip('right')),rest=shortToe();
+ hold.start('chest',{x:0,y:0},null);for(let k=0;k<30;k++)frame(hold,short,settings,{ay:-9000});hold.release({flight:true,seconds:.06});assert.equal(hold.handover,.1);assert.equal(hold.airFrequency,6);
+ hold.land();for(let k=0;k<5;k++)frame(hold,short,settings);  // it touched down at once: the hand's hold lets go within 0.08 s of the contact
+ assert.ok(Math.abs(shortToe()-rest)<1e-6,`a 0.06 s drop: the shoe tips are ${((shortToe()-rest)*1000).toFixed(3)} mm off the line 0.08 s after the contact`);
+ assert.ok(Math.abs(toe()-standing)<.003);
+});
+
+test('the head look aims from where the head shows, with the anchor\'s translation the normalized rig never gets',()=>{
+ const fixture=rig(),pickup=new AvatarPickup(fixture.vrm,fixture.catalog);pickup.start('chest',{x:0,y:0},null);
+ const head=fixture.nodes.get('head'),point=world(head).add(new Vector3(0,.3,1));
+ assert.ok(Math.abs(pickup.aim(head,point).pitch-Math.atan2(-.3,1))<1e-9,'30 cm up at 1 m: 17 degrees up');
+ pickup.offset.set(0,.3,0);assert.ok(Math.abs(pickup.aim(head,point).pitch)<1e-9,'the head shows 30 cm higher: the point is level with it');
+});
+
+test('the plant puts the shoe tip lowest on screen onto the floor line seen through the camera: feet swung toward the camera never dip below it',()=>{
+ const camera=new PerspectiveCamera(30,480/720,.01,100);camera.position.set(0,.9,4);camera.lookAt(0,.9,0);camera.updateMatrixWorld(true);
+ const fixture=rig(),{nodes}=fixture,settings=normalizeProfile({}).pickup,pickup=new AvatarPickup(fixture.vrm,fixture.catalog);
+ const tip=side=>{const t=world(nodes.get(side+'Toes')),f=world(nodes.get(side+'Foot'));return t.clone().add(t.clone().sub(f).multiplyScalar(.4));};
+ const lowest=()=>Math.min(...['left','right'].map(side=>tip(side).project(camera).y)),line=lowest(),standing=Math.min(tip('left').y,tip('right').y);
+ pickup.start('chest',{x:0,y:0},camera);for(let i=0;i<30;i++)frame(pickup,fixture,settings);pickup.release({flight:true,seconds:.3});
+ const lunge=new Map([['leftUpperLeg',-45],['rightUpperLeg',-45],['leftLowerLeg',30],['rightLowerLeg',30]].map(([bone,degrees])=>[bone,new Quaternion().setFromAxisAngle(new Vector3(1,0,0),degrees*D)]));
+ for(let i=0;i<20;i++)frame(pickup,fixture,settings,{},lunge);pickup.land();for(let i=0;i<120;i++)frame(pickup,fixture,settings,{},lunge);
+ assert.equal(pickup.cameraActive,false);assert.ok(Math.abs(lowest()-line)<1e-6,`on screen the tip is ${((lowest()-line)*360).toFixed(3)} px off the line`);
+ const z=Math.max(tip('left').z,tip('right').z);assert.ok(z>.3,'her feet are well in front of her');
+ assert.ok(Math.min(tip('left').y,tip('right').y)>standing+.003,'so in the world they stand a little higher, where the camera sees them on the line');
+});
