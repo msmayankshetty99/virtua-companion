@@ -31,7 +31,7 @@ def resource_estimate(request: ResourceEstimate, backend: Services):
     import os
     import tempfile
     from pathlib import Path
-    from ..resources.vram_estimate import estimate
+    from ..resources.vram_estimate import draft_telemetry, estimate
     from ..configuration.settings_store import LOCK
     store = backend.settings_store()
     with LOCK:
@@ -48,7 +48,7 @@ def resource_estimate(request: ResourceEstimate, backend: Services):
         finally: Path(temporary).unlink(missing_ok=True)
     if 'initiative.context_window_tokens' in request.changes:
         candidate.runtime.initiative_n_ctx = request.changes['initiative.context_window_tokens']
-    projected = estimate(candidate, backend.gpu_monitor.sample(backend.provider()))
+    projected = estimate(candidate, draft_telemetry(backend.gpu_monitor.sample(backend.provider()), backend.config.runtime, candidate.runtime))
     if errors: projected.setdefault('warnings', []).extend('Unsavable draft: ' + value for value in errors.values())
     return {'estimate': projected, 'validation_errors':errors, 'draft': bool(request.changes)}
 

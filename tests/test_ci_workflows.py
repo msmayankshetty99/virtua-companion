@@ -71,7 +71,7 @@ def test_native_smoke_builds_the_release_bridge_for_metal_and_loads_a_pinned_mod
     assert re.search(r'/resolve/[0-9a-f]{40}/[^/]+\.gguf$', job['env']['MODEL_URL']) and re.fullmatch(r'[0-9a-f]{64}', job['env']['MODEL_SHA256'])
     assert 'shasum -a 256 -c' in by_name['Verify the model']['run']
     native = by_name['Native tests']
-    assert {'RIKO_TEST_NATIVE_LIBRARY', 'RIKO_TEST_GGUF'} <= set(native['env']) and native['env']['RIKO_TEST_EXPECT_GPU'] == '1'
+    assert {'RIKO_TEST_NATIVE_LIBRARY', 'RIKO_TEST_GGUF'} <= set(native['env']) and native['env']['RIKO_TEST_EXPECT_GPU'] == '1' and native['env']['RIKO_TEST_EXPECT_DEVICES'] == '1'
     assert native['run'].startswith('python -m pytest -m native ') and 'tests/test_native_smoke.py' in native['run']
     markers = tomllib.loads((ROOT / 'pyproject.toml').read_text(encoding='utf-8'))['tool']['pytest']['ini_options']['markers']
     assert any(marker.startswith('native:') for marker in markers)

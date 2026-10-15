@@ -133,6 +133,7 @@ def test_a_turn_reaches_chat_service_as_a_turn_context(monkeypatch):
         observation = [m.content for m in requests[0] if m.role == 'system' and m.content.startswith('Current runtime observation')]
         assert len(observation) == 1 and '"source": "discord"' in observation[0]  # the session's runtime_snapshot
         assert {'runtime', 'desktop', 'perception'} <= set(captures[0])  # the memory capture records the runtime context
+        assert captures[0]['perception']['idle'] == captures[0]['perception']['active_application'] == 'unavailable'  # no initiative here
         assert 'output' not in submitted and submitted[:2] == ['start', 'input']  # sentences feed Julia as they play, not the stream
     finally: session.close()
 

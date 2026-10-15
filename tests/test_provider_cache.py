@@ -256,3 +256,16 @@ def test_chat_tool_loop_requests_extend_the_previous_one(tmp_path):
     assert len(requests) == 2 and requests[1].get('previous_response_id') == 'resp_tool'
     assert [item['type'] for item in requests[1]['input']] == ['function_call_output']  # only the new tool result is sent
     assert 'Current runtime observation' not in requests[1]['input'][0]['output']  # unchanged state: no second observation
+
+
+def test_runtime_observation_ignores_nested_timestamps_and_idle_seconds_within_a_minute():
+    """initiative's environment (perception.computer) has its own observed_at, and idle time grows on every sample: neither
+    is a state change, so the tool loop does not append an observation per iteration; a new minute of idleness is."""
+    from process.app_core.conversation.chat import observation_state
+    def observed(second, idle):
+        return {'observed_at': f'21:14:{second:02d}', 'runtime': {'listening': True},
+                'perception': {'computer': {'idle_seconds': idle, 'active_app': {'app_name': 'Finder'}, 'observed_at': f'21:14:{second:02d}'}}}
+    assert observation_state(observed(1, 884.9)) == observation_state(observed(3, 886.9))
+    assert observation_state(observed(1, 884.9)) != observation_state(observed(59, 900.1))
+    assert observation_state(observed(1, 5)) != observation_state({**observed(1, 5), 'perception': {'computer': {'idle_seconds': 5, 'active_app': {'app_name': 'Mail'}}}})
+    assert observation_state([{'observed_at': 1, 'a': 2}]) == [{'a': 2}] and observation_state('text') == 'text'

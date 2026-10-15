@@ -144,6 +144,7 @@ def test_runtime_context_refreshes_after_tool_and_includes_outcomes(monkeypatch)
     assert observed[0]['desktop']['whiteboard'][0]['payload']['text'] == 'A current note'
     assert observed[0]['desktop']['actions'][0]['status'] == 'completed'
     assert observed[0]['perception']['screen'] == 'unavailable'
+    assert observed[0]['perception']['idle'] == observed[0]['perception']['active_application'] == 'unavailable'  # no initiative
     session.close()
 
 

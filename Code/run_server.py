@@ -84,10 +84,34 @@ def native_bundle_problems(library, loaded):
             if is_driver(name) or path.resolve().parent != bundle]
 
 
+def native_device_problems(dll):
+    """riko_devices, after riko_create initialised the backends: version 1 JSON listing ggml's devices, the CPU among them
+    (printed with their memory). [] when it does; a bridge without the export is an older riko-native."""
+    import ctypes
+    import json
+    try: devices = dll.riko_devices
+    except AttributeError: return ['riko_devices missing: an older riko-native; rebuild it from this checkout (tools/llama_cpp/README.md)']
+    devices.argtypes, devices.restype = [ctypes.c_char_p, ctypes.c_size_t], ctypes.c_int
+    buffer = ctypes.create_string_buffer(65536)
+    length = devices(buffer, len(buffer))
+    text = buffer.value.decode('utf-8', errors='replace')
+    if not 0 <= length < len(buffer): return [f'riko_devices returned {length}: {text}']
+    try:
+        data = json.loads(text)
+        listed = data['devices'] if isinstance(data, dict) and data.get('version') == 1 and isinstance(data.get('devices'), list) else None
+        if listed is None or not all(isinstance(device, dict) for device in listed): raise ValueError('not a version 1 device list')
+    except ValueError as exc: return [f'riko_devices returned no device list ({exc}): {text[:300]}']
+    print('ggml devices: ' + ', '.join(f'{device.get("name")} ({device.get("description")}, {device.get("type")}, '
+        f'{int(device.get("memory_total") or 0) // 1024 ** 2} MiB)' for device in listed), flush=True)
+    return [] if any(device.get('type') == 'cpu' for device in listed) else ['riko_devices lists no CPU device']
+
+
 def native_release_problems(library, modules=None, system=()):
-    """Why a native bundle cannot ship ([] when it can), loading it as the app does: its five exports; no library it links
-    resolves from outside the bundle (a toolkit, SDK or LD_LIBRARY_PATH users lack) and no NVIDIA driver library loads with
-    it. riko_create, given no arguments, initialises ggml's backends and fails before it reads a model. With modules
+    """Why a native bundle cannot ship ([] when it can), loading it as the app does: its six exports (the app treats
+    riko_devices as optional, for older bridges, but a new bundle must have it); no library it links resolves from outside
+    the bundle (a toolkit, SDK or LD_LIBRARY_PATH users lack) and no NVIDIA driver library loads with it. riko_create, given
+    no arguments, initialises ggml's backends and fails before it reads a model; riko_devices then lists ggml's devices,
+    which must include the CPU. With modules
     (native_backends.backend_modules: GGML_BACKEND_DL), ggml looks for them only beside the executable and in the working
     directory, so a CPU module loaded from the bundle proves that the bridge loads from its own folder; every module there
     must then load with its dependencies from the bundle too, except a dependency matching `system`
@@ -107,6 +131,7 @@ def native_release_problems(library, modules=None, system=()):
         error = ctypes.create_string_buffer(8192)
         if dll.riko_create(b'[]', 0, error, len(error)): problems.append('riko_create accepted empty arguments')
         print(f'riko_create without arguments: {error.value.decode("utf-8", errors="replace")}', flush=True)
+        problems += native_device_problems(dll)
         if modules:
             def module(name): return name == modules['gpu'] or any(fnmatch.fnmatch(name, pattern) for pattern in modules['cpu'])
             loaded = {name for name in loaded_libraries(names) if name in names}
@@ -142,7 +167,7 @@ def release_check(library=None):
     if library:
         backend, library = Path(library).absolute().parent.name, Path(library).resolve()
         problems = native_release_problems(library, backend_modules(backend), system_libraries(backend))
-        if problems: raise SystemExit('The native bundle is not self-contained:\n  ' + '\n  '.join(problems))
+        if problems: raise SystemExit('The native bundle cannot ship:\n  ' + '\n  '.join(problems))
     for module in RELEASE_MODULES + KERNEL_MODULES: importlib.import_module(module)
     core = importlib.import_module('process.app_core')
     for name in core.__all__: getattr(core, name)

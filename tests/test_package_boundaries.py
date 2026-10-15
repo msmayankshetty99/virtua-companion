@@ -33,7 +33,8 @@ EDGES = {
     'inference': {'events': 'lazy', 'kernel': 'load'},
     'integrations': {'audio': 'load', 'desktop': 'lazy', 'events': 'load', 'kernel': 'load', 'persistence': 'load'},
     'persistence': {'emotion': 'lazy', 'events': 'lazy', 'kernel': 'load'},
-    'resources': {'audio': 'lazy', 'events': 'lazy', 'inference': 'load'},
+    # The estimate resolves a torch model's device (kernel/torch_device.py) only when it computes one.
+    'resources': {'audio': 'lazy', 'events': 'lazy', 'inference': 'load', 'kernel': 'lazy'},
     'runtime': {'animation': 'lazy', 'audio': 'load', 'events': 'load', 'kernel': 'load', 'persistence': 'load', 'tools': 'lazy'},
     'tools': {'events': 'load', 'kernel': 'load', 'persistence': 'load'},  # the factory registers the desktop tools
 }

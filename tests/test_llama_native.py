@@ -383,6 +383,105 @@ def test_native_runtime_is_live_from_create_until_destroy(monkeypatch, tmp_path)
     assert native._LIVE == before
 
 
+def device(index, name, backend, kind, device_id=None, total=8 << 30, free=6 << 30, description='Device'):
+    return {'index': index, 'name': name, 'description': description, 'backend': backend, 'type': kind, 'device_id': device_id,
+        'memory_free': free, 'memory_total': total}
+
+
+def devices_library(results, calls):
+    """FakeNativeLibrary with a riko_devices answering each call from `results`: (length, text written)."""
+    library = FakeNativeLibrary(lambda *args: 77)
+    def riko_devices(buffer, capacity):
+        length, text = results.pop(0)
+        calls.append(capacity)
+        if text is not None and (length < 0 or length < capacity): buffer.value = text.encode()
+        return length
+    library.riko_devices = riko_devices
+    return library
+
+
+def test_riko_devices_is_optional_parsed_retried_and_never_runs_at_exit(monkeypatch, tmp_path, caplog):
+    import process.app_core.inference.llama_native as native
+    monkeypatch.setattr(native.ctypes, 'CDLL', lambda path: FakeNativeLibrary(lambda *args: 77))
+    old = native.NativeRuntime(tmp_path / 'riko-native.dll', ['riko-native'])  # a bridge from before riko_devices
+    try: assert old.devices_function is None and old.devices() is None
+    finally: old.close()
+    listed = [device(0, 'CUDA0', 'CUDA', 'gpu', '0000:01:00.0'), device(1, 'CPU', 'CPU', 'cpu', total=64 << 30)]
+    text = json.dumps({'version': 1, 'devices': listed})
+    calls, results = [], []
+    monkeypatch.setattr(native.ctypes, 'CDLL', lambda path: devices_library(results, calls))
+    runtime = native.NativeRuntime(tmp_path / 'riko-native.dll', ['riko-native'])
+    try:
+        assert runtime.devices_function.argtypes == [ctypes.c_char_p, ctypes.c_size_t] and runtime.devices_function.restype is ctypes.c_int
+        results[:] = [(len(text), text)]
+        assert runtime.devices() == listed and calls == [16384]
+        results[:] = [(20000, None), (len(text), text)]  # too long for the first buffer: once more with room for it
+        calls.clear()
+        assert runtime.devices() == listed and calls == [16384, 20256]
+        results[:] = [(-2, 'riko_devices before riko_create')]
+        assert runtime.devices() is None and 'riko_devices' not in caplog.text  # not initialised yet: not a failure
+        for answer in [(-1, 'no backend'), (len('{"version": 2}'), '{"version": 2}'),
+                (len(json.dumps({'version': 1, 'devices': [{**listed[0], 'type': 'tpu'}]})), json.dumps({'version': 1, 'devices': [{**listed[0], 'type': 'tpu'}]}))]:
+            results[:] = [answer]
+            assert runtime.devices() is None
+        assert caplog.text.count('riko_devices failed') == 1 and 'no backend' in caplog.text  # logged once, then quiet
+        monkeypatch.setattr(native, '_EXITING', True)  # _release_at_exit: no call may run into exit()'s static destructors
+        results[:] = [(len(text), text)]
+        assert runtime.devices() is None and results
+    finally: runtime.close()
+    assert runtime.devices() is None  # closed
+
+
+def test_release_at_exit_stops_device_queries_first(monkeypatch):
+    import process.app_core.inference.llama_native as native
+    monkeypatch.setattr(native, '_EXITING', False)
+    monkeypatch.setattr(native, '_LIVE', set())
+    native._release_at_exit()
+    assert native._EXITING is True and not native._DEVICES_LOCK.locked()
+
+
+def test_model_devices_follows_llama_cpp_default_device_selection():
+    # llama_prepare_model_devices (src/llama.cpp at the pin): RPC first, discrete GPUs once per device_id, iGPUs only without
+    # a discrete GPU (and only the first iGPU's backend), CPU and BLAS never; split_mode none keeps devices[main_gpu].
+    from process.app_core.inference.devices import model_devices
+    cuda0, cuda1 = device(0, 'CUDA0', 'CUDA', 'gpu', '0000:02:00.0'), device(1, 'CUDA1', 'CUDA', 'gpu', '0000:01:00.0')
+    vulkan = device(2, 'Vulkan0', 'Vulkan', 'gpu', '0000:01:00.0')  # the same card as CUDA1 through another backend
+    igpu, igpu_vk = device(3, 'Vulkan1', 'Vulkan', 'igpu', '0000:00:02.0'), device(4, 'SYCL0', 'SYCL', 'igpu', '0000:00:02.0')
+    rpc, cpu, blas = device(5, 'RPC0', 'RPC', 'gpu'), device(6, 'CPU', 'CPU', 'cpu'), device(7, 'BLAS', 'BLAS', 'accel')
+    names = lambda chosen: chosen if chosen is None else [d['name'] for d in chosen]
+    every = [cuda0, cuda1, vulkan, igpu, igpu_vk, rpc, cpu, blas]
+    assert names(model_devices(every, split_mode='layer', main_gpu=0)) == ['RPC0', 'CUDA0', 'CUDA1']
+    assert names(model_devices(every, split_mode='none', main_gpu=2)) == ['CUDA1']  # RPC counts in main_gpu's indexing
+    assert names(model_devices([igpu, igpu_vk, cpu], split_mode='layer', main_gpu=0)) == ['Vulkan1']
+    assert names(model_devices([igpu, device(8, 'Vulkan2', 'Vulkan', 'igpu'), cpu], split_mode='layer', main_gpu=0)) == ['Vulkan1', 'Vulkan2']
+    assert names(model_devices([cuda0, igpu, cpu], split_mode='layer', main_gpu=0)) == ['CUDA0']
+    assert names(model_devices([cuda0, device(1, 'CUDA1', 'CUDA', 'gpu'), device(2, 'CUDA2', 'CUDA', 'gpu')], split_mode='layer', main_gpu=0)) == ['CUDA0', 'CUDA1', 'CUDA2']  # no id: never a duplicate
+    assert names(model_devices([cuda0, cpu], split_mode='none', main_gpu=1)) is None  # llama.cpp refuses this main_gpu
+    assert names(model_devices([cpu, blas], split_mode='none', main_gpu=3)) == []  # the CPU only, whatever main_gpu says
+    metal = device(0, 'MTL0', 'MTL', 'gpu', description='Apple M5 Pro')  # Metal reports a gpu, without a PCI id
+    assert names(model_devices([metal, blas, cpu], split_mode='none', main_gpu=0)) == ['MTL0']
+
+
+def test_provider_devices_mark_the_model_and_main_device(tmp_path):
+    from types import SimpleNamespace as NS
+    library = tmp_path / 'riko-native.dll'; library.write_bytes(b'library')
+    provider = InProcessLlamaProvider(RuntimeConfig(provider='llama_cpp', model_path=tmp_path / 'model.gguf', native_library=library, split_mode='layer'))
+    listed = [device(0, 'CUDA0', 'CUDA', 'gpu', '0000:02:00.0'), device(1, 'CUDA1', 'CUDA', 'gpu', '0000:01:00.0'), device(2, 'CPU', 'CPU', 'cpu')]
+    try:
+        assert provider.devices() is None  # before the model loads
+        provider.native = NS(devices=lambda: listed)
+        assert [(d['name'], d['model'], d['main']) for d in provider.devices()] == [('CUDA0', True, False), ('CUDA1', True, False), ('CPU', False, False)]
+        provider.config.split_mode, provider.config.main_gpu = 'none', 1
+        assert [(d['name'], d['model'], d['main']) for d in provider.devices()] == [('CUDA0', False, False), ('CUDA1', True, True), ('CPU', False, False)]
+        provider.config.n_gpu_layers = 0  # no layer offloaded: no device runs the model
+        assert not any(d['model'] or d['main'] for d in provider.devices())
+        provider.native = NS(devices=lambda: None)  # an older bridge
+        assert provider.devices() is None
+    finally:
+        provider.native = None
+        provider.close()
+
+
 def test_release_native_refuses_while_loading_and_waits_for_a_destroy_in_progress(monkeypatch, tmp_path):
     import process.app_core.inference.llama_native as native
     loading, loaded, entered, release = threading.Event(), threading.Event(), threading.Event(), threading.Event()

@@ -7,6 +7,7 @@ checks the ctypes signatures against the C ABI, the slot layout, streaming, canc
         python -m pytest -m native
 
 RIKO_TEST_EXPECT_GPU=1 also requires llama.cpp to have put layers on a GPU, so a silent CPU fallback fails.
+RIKO_TEST_EXPECT_DEVICES=1 requires the bridge's riko_devices export (a bridge built before it passes without).
 """
 import json
 import math
@@ -84,6 +85,13 @@ def test_provider_loads_streams_counts_cancels_and_closes(provider):
     assert props['riko_emotion_probe'] == 'disabled' and props['build_info']
     slots = provider.client.get('/slots').json()
     assert [slot['id'] for slot in slots] == [0, 1] and all(slot['n_ctx'] >= 2048 for slot in slots)
+    devices = provider.devices()  # riko_devices: optional, so an older bridge answers None and telemetry falls back
+    if os.environ.get('RIKO_TEST_EXPECT_DEVICES') == '1': assert devices is not None, 'this bridge has no riko_devices'
+    if devices is not None:
+        assert any(device['type'] == 'cpu' for device in devices), devices
+        if os.environ.get('RIKO_TEST_EXPECT_GPU') == '1':
+            gpus = [device for device in devices if device['type'] in {'gpu', 'igpu'} and device['memory_total'] > 0]
+            assert gpus and any(device['model'] and device['main'] for device in gpus), devices
 
     messages = [ChatMessage('system', 'You are a concise assistant.'), ChatMessage('user', 'Name three colours.')]
     assert 10 < provider.count_tokens(messages) < 200

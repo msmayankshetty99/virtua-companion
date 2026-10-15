@@ -20,6 +20,18 @@ def release_build():
     return build
 
 
+CPU_DEVICE = {'index': 0, 'name': 'CPU', 'description': 'Test CPU', 'backend': 'CPU', 'type': 'cpu', 'device_id': None, 'memory_free': 1 << 30, 'memory_total': 1 << 30}
+
+
+def riko_devices(text=None, result=None):
+    """A fake riko_devices: writes `text` (ggml's device list as the bridge prints it) into the caller's buffer."""
+    data = (text if text is not None else json.dumps({'version': 1, 'devices': [CPU_DEVICE]})).encode()
+    def devices(buffer, capacity):
+        if len(data) < capacity: buffer.value = data
+        return len(data) if result is None else result
+    return devices
+
+
 def test_cmake_source_path_uses_forward_slashes_on_windows():
     source = Path(__file__).resolve().parents[1] / 'tools/release/build.py'
     spec = importlib.util.spec_from_file_location('release_build', source)
@@ -137,6 +149,7 @@ def test_native_release_check_proves_the_bridge_loads_backend_modules_from_its_o
 
     class Bridge:  # riko_create fails on empty arguments once it has loaded the backends
         riko_request = riko_set_interval = riko_stop = riko_destroy = object()
+        riko_devices = staticmethod(riko_devices())
         def __init__(self, created):
             def riko_create(arguments, interval, error, capacity):
                 assert arguments == b'[]' and interval == 0 and capacity == len(error)
@@ -166,6 +179,24 @@ def test_native_release_check_proves_the_bridge_loads_backend_modules_from_its_o
     monkeypatch.setattr(ctypes, 'CDLL', lambda path: Bridge({}))
     loaded.clear(); loaded['libriko-native.so'] = library
     assert run_server.native_release_problems(library, None) == []  # linked backends (Metal): no module expectations
+
+
+def test_native_release_check_requires_riko_devices_and_a_cpu_device(capsys):
+    # The app treats riko_devices as optional (an older bridge lacks it), but a bundle built from this checkout must have it.
+    import ctypes
+    class Bridge: pass
+    assert run_server.native_device_problems(Bridge()) == ['riko_devices missing: an older riko-native; rebuild it from this checkout (tools/llama_cpp/README.md)']
+    def check(function):
+        bridge = Bridge(); bridge.riko_devices = function
+        return run_server.native_device_problems(bridge)
+    gpu = {**CPU_DEVICE, 'index': 1, 'name': 'MTL0', 'description': 'Apple M5 Pro', 'backend': 'MTL', 'type': 'gpu', 'memory_total': 38339 * 1024 ** 2}
+    assert check(riko_devices(json.dumps({'version': 1, 'devices': [gpu, CPU_DEVICE]}))) == []
+    assert 'ggml devices: MTL0 (Apple M5 Pro, gpu, 38339 MiB), CPU (Test CPU, cpu, 1024 MiB)' in capsys.readouterr().out
+    assert check(riko_devices(json.dumps({'version': 1, 'devices': [gpu]}))) == ['riko_devices lists no CPU device']
+    assert check(riko_devices('not json'))[0].startswith('riko_devices returned no device list')
+    assert check(riko_devices(json.dumps({'version': 2, 'devices': []})))[0].startswith('riko_devices returned no device list (not a version 1')
+    assert check(riko_devices('backends failed', -1)) == ['riko_devices returned -1: backends failed']
+    assert check(riko_devices('', -2)) == ['riko_devices returned -2: ']  # riko_create had not initialised the backends
 
 
 def test_loaded_libraries_finds_this_process_system_library():
@@ -528,6 +559,7 @@ def test_release_check_accepts_a_missing_system_library_only_where_the_manifest_
 
     class Bridge:  # riko_create loads the CPU module ggml picked; ggml-hip's ROCm is missing
         riko_request = riko_set_interval = riko_stop = riko_destroy = object()
+        riko_devices = staticmethod(riko_devices())
         def __init__(self): self.riko_create = lambda arguments, interval, error, capacity: loaded.update({'libggml-cpu-haswell.so': bundle / 'libggml-cpu-haswell.so'})
     def load(path, missing='libamdhip64.so.7'):
         if Path(path) == library: return Bridge()

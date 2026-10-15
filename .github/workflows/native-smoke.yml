@@ -116,4 +116,5 @@ jobs:
           RIKO_TEST_NATIVE_LIBRARY: ${{ runner.temp }}/native/metal/libriko-native.dylib
           RIKO_TEST_GGUF: ${{ env.MODEL }}
           RIKO_TEST_EXPECT_GPU: '1'
+          RIKO_TEST_EXPECT_DEVICES: '1'   # the bridge built here has riko_devices
         run: python -m pytest -m native -v -rs --timeout=600 tests/test_native_smoke.py

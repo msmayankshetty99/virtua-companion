@@ -40,6 +40,20 @@ driver, no Vulkan loader, or no ROCm runtime for `ggml-hip`), it logs a
 notes. A build that links its backends (the default, and the Metal bundle) is
 unaffected.
 
+`riko_devices(buffer, capacity)` writes ggml's devices into the caller's buffer as
+`{"version":1,"devices":[{"index","name","description","backend","type","device_id","memory_free","memory_total"}]}`
+(memory in bytes, `type` one of cpu/gpu/igpu/accel/other, `device_id` the PCI bus
+id or null) and returns the JSON's length; a result of `capacity` or more means the
+buffer was too small and nothing was written, `-2` that no `riko_create` has run in
+this process yet (that call initialises the backends, so its log scope keeps their
+warnings), and `-1` a failure with its message in the buffer. It is safe from any
+thread once initialised, also while contexts load or run: it asks each device for
+its memory as llama.cpp's own load does (`cudaMemGetInfo`/`hipMemGetInfo`, Vulkan's
+memory budget, or Metal's recommended working set, whose free figure counts only
+this process's Metal allocations). The app treats it as optional, so an older
+bridge with the first five exports still loads and GPU telemetry falls back to
+other sources; the release check requires it and a CPU device in its list.
+
 Windows NVCC can repeatedly warn #221 when MSVC expands the upstream `INFINITY`
 max-reduction sentinel. Release CUDA builds suppress that diagnostic through
 `--diag-suppress=221`, without changing the sentinel or disabling other diagnostic

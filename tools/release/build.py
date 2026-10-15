@@ -230,7 +230,8 @@ def smoke_bundle(backend, checkout, destination):
 def check_bundle(library):
     """`build.py --check-bundle <native/<backend>/library>`: the release check's native half (run_server.native_release_problems)
     on a bundle, without the frozen app, where the backend's system libraries are installed (ROCm in the hip container), so
-    they must load too: the exports, a CPU module from the bundle, every module with its dependencies, no foreign copy."""
+    they must load too: the exports (riko_devices and its device list included), a CPU module from the bundle, every module
+    with its dependencies, no foreign copy."""
     library, shipped, name = Path(library).resolve(), native.backends_for(sys.platform), native.library_name(sys.platform)
     backend = library.parent.name
     if backend not in shipped or library.name != name: raise SystemExit(f'{library} is not a native/<{"|".join(shipped)}>/{name} bundle')
@@ -238,7 +239,7 @@ def check_bundle(library):
     server = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(server)
     problems = server.native_release_problems(library, native.backend_modules(backend))
-    if problems: raise SystemExit('The native bundle is not self-contained:\n  ' + '\n  '.join(problems))
+    if problems: raise SystemExit('The native bundle cannot ship:\n  ' + '\n  '.join(problems))
     print('RIKO_BUNDLE_CHECK_OK', flush=True)
 
 

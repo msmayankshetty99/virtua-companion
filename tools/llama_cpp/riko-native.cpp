@@ -13,6 +13,7 @@
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -221,6 +222,28 @@ void riko_error(char * error, size_t capacity, const std::string & message) {
     error[length] = 0;
 }
 
+// ggml's backends initialise once per process, inside the first riko_create (successful or not), so its log scope keeps
+// their warnings (riko_load_backends' "no GPU device"). riko_devices only reads what this set up.
+std::once_flag riko_initialized;
+std::atomic<bool> riko_ready{false};
+
+void riko_init() {
+    std::call_once(riko_initialized, []() {
+        common_init(); llama_log_set(riko_log_callback, nullptr); riko_load_backends(); llama_backend_init();
+        riko_ready.store(true);
+    });
+}
+
+const char * riko_device_type(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:   return "cpu";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:   return "gpu";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:  return "igpu";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "accel";
+        default:                             return "other";
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -231,8 +254,7 @@ RIKO_EXPORT void * riko_create(const char * arguments, int interval, char * erro
         if (!arguments) {
             throw std::runtime_error("missing native arguments");
         }
-        static std::once_flag initialized;
-        std::call_once(initialized, []() { common_init(); llama_log_set(riko_log_callback, nullptr); riko_load_backends(); llama_backend_init(); });
+        riko_init();
         const auto input = json::parse(arguments);
         if (!input.is_array() || input.empty() || input.size() > 256) {
             throw std::runtime_error("invalid native arguments");
@@ -350,6 +372,46 @@ RIKO_EXPORT void riko_stop(void * handle) {
 
 RIKO_EXPORT void riko_destroy(void * handle) {
     delete static_cast<riko_runtime *>(handle);
+}
+
+// ggml's devices, NUL-terminated in the caller's buffer, as {"version":1,"devices":[{"index":i,"name":"CUDA0",
+// "description":"NVIDIA GeForce RTX 4090","backend":"CUDA","type":"cpu|gpu|igpu|accel|other","device_id":"0000:01:00.0"|null,
+// "memory_free":bytes,"memory_total":bytes}]}. Returns the JSON's length; a result >= capacity means the buffer was too small
+// and nothing was written (call again with a larger one). -2: no riko_create has run in this process yet (it initialises the
+// backends); -1: a failure, its message in the buffer. Any thread, any time after that, also while contexts load, run or are
+// destroyed: the registry is fixed once initialised, and each device reports its memory as llama.cpp's own load asks for it
+// (cudaMemGetInfo/hipMemGetInfo, Vulkan's memory budget, Metal's working set, which counts this process's allocations only).
+RIKO_EXPORT int riko_devices(char * buffer, size_t capacity) {
+    try {
+        if (!riko_ready.load()) {
+            riko_error(buffer, capacity, "riko_devices before riko_create: the backends are not initialised");
+            return -2;
+        }
+        json devices = json::array();
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t device = ggml_backend_dev_get(i);
+            ggml_backend_dev_props props{};
+            ggml_backend_dev_get_props(device, &props);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+            devices.push_back({{"index", i}, {"name", props.name ? props.name : ""}, {"description", props.description ? props.description : ""},
+                {"backend", reg ? ggml_backend_reg_name(reg) : ""}, {"type", riko_device_type(props.type)},
+                {"device_id", props.device_id ? json(props.device_id) : json(nullptr)},
+                {"memory_free", (unsigned long long) props.memory_free}, {"memory_total", (unsigned long long) props.memory_total}});
+        }
+        const std::string text = json{{"version", 1}, {"devices", devices}}.dump_safe(); // a driver's description in a legacy code page must not fail the call
+        if (text.size() > (size_t) std::numeric_limits<int>::max()) throw std::runtime_error("device list too large");
+        if (buffer && text.size() < capacity) {
+            std::memcpy(buffer, text.data(), text.size());
+            buffer[text.size()] = 0;
+        }
+        return (int) text.size();
+    } catch (const std::exception & exception) {
+        riko_error(buffer, capacity, exception.what());
+        return -1;
+    } catch (...) {
+        riko_error(buffer, capacity, "unknown native device failure");
+        return -1;
+    }
 }
 
 }

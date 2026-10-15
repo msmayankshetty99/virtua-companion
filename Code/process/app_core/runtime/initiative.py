@@ -3,12 +3,12 @@ from copy import deepcopy
 from datetime import datetime
 import json
 import math
-import os
 import re
 import threading
 import time
 from ..kernel.workers import DaemonExecutor
 
+from .activity import ActivityUnsupported, WindowsActivity, activity_adapter, capability  # noqa: F401 (WindowsActivity: its old home)
 from ..events.bus import event_bus
 from ..kernel.background_budget import validate_budget
 from ..kernel.messages import ChatMessage, conversation_sections
@@ -46,7 +46,13 @@ def effective_budgets(config, values):  # Settings shows the budgets in force: i
 BUDGET = dict(group='models', section='Token budgets', live='initiative_budgets')  # applied to the running initiative; the KV pool needs a restart
 SETTINGS = register(Section('initiative', group='initiative', title='Settings', strict=True, check=yaml_settings, review=review_budgets,
     effective=effective_budgets, settings=(
-        Setting('enabled', False), Setting('observe_idle', False), Setting('observe_active_app', False),
+        Setting('enabled', False),
+        Setting('observe_idle', False, label='Computer idle awareness',
+            help='Seconds since the last keyboard or mouse input (never which keys): Windows, macOS, and Linux desktops with GNOME '
+                 'Mutter or org.freedesktop.ScreenSaver.'),
+        Setting('observe_active_app', False, label='Foreground app awareness',
+            help='Windows: the foreground window title and process ID. macOS: the frontmost app name and process ID (no window '
+                 'titles). Linux: the active X11 window title and app; not available on Wayland. Shared with the model provider.'),
         Setting('max_output_tokens', 1024, range=(1, 1048575), **BUDGET,
             help='Output budget including reasoning. Invalid/empty/truncated decisions fail the attempt; no repair inference.'),
         Setting('context_window_tokens', 4096, range=(256, 1048576), **BUDGET,
@@ -54,6 +60,7 @@ SETTINGS = register(Section('initiative', group='initiative', title='Settings', 
         Setting('interval_seconds', 120), Setting('idle_seconds', 300), Setting('cooldown_seconds', 300),
         Setting('spoken_enabled', False), Setting('allow_urgent_spoken', False), Setting('rules', DEFAULT_RULES))))
 DEFAULTS = SETTINGS.defaults()
+FIELDS = {'idle': ('observe_idle', 'Idle awareness'), 'active_app': ('observe_active_app', 'App awareness')}  # adapter field: setting, label
 
 
 class InitiativeDecisionError(ValueError):
@@ -92,42 +99,10 @@ def parse_decision(response):
     return proposal
 
 
-class WindowsActivity:
-    """Read OS idle time and foreground-app metadata; never hook input or images."""
-    def sample(self, *, idle=False, active_app=False):
-        if os.name != 'nt': raise RuntimeError('Computer awareness currently supports Windows only')
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.WinDLL('user32', use_last_error=True)
-        result = {}
-        if idle:
-            class LastInput(ctypes.Structure):
-                _fields_ = [('cbSize', wintypes.UINT), ('dwTime', wintypes.DWORD)]
-            info = LastInput()
-            info.cbSize = ctypes.sizeof(info)
-            if not user32.GetLastInputInfo(ctypes.byref(info)): raise ctypes.WinError(ctypes.get_last_error())
-            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-            kernel32.GetTickCount.restype = wintypes.DWORD
-            result['idle_seconds'] = ((kernel32.GetTickCount() - info.dwTime) & 0xffffffff) / 1000
-        if active_app:
-            user32.GetForegroundWindow.restype = wintypes.HWND
-            user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-            user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-            handle = user32.GetForegroundWindow()
-            title = ctypes.create_unicode_buffer(user32.GetWindowTextLengthW(handle) + 1)
-            user32.GetWindowTextW(handle, title, len(title))
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
-            # Title + process ID avoids inspecting process contents or requiring privileges.
-            result['active_app'] = {'window_title': title.value, 'process_id': pid.value}
-        return result
-
-
 class Initiative:
     def __init__(self, session, *, adapter=None, triggers=None, start_worker=True):
         self.session = session
-        self.adapter = adapter or WindowsActivity()
+        self.adapter = adapter or activity_adapter()  # runtime/activity.py: this OS's adapter, or NullActivity
         self.path = session.config.paths.initiative_settings
         self.lock = threading.RLock()
         self.wake = threading.Event()
@@ -137,7 +112,8 @@ class Initiative:
                          'user.custom': 'Custom user event', 'task.changed': 'Task changes'}
         self.triggers.update(triggers or {})
         self.environment = {}
-        self.error = ''
+        self.field_status = dict.fromkeys(FIELDS, 'waiting')  # per awareness field: waiting | available | error | unsupported
+        self.error = self.sample_error = ''
         self.busy = False
         self.pending = {}
         self.last_sample, self.last_tick = 0.0, time.monotonic()
@@ -206,7 +182,8 @@ class Initiative:
             self.settings = settings
             self.version += 1
             self.environment = {}
-            self.error = ''
+            self.error = self.sample_error = ''
+            self.field_status = dict.fromkeys(FIELDS, 'waiting')
             self.pending.clear()
             self.was_idle = self.app_identity = None
             self.task_version = None
@@ -216,11 +193,33 @@ class Initiative:
         event_bus.publish('initiative.settings', enabled=settings['enabled'])
         return self.snapshot()
 
+    def capabilities(self):
+        """What this OS's adapter can observe: {field: {supported, reason, ...}} (static checks, cached by the adapter)."""
+        try: found = self.adapter.capabilities()
+        except Exception as exc: found = {}; reason = str(exc) or type(exc).__name__
+        else: reason = 'not reported by this adapter'
+        return {field: deepcopy(found[field]) if isinstance(found.get(field), dict) else capability(False, reason) for field in FIELDS}
+
+    def observed_fields(self, settings, capabilities=None):
+        """The awareness fields the user allowed and this OS supports: the only ones poll samples."""
+        capabilities = capabilities or self.capabilities()
+        return [field for field, (setting, _) in FIELDS.items() if settings['enabled'] and settings[setting] and capabilities[field]['supported']]
+
+    def perception(self, capabilities=None):
+        """Per field, from the last sample rather than the settings: off, unsupported, waiting, available or error."""
+        capabilities = capabilities or self.capabilities()
+        with self.lock:
+            return {field: 'off' if not (self.settings['enabled'] and self.settings[setting]) else
+                    'unsupported' if not capabilities[field]['supported'] or self.field_status[field] == 'unsupported' else self.field_status[field]
+                    for field, (setting, _) in FIELDS.items()}
+
     def snapshot(self):
+        capabilities = self.capabilities()
+        perception = self.perception(capabilities)
         with self.lock:
             return {'settings': deepcopy(self.settings), 'environment': deepcopy(self.environment),
                     'triggers': [{'event': event, 'description': description} for event, description in self.triggers.items()],
-                    'busy': self.busy, 'error': self.error,
+                    'busy': self.busy, 'error': self.error, 'capabilities': capabilities, 'perception': perception,
                     'last_check': self.last_check, 'last_decision': deepcopy(self.last_decision)}
 
     def _on_event(self, event):
@@ -264,18 +263,23 @@ class Initiative:
                 if self.task_version is not None and task_version != self.task_version:
                     event_bus.publish('task.changed', external=True, change_version=task_version)
                 self.task_version = task_version
-            observation = {}
-            previous_error = self.error
-            if settings['observe_idle'] or settings['observe_active_app']:
+            observation, statuses, errors = {}, {}, []
+            for field in self.observed_fields(settings):  # one call per field, so each gets its own status
                 try:
-                    observation = self.adapter.sample(idle=settings['observe_idle'], active_app=settings['observe_active_app'])
-                    with self.lock: self.error = ''
+                    observation.update(self.adapter.sample(**{field: True}))
+                    statuses[field] = 'available'
+                except ActivityUnsupported: statuses[field] = 'unsupported'  # this desktop cannot answer: not an error
                 except Exception as exc:
-                    with self.lock: self.error = str(exc)
+                    statuses[field] = 'error'
+                    errors.append(f'{FIELDS[field][1]}: {str(exc) or type(exc).__name__}')
             with self.lock:
                 if version != self.version: return
+                previous_error, previous_status = self.error, dict(self.field_status)
+                if errors or self.error == self.sample_error: self.error = '; '.join(errors)  # a decision's error stays until replaced
+                self.sample_error = '; '.join(errors)
+                self.field_status.update(statuses)
                 previous = {k:v for k,v in self.environment.items() if k != 'observed_at'}
-                observation_changed = observation != previous or previous_error != self.error
+                observation_changed = observation != previous or previous_error != self.error or previous_status != self.field_status
                 self.environment = {**observation, 'observed_at': datetime.now().astimezone().isoformat(timespec='seconds')}
                 transitions = []
                 if 'idle_seconds' in observation:
@@ -313,7 +317,8 @@ class Initiative:
         if now - self.last_evaluation < min(settings['interval_seconds'], 30): return False
         if now - self.last_presented < settings['cooldown_seconds'] or now - self.rule_last.get(rule['id'], float('-inf')) < rule.get('cooldown_seconds', 0): return False
         if rule.get('min_idle_seconds', 0) and environment.get('idle_seconds', -1) < rule['min_idle_seconds']: return False
-        if rule.get('app_contains') and rule['app_contains'].casefold() not in environment.get('active_app', {}).get('window_title', '').casefold(): return False
+        app = environment.get('active_app') or {}
+        if rule.get('app_contains') and not any(rule['app_contains'].casefold() in str(app.get(key) or '').casefold() for key in ('window_title', 'app_name')): return False
         revision = status.interaction_revision
         self.last_evaluation = now
         with self.lock:
@@ -413,7 +418,7 @@ class Initiative:
                 deadlines = [self.last_tick + self.settings['interval_seconds']] if self.settings['enabled'] else []
                 task_store = self.session.chat.deps.task_store
                 external_tasks = task_store and not getattr(task_store, 'events_managed', False)
-                if self.settings['enabled'] and (self.settings['observe_idle'] or self.settings['observe_active_app'] or external_tasks):
+                if self.settings['enabled'] and (external_tasks or self.observed_fields(self.settings)):  # only fields this OS supports
                     deadlines.append(self.last_sample + 2)
                 now = time.monotonic()
             self.wake.wait(max(.01, min(deadlines) - now) if deadlines else None)

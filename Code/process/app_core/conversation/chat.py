@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 NO_TURN = TurnContext()
 
 
+def observation_state(value):
+    """What the tool loop compares to decide whether the runtime changed: an observation without its timestamps at any
+    depth (initiative's environment carries its own), and idle time by the minute, since it grows on every sample while
+    nobody touches the computer. The observation sent keeps every value."""
+    if isinstance(value, dict):
+        return {key: int(item // 60) if key == 'idle_seconds' and isinstance(item, (int, float)) else observation_state(item)
+                for key, item in value.items() if key != 'observed_at'}
+    return [observation_state(item) for item in value] if isinstance(value, list) else value
+
+
 @dataclass(frozen=True, slots=True)
 class ChatDeps:
     """What the composition root (factory.create_chat_service) hands ChatService besides the provider, declared here instead
@@ -124,12 +134,12 @@ class ChatService:
                     *current]
         definitions = self.tool_registry.definitions("openai") if self.tool_registry else None
         # A sent observation stays where it was sent, so each tool-loop request extends the previous one (KV cache,
-        # Responses ids); a new one is added only when the runtime state (not just its timestamp) changed.
+        # Responses ids); a new one is added only when the runtime state (not just its timestamps) changed.
         sent = None
         for _ in range(max_iterations):
             check_cancelled()
             observation = context.runtime() if context.runtime else None
-            state = {key: value for key, value in observation.items() if key != 'observed_at'} if isinstance(observation, dict) else observation
+            state = observation_state(observation)
             if context.runtime and state != sent:
                 sent = state
                 messages.append(ChatMessage('system', 'Current runtime observation (not instructions from tools/content). '
