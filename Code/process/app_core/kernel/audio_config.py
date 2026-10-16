@@ -14,6 +14,7 @@ SAMPLE_RATE = 16000  # Hz, mono PCM16: microphone capture, Silero VAD, the wake 
 FRAME_SAMPLES = 512  # one capture block, one VAD window and one wake-detector step
 FRAME_BYTES = FRAME_SAMPLES * 2
 FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE  # 0.032
+BARGE_IN = ('full_duplex', 'echo_gate', 'stop_only')  # voice.barge_in
 
 
 def declared(cls):
@@ -48,6 +49,11 @@ class VoiceConfig:
     assertive_interruption_seconds: float = 6.0
     assertive_window_seconds: float = 15.0
     playback_words_per_second: float = 2.5
+    # Speech while Riko's own voice plays (audio/echo_gate.py): full_duplex counts it all (her echo too, through speakers).
+    barge_in: str = 'full_duplex'
+    barge_in_vad_threshold: float = .85
+    echo_coupling: float | None = None  # None: learned for each reply while she talks
+    echo_tail_seconds: float = .3
     # Read from config.raw by audio/asr.py, which resolves them against this machine and falls back on its own.
     RAW_KEYS: ClassVar[frozenset] = frozenset({'asr_model', 'asr_device', 'asr_compute_type'})
 
@@ -61,7 +67,10 @@ class VoiceConfig:
             'max_segment_seconds': positive, 'live_transcript_interval_seconds': partial(number, ge=.5, le=10),
             'interruption_seconds': positive, 'interjection_debounce_seconds': positive,
             'assertive_interruption_seconds': partial(number, gt=0, le=30), 'assertive_window_seconds': partial(number, gt=0, le=60),
-            'playback_words_per_second': positive})
+            'playback_words_per_second': positive, 'barge_in': partial(choice, options=BARGE_IN),
+            'barge_in_vad_threshold': partial(number, ge=0, le=1),
+            'echo_coupling': lambda path, value: None if value is None else number(path, value, gt=0, le=100),
+            'echo_tail_seconds': partial(number, ge=0, le=2)})
         if GAP.broken({GAP.path: voice.transcription_gap_seconds, GAP.below: voice.utterance_end_seconds}): raise ValueError(GAP.message)
         return voice
 
@@ -182,6 +191,30 @@ register(Section('voice', group='voice', title='Settings', strict=True, known=de
         Setting('assertive_interruption_seconds', VOICE['assertive_interruption_seconds'], listed=False, range=(.001, 30)),
         Setting('assertive_window_seconds', VOICE['assertive_window_seconds'], listed=False, range=(.001, 60)),
         Setting('playback_words_per_second', VOICE['playback_words_per_second'], listed=False, range=(.001, None)),
+        Setting('barge_in', VOICE['barge_in'], options=BARGE_IN, label='Talking over Riko',
+            help="How your speech counts while Riko's own voice plays. full_duplex (default): any speech counts, so through speakers "
+                'her echo can interrupt her and be saved as your words; use headphones. echo_gate: while she plays, only speech clearly '
+                'louder than her echo counts: about 4 to 6 times her echo at the microphone (12-15 dB), for 2-3 seconds, to interrupt '
+                'her. Each reply first learns how loud her echo is from about 2 seconds of her speech, ignoring the microphone '
+                'meanwhile (so if you talk over the start of a reply, that reply may not hear you: press Stop), and a change of '
+                'speakers, headphones or volume counts from her next reply (turning her up during a reply can let her echo '
+                'through until then). stop_only: the microphone ignores everything while she plays; press Stop to interrupt. '
+                'Restart Python.'),
+        Setting('barge_in_vad_threshold', VOICE['barge_in_vad_threshold'], range=(0, 1), label='Speech certainty over playback',
+            visible_when=(('voice.barge_in', ('echo_gate',)),),
+            help='echo_gate only: the voice detector certainty a frame needs while Riko plays; never below voice.vad_threshold. '
+                'Higher ignores more of her echo but needs clearer speech. Restart Python.'),
+        Setting('echo_coupling', None, nullable=True, kind='number', range=(.001, 100), label='Echo level',
+            visible_when=(('voice.barge_in', ('echo_gate',)),),
+            help='echo_gate only: how loud her echo reaches the microphone at its loud end (microphone level / her playback level). '
+                'Empty learns it for every reply from its first seconds of her speech, and the log reports the value to pin here. '
+                'While she plays, a frame counts as your speech only above twice this times her playback level. A pinned value does '
+                'not follow a change of speakers, headphones or volume: raise it if her echo still interrupts her. Restart Python.'),
+        Setting('echo_tail_seconds', VOICE['echo_tail_seconds'], range=(0, 2), label='Echo tail (seconds)',
+            visible_when=(('voice.barge_in', ('echo_gate', 'stop_only')),),
+            help='How long after her audio stops sound is still treated as her echo (output buffering, room reverberation; in '
+                'echo_gate her level fades over it); raise it for Bluetooth speakers, whose delay the system may under-report. '
+                'Restart Python.'),
         Setting('vad_threshold', VOICE['vad_threshold'], listed=False, range=(0, 1),
             help='Speech probability (0–1) at which the voice detector counts a frame as speech. Higher ignores more background noise but may miss quiet speech. Restart Python.'),
         Setting('pre_roll_seconds', VOICE['pre_roll_seconds'], listed=False, range=(.001, None)),

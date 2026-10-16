@@ -7,9 +7,11 @@ from dataclasses import asdict
 from functools import cache
 import json
 import math
+import re
 
 from ..kernel import schema
 from ..kernel.background_budget import validate_budget
+from ..kernel.model_pins import JULIA_REVISION, commit
 from ..kernel.schema import MISSING, Section, Setting, dataclass_defaults, register
 from ..kernel.validation import section, unknown
 
@@ -25,7 +27,14 @@ BLANK = Setting('')
 def check_memory(memory):
     memory = section('memory', memory)
     validate_budget(memory.get('reflection_context_window_tokens', 4096), memory.get('reflection_max_output_tokens', 1024), 'reflection')
+    commit('memory.system1_revision', memory.get('system1_revision', JULIA_REVISION))
     return memory
+
+
+def check_emotion(emotion):
+    emotion = section('emotion', emotion)
+    commit('emotion.revision', emotion.get('revision', JULIA_REVISION))
+    return emotion
 
 
 def check_tools(tools):
@@ -34,6 +43,9 @@ def check_tools(tools):
     for key, default in (('best_fit_timeout_seconds', .4), ('best_fit_min_confidence', .85)):
         value, (low, high) = tools.get(key, default), schema.REGISTRY.setting(f'tools.{key}').range
         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high: raise ValueError(f'tools.{key} must be between {low} and {high}')
+    disabled = tools.get('disabled') or []  # tool names as the model calls them (tools/tool.py NAME)
+    if not isinstance(disabled, list) or not all(isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name) for name in disabled):
+        raise ValueError('tools.disabled must be a list of tool names (letters, digits, _ or -)')
     return tools
 
 
@@ -50,6 +62,9 @@ def without_probe(config, values): values.pop('emotion.probe', None)  # emotion.
 MODELS = dict(group='models')
 TOKENS, BACKGROUND, EMBEDDING = (dict(MODELS, section=name) for name in ('Token budgets', 'Background models', 'Embedding model'))
 RESTART_PYTHON = ' Restart Python to apply.'
+JULIA_REVISION_HELP = ('The Hugging Face commit of {model} to download and run. Julia-1 ships Python code that runs inside Riko, so this is '
+    'a full 40-character commit hash, never a branch: a new upstream commit changes nothing until you change this. The default is '
+    'the commit this version checks file by file; another commit\'s code runs unverified.{extra} Restart Python.')
 register(
     # The top level: what no section declares is character text, edited until Python restarts.
     Section('', group='character', title='Settings', restart='python', advanced=False, settings=(
@@ -63,21 +78,27 @@ register(
         Setting('reflection_context_window_tokens', range=(256, 1048576), **TOKENS,
             help='Total reflection context including evidence/instructions/output. Optional related evidence and formation history are token-trimmed; required focal content stays.'),
         Setting('system1_enabled', **BACKGROUND), Setting('system1_model_id', **BACKGROUND), Setting('system1_cache_dir', nullable=True, **BACKGROUND),
+        Setting('system1_revision', kind='text', quoted=True, label='Julia-1 revision', **BACKGROUND,
+            help=JULIA_REVISION_HELP.format(model='memory.system1_model_id', extra='')),
         Setting('system1_max_length', **TOKENS),
         Setting('device', options=(*DEVICES, 'mps'), label='Memory model device', **BACKGROUND,
             help='Device for the memory classifier (Julia-1) and the embedding model. CPU by default. auto picks CUDA, then Apple MPS, then CPU. The classifier stays on CPU under MPS; embeddings can use it. GPU use competes with the main model for memory, and a GPU that fails to load falls back to CPU. Restart Python.'),
         Setting('embeddings_enabled', **EMBEDDING), Setting('embedding_model', **EMBEDDING), Setting('embedding_dimension', **EMBEDDING),
         Setting('minimum_importance', range=(0, 1)), Setting('index_file', obsolete=True))),  # FAISS is gone; the index is rebuilt in memory
-    Section('emotion', group='models', title='Emotion model', effective=without_probe, settings=(
+    Section('emotion', group='models', title='Emotion model', check=check_emotion, effective=without_probe, settings=(
         Setting('device', options=DEVICES, label='Julia-1 compute device',
             help='Julia-1 teacher device: CPU by default, keeping GPU memory for the main model. CUDA is opt-in and needs a GPU build of torch (ROCm builds also report cuda); auto uses it when available. Julia does not support Apple MPS yet, so Macs use CPU. A GPU that fails to load falls back to CPU. The latent probe always runs on CPU. Restart Python.'),
         Setting('model_path', nullable=True), Setting('cache_dir', nullable=True),
+        Setting('revision', kind='text', quoted=True, label='Julia-1 revision',
+            help=JULIA_REVISION_HELP.format(model='emotion.model_id', extra=' Ignored when emotion.model_path exists.')),
         Setting('temperature', hidden=True), Setting('pause_during_inference', obsolete=True))),
     Section('tools', group='tools', title='Settings', check=check_tools, settings=(
         Setting('require_approval', help='Default for new/unconfigured tools. Per-tool live permissions override this default; approval bubbles expire after two minutes without executing.'),
         Setting('best_fit_inputs', help='Correct finite-choice desktop inputs before approval. Reuses the enabled, already-loaded CPU Julia model; safe spelling normalization is the fallback. Never repairs file permissions, numeric values or arbitrary paths.'),
         Setting('timeout_seconds', range=(.1, 3600)), Setting('max_iterations', range=(1, 100)),
-        Setting('best_fit_timeout_seconds', range=(.05, 2)), Setting('best_fit_min_confidence', range=(.5, 1)))),
+        Setting('best_fit_timeout_seconds', range=(.05, 2)), Setting('best_fit_min_confidence', range=(.5, 1)),
+        Setting('disabled', [], label='Disabled tools',
+            help='JSON list of tool names Riko never sees or calls, e.g. ["pdf_extractor", "todo_list"]. Each tool\'s description is part of every prompt, so fewer tools mean faster replies. Restart Python.'))),
     Section('tasks', group='tools', title='Settings'),
     Section('logging', group='performance', title='Debug logging', settings=(
         Setting('file_enabled', True, label='Write debug log file',
@@ -200,10 +221,21 @@ def restart_scope(path): return resolve(path, 'restart') or 'python'
 def quoted(path): return setting(path).quoted
 
 
+SECRET = re.compile(r'(?i)(^|_)(api_key|token|password|passphrase|secret)$')
+
+
+def secret(path):
+    """Whether a setting holds a credential, by its last name (api_key, *_token, password, ...; not *_tokens budgets or
+    tokenizer_model): Settings masks its value and never sends it back (configuration/settings_store.py)."""
+    return bool(SECRET.search(str(path).rsplit('.', 1)[-1]))
+
+
 def field(path, value):
     """The form for one value: what its Setting declares, else inferred from the value and the sections around it."""
     spec, default = setting(path), declared_default(path)
-    kind = 'text' if spec.quoted else spec.kind or ('boolean' if type(value) is bool else 'number' if type(value) in (int, float)
+    # A credential is text even when PyYAML reads it as a number (api_key: 123456789), so Settings masks it (secret()).
+    kind = 'text' if spec.quoted or not spec.kind and secret(path) and type(value) in (int, float) else spec.kind or (
+        'boolean' if type(value) is bool else 'number' if type(value) in (int, float)
         else 'json' if isinstance(value, (list, dict)) else 'text')
     # A numeric default says whether it is a whole number: YAML's 1 for a temperature no longer makes 0.7 an error.
     # A whole-number default makes a field integer unless the YAML holds a fraction the backend accepts (initiative seconds).
@@ -219,7 +251,7 @@ def field(path, value):
     if kind == 'number' and 'min' not in result and path.endswith(('_seconds', '_tokens', '_length', '_size', '_dimension', '_results')): result['min'] = 0
     if 'importance' in path or 'temperature' in path:
         result.setdefault('min', 0); result.setdefault('max', 2 if 'temperature' in path else 1)
-    result['secret'] = any(s in path.lower() for s in ('api_key', 'token', 'password')) and kind == 'text' and 'tokenizer' not in path
+    result['secret'] = secret(path) and kind == 'text'
     result['file'] = kind == 'text' and (bool(spec.file) or path.endswith(('_file', '_path', '_directory', '_dir')))
     result['multiline'] = kind == 'json' or 'prompt' in path or 'rules' in path
     result['restart_scope'] = scope  # RESTART in kernel/schema.py

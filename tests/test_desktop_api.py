@@ -228,6 +228,26 @@ def test_resource_estimate_previews_drafts_without_saving(backend):
     assert client.post('/api/resources/estimate', json={'changes': {'runtime.n_ctx': -1}}).status_code == 400
 
 
+def test_resource_estimate_never_touches_a_drafted_network_path(backend, monkeypatch):
+    from pathlib import Path
+    path = backend.config.root / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: llama_cpp\n')
+    backend.gpu_monitor.sample = lambda *args: {'available': False, 'gpus': []}
+    touched = []
+    for name in ('stat', 'exists', 'is_file', 'is_dir', 'resolve', 'open', 'rglob'):
+        original = getattr(Path, name)
+        def spy(self, *args, _original=original, **kwargs):
+            if 'attacker' in str(self): touched.append(str(self)); raise AssertionError('a network path reached the filesystem')
+            return _original(self, *args, **kwargs)
+        monkeypatch.setattr(Path, name, spy)
+    client = client_for(backend)
+    for key in ('runtime.model_path', 'emotion.model_path', 'emotion.cache_dir'):
+        for value in ('//attacker/share/model.gguf', r'\\attacker\share\model.gguf'):
+            response = client.post('/api/resources/estimate', json={'changes': {key: value}})
+            assert response.status_code == 400 and 'Network and device paths' in response.json()['detail'], (key, value)
+    assert not touched
+
+
 def test_tool_approval_api_policy_and_decision(backend, tmp_path):
     from process.app_core.tools.registry import ToolRegistry, RegisteredTool
     from process.app_core.tools.approval import ToolApprovals
@@ -509,6 +529,26 @@ def test_a_server_tool_named_like_a_built_in_has_its_own_rule_and_turning_it_off
     finally: registry.close()
 
 
+def test_a_server_tool_asks_first_by_default_and_turning_that_off_is_confirmed_even_with_approval_off(backend, tmp_path):
+    from process.app_core.tools.registry import ToolRegistry
+    from process.app_core.tools.approval import ToolApprovals
+    class Server:
+        def list_tools(self): return [{'name': 'todo_list', 'description': 'Lists things', 'inputSchema': {'type': 'object'}}]
+        def call(self, name, arguments): return {'content': []}
+        def close(self): pass
+    registry = ToolRegistry()
+    registry.register_mcp(Server(), source='mcp:evil')
+    registry.approvals = ToolApprovals(tmp_path / 'approvals.json', False)  # tools.require_approval: false
+    backend.chat = SimpleNamespace(tool_registry=registry)
+    client = client_for(backend)
+    try:
+        listed = client.get('/api/tools/approvals').json()
+        assert listed['default_required'] is False and listed['policy'] == {} and listed['required'] == {'todo_list': True}
+        asked = client.put('/api/tools/approvals', json={'policy': {'todo_list': False}})
+        assert asked.status_code == 428 and registry.approvals.required(('mcp:evil', 'todo_list'))
+    finally: registry.close()
+
+
 def test_discord_client_receives_only_its_own_turns_not_local_activity(backend):
     import uuid
     from process.app_core.events.bus import EventBus
@@ -546,7 +586,7 @@ def test_confirmations_are_single_use_bound_to_the_change_and_expire():
 @pytest.mark.parametrize('key', ['runtime.native_library', 'runtime.provider', 'runtime.base_url', 'runtime.model_path',
     'runtime.hf_repo_id', 'tools.mcp_config', 'emotion.enabled', 'emotion.model_id', 'memory.system1_enabled',
     'memory.system1_model_id', 'memory.store_file', 'sovits_ping_config.url', 'sovits_ping_config.ref_audio_path',
-    'sovits_ping_config.executable', 'sovits_ping_config.arguments', 'voice.asr_model'])
+    'sovits_ping_config.executable', 'sovits_ping_config.arguments', 'voice.asr_model', 'emotion.revision', 'memory.system1_revision'])
 def test_settings_that_run_code_or_send_data_elsewhere_are_security_sensitive(key):
     assert security_sensitive(key)
 
@@ -661,6 +701,82 @@ def test_an_interjection_that_cuts_the_reply_in_flight_redoes_it(backend):
     def unexpected(*args): raise AssertionError('no reply is in flight')
     backend.session = SimpleNamespace(voice_anchor=lambda: None, voice_transcript=unexpected)
     assert client.post('/api/voice/interjection', json=body).json() == {'accepted': False}  # the client sends a chat turn
+
+
+def refuse_attacker_paths(monkeypatch):
+    """Fail on any filesystem call that sees the attacker's host: on Windows resolving or stat-ing \\\\attacker\\share
+    contacts it and offers the user's credentials, so a network path must be refused as text (kernel/safe_paths.py)."""
+    from pathlib import Path
+    touched = []
+    def guard(original):
+        def call(path, *args, **kwargs):
+            if 'attacker' in str(path): touched.append(str(path)); raise AssertionError('a network path reached the filesystem')
+            return original(path, *args, **kwargs)
+        return call
+    for name in ('resolve', 'stat', 'exists', 'is_file', 'is_dir', 'open', 'read_bytes'): monkeypatch.setattr(Path, name, guard(getattr(Path, name)))
+    for module, name in ((os, 'stat'), (os, 'lstat'), (os.path, 'realpath'), (os.path, 'exists'), (os.path, 'isfile'), (os.path, 'isdir')):
+        monkeypatch.setattr(module, name, guard(getattr(module, name)))
+    return touched
+
+
+def test_network_paths_are_refused_as_text_on_every_route_that_takes_a_path(backend, monkeypatch):
+    from process.app_core.animation.runtime import AnimationRuntime
+    from process.app_core.configuration.settings_store import SettingsStore
+    from process.app_core.kernel.turns import RuntimeStatus
+    from process.app_core.runtime.actions import ActionController
+    session = SimpleNamespace(config=backend.config, chat=SimpleNamespace(), state=backend.state, actions=ActionController(), status=lambda: RuntimeStatus())
+    session.animation = service = AnimationRuntime(session, start=False)
+    backend.session = session
+    path = backend.config.root / 'character_config.yaml'; path.write_text('runtime:\n  provider: lm_studio\n')
+    store = SettingsStore(path); backend.settings_store = lambda: store
+    client = client_for(backend)
+    touched = refuse_attacker_paths(monkeypatch)
+    try:
+        for share in ('//attacker/share/', r'\\attacker\share' + '\\', r'\\?\UNC\attacker\share' + '\\'):
+            for response in (client.get('/api/media', params={'path': share + 'x.png'}),
+                    client.get('/api/avatar/animation', params={'path': share + 'x.vrma'}),
+                    client.post('/api/avatar/models/import', json={'value': share + 'x.vrm'}),
+                    client.post('/api/animation/import', json={'path': share + 'x.vrma', 'metadata': {}}),
+                    client.post('/api/settings/path', json={'key': 'memory.store_file', 'value': share + 'x.json'})):
+                assert response.status_code == 400, (share, response.request.url, response.text)
+        assert not touched
+    finally: service.close(); session.actions.close()
+
+
+def test_settings_never_send_a_secret_and_a_masked_one_saves_as_kept(backend, monkeypatch):
+    from process.app_core.configuration.settings_store import SECRET_MASK, SettingsStore
+    monkeypatch.delenv('RIKO_API_KEY', raising=False)
+    path = backend.config.root / 'character_config.yaml'
+    path.write_text('runtime:\n  provider: lm_studio\n  api_key: sk-saved-secret-1234\n')
+    store = SettingsStore(path); backend.settings_store = lambda: store
+    client = client_for(backend)
+    snapshot = client.get('/api/settings')
+    assert snapshot.status_code == 200 and 'sk-saved-secret' not in snapshot.text
+    assert snapshot.json()['values']['runtime.api_key'] == SECRET_MASK and 'path' not in snapshot.json()
+    # Saving other settings with the mask untouched asks nothing and keeps the key; so does retyping the same key.
+    kept = client.put('/api/settings', json={'revision': snapshot.json()['revision'], 'changes': {'runtime.api_key': SECRET_MASK, 'runtime.temperature': .5}})
+    assert kept.status_code == 200 and kept.json()['saved'] and 'api_key: sk-saved-secret-1234' in path.read_text() and 'sk-saved' not in kept.text
+    same = client.put('/api/settings', json={'revision': kept.json()['revision'], 'changes': {'runtime.api_key': 'sk-saved-secret-1234'}})
+    assert same.status_code == 200
+    asked = client.put('/api/settings', json={'revision': same.json()['revision'], 'changes': {'runtime.api_key': 'sk-another-key'}})
+    assert asked.status_code == 428 and 'sk-another-key' not in path.read_text()
+    # The native dialog shows (and signs) only a fingerprint of the new key, which still binds the approval to that key.
+    from process.app_core.desktop.api_guard import signature
+    challenge = asked.json()['detail']['confirm']
+    assert 'sk-another-key' not in challenge and json.loads(challenge)['changes']['runtime.api_key'].startswith('new secret, sha256 ')
+    swapped = client.put('/api/settings', json={'revision': same.json()['revision'], 'changes': {'runtime.api_key': 'sk-swapped-key'}},
+        headers={'X-Riko-Confirmation': signature(backend.api_secrets()[1], challenge)})
+    assert swapped.status_code == 428 and 'sk-swapped-key' not in path.read_text()
+    signed = client.put('/api/settings', json={'revision': same.json()['revision'], 'changes': {'runtime.api_key': 'sk-another-key'}},
+        headers={'X-Riko-Confirmation': signature(backend.api_secrets()[1], challenge)})
+    assert signed.status_code == 200 and 'api_key: sk-another-key' in path.read_text()
+    cleared = client.put('/api/settings', json={'revision': signed.json()['revision'], 'changes': {'runtime.api_key': ''}})
+    assert cleared.status_code == 428 and json.loads(cleared.json()['detail']['confirm'])['changes'] == {'runtime.api_key': ''}
+    assert client.post('/api/settings/validate', json={'changes': {'runtime.api_key': SECRET_MASK}}).json()['valid']
+    for body in ({'key': 'runtime.temperature', 'value': 'x'}, {'key': 'memory.store_file', 'value': '//attacker/share/x'}, {'value': 'memory_store.json'}):
+        assert client.post('/api/settings/path', json=body).status_code in (400, 422), body
+    checked = client.post('/api/settings/path', json={'key': 'memory.store_file', 'value': 'memory_store.json'}).json()
+    assert checked == {'resolved': str(backend.config.root / 'memory_store.json'), 'exists': False, 'directory': False, 'executable': False}
 
 
 # Every route the Electron app and the Discord worker call, as before the routes moved into routers: same paths and methods.

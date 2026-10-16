@@ -6,7 +6,7 @@ import path from 'node:path';
 import {createRequire} from 'node:module';
 import {EventEmitter} from 'node:events';
 const require=createRequire(import.meta.url);
-const {hardware,saveSetup,backendExecutable,backendAnswer,installRoot,askMicrophone,startBackend,startSovits,stopBackend,watchListening,listeningLine,freePort,finderPath,LISTENING}=require('../release.cjs');
+const {hardware,saveSetup,backendExecutable,backendAnswer,installRoot,askMicrophone,startBackend,launchLog,LAUNCH_LOG_BYTES,startSovits,stopBackend,watchListening,listeningLine,freePort,finderPath,LISTENING}=require('../release.cjs');
 const {MANIFEST}=require('../native_backends.cjs');
 const YAML=require('yaml');
 const form={backend:'cuda',repo:'owner/model',filename:'model.gguf',context:8192,output:1024,threads:4,memories:'I like tea.\nMy name is Alex.',sovitsAuto:false};
@@ -56,24 +56,54 @@ test('the packaged backend is resources/backend/riko-backend, with .exe on Windo
   assert.equal(backendExecutable('/app/resources','win32'),path.join('/app/resources','backend','riko-backend.exe'));
 });
 test('GPT-SoVITS starts only for auto_start: true, with an absolute executable',()=>{for(const auto_start of [false,undefined,'no','yes',1])assert.equal(startSovits({auto_start,executable:'relative.exe'}),null,String(auto_start));assert.equal(startSovits(undefined),null);assert.throws(()=>startSovits({auto_start:true,executable:'relative.exe'}),/missing/);});
+const probe=outputs=>{const calls=[];return {calls,run:(file,args)=>{calls.push([file,...args]);return Promise.resolve(outputs[file]||'');}};};
 test('hardware detection runs only the tools for this OS\'s bundles and preselects from them',async()=>{
-  const probe=outputs=>{const calls=[];return {calls,run:(file,args)=>{calls.push([file,...args]);return Promise.resolve(outputs[file]||'');}};};
-  const mac=probe({'nvidia-smi':'NVIDIA','vulkaninfo':'MoltenVK'}),macHw=await hardware('darwin',mac.run);
+  const mac=probe({'nvidia-smi':'NVIDIA','vulkaninfo':'MoltenVK'}),macHw=await hardware('/app/resources','darwin',mac.run);
   assert.deepEqual(mac.calls,[]);
   assert.deepEqual(macHw.backends,[{id:'metal',label:'Metal',description:'Apple silicon GPU'}]);
   assert.deepEqual(macHw.detections,[]);assert.equal(macHw.preferred,'metal');assert.equal(macHw.platform,'darwin');
-  const linux=probe({'vulkaninfo':'GPU0: AMD Radeon RX 7900'}),linuxHw=await hardware('linux',linux.run);
-  assert.deepEqual(linux.calls.map(call=>call[0]),['nvidia-smi','vulkaninfo']);
-  assert.equal(linuxHw.preferred,'vulkan');
+  const linux=probe({'vulkaninfo':'GPU0: AMD Radeon RX 7900','rocminfo':'  Name:  gfx1100'}),linuxHw=await hardware('/app/resources','linux',linux.run);
+  assert.deepEqual(linux.calls.map(call=>call[0]),['nvidia-smi','vulkaninfo'],'no hip bundle, so no rocminfo');
+  assert.equal(linuxHw.preferred,'vulkan');assert.deepEqual(linuxHw.backends.map(backend=>backend.id),['cuda','vulkan']);assert.deepEqual(linuxHw.unavailable,[]);
   assert.deepEqual(linuxHw.detections.map(item=>[item.backend,item.required,item.output]),[['cuda',true,'No NVIDIA GPU detected via nvidia-smi'],['vulkan',false,'GPU0: AMD Radeon RX 7900']]);
-  const windows=await hardware('win32',probe({'nvidia-smi':'NVIDIA GeForce RTX 4090, 24564, 551.86'}).run);
+  const windows=await hardware('/app/resources','win32',probe({'nvidia-smi':'NVIDIA GeForce RTX 4090, 24564, 551.86'}).run);
   assert.equal(windows.preferred,'cuda');assert.deepEqual(windows.backends.map(backend=>backend.id),['cuda','vulkan']);
+});
+test('a release with the opt-in hip bundle offers ROCm only for GPUs it was built for, with ROCm 7 installed, and Vulkan otherwise',async()=>{
+  const resources=temporary('riko-resources-'),library=path.join(resources,'native','hip','libriko-native.so'),rocm=()=>true,noRocm=()=>false;
+  const agents=(...names)=>['ROCk module is loaded','  Name:                    AMD Ryzen 9 7950X',...names.flatMap(name=>[`  Name:                    ${name}`,'  Marketing Name:          Radeon',`      Name:                    amdgcn-amd-amdhsa--${name}`])].join('\n');
+  try{
+    fs.mkdirSync(path.dirname(library),{recursive:true});fs.writeFileSync(library,'');
+    const amd=probe({rocminfo:agents('gfx1100'),'vulkaninfo':'GPU0: AMD Radeon RX 7900'}),hw=await hardware(resources,'linux',amd.run,rocm);
+    assert.deepEqual(amd.calls.map(call=>call[0]),['nvidia-smi','rocminfo','vulkaninfo']);
+    assert.deepEqual(hw.backends.map(backend=>backend.id),['cuda','hip','vulkan']);assert.equal(hw.preferred,'hip');assert.deepEqual(hw.unavailable,[]);
+    assert.equal(hw.detections.find(item=>item.backend==='hip').output,'Name:                    gfx1100','only GPU agent names');
+    // AMD's packages keep rocminfo in /opt/rocm/bin, off a desktop session's PATH.
+    const fallback=probe({'/opt/rocm/bin/rocminfo':agents('gfx1201')}),viaRocm=await hardware(resources,'linux',fallback.run,rocm);
+    assert.deepEqual(fallback.calls.map(call=>call[0]),['nvidia-smi','rocminfo','vulkaninfo','/opt/rocm/bin/rocminfo']);assert.equal(viaRocm.preferred,'hip');
+    // Never preselect a bundle that would abort the backend: a GPU it has no code for (RX 6700 XT gfx1031, a 780M gfx1103),
+    // a supported card beside an unsupported iGPU (ggml-hip uses both), only amd-smi (no proof of /dev/kfd), no AMD GPU,
+    // or no ROCm 7 runtime (the module would not load).
+    for(const [outputs,exists] of [[{rocminfo:agents('gfx1031')},rocm],[{rocminfo:agents('gfx1103')},rocm],[{rocminfo:agents('gfx1100','gfx1036')},rocm],
+      [{'amd-smi':'TARGET_GRAPHICS_VERSION: gfx1100'},rocm],[{rocminfo:'  Name:                    AMD Ryzen 9 7950X'},rocm],[{},rocm],[{rocminfo:agents('gfx1100')},noRocm]]){
+      const none=probe(outputs),noHip=await hardware(resources,'linux',none.run,exists);
+      assert.deepEqual(noHip.backends.map(backend=>backend.id),['cuda','vulkan'],JSON.stringify(outputs));assert.equal(noHip.preferred,'vulkan');
+      assert.deepEqual(noHip.unavailable,[{id:'hip',label:'ROCm (HIP)',reason:MANIFEST.backends.find(backend=>backend.id==='hip').detect.missing}]);
+      assert.ok(!none.calls.some(call=>call[0].includes('amd-smi')));
+      if(exists===noRocm)assert.ok(!none.calls.some(call=>call[0].includes('rocminfo')),'no runtime: rocminfo never runs');
+    }
+    const nvidia=await hardware(resources,'linux',probe({'nvidia-smi':'NVIDIA GeForce RTX 4090, 24564, 550.54.15',rocminfo:agents('gfx1100')}).run,rocm);
+    assert.equal(nvidia.preferred,'cuda');assert.deepEqual(nvidia.backends.map(backend=>backend.id),['cuda','hip','vulkan']);
+    const windows=await hardware(resources,'win32',probe({rocminfo:agents('gfx1100')}).run,rocm);  // hip ships only for Linux
+    assert.deepEqual(windows.backends.map(backend=>backend.id),['cuda','vulkan']);
+  }finally{fs.rmSync(resources,{recursive:true,force:true});}
 });
 test('the setup page offers the backends hardware() reports instead of a fixed list',()=>{
   const page=fs.readFileSync(new URL('./first_setup.jsx',import.meta.url),'utf8');
   assert.doesNotMatch(page,/value="(cuda|vulkan|metal)"|backend:'(cuda|vulkan|metal)'|hw\.(nvidia|vulkan)\b/);
   assert.match(page,/\(hw\?\.backends\|\|\[\]\)\.map\(backend=><option key=\{backend\.id\} value=\{backend\.id\}>/);
   assert.match(page,/backend:h\.preferred/);
+  assert.match(page,/\(hw\?\.unavailable\|\|\[\]\)\.map\(item=><p key=\{item\.id\}>\{item\.label\} is bundled but not offered\. \{item\.reason\}/);
 });
 test('setup refuses a data folder that an update or uninstall would delete',async()=>{
   const install=fs.mkdtempSync(path.join(os.tmpdir(),'riko-install-')),resources=path.join(install,'resources'),sibling=install+'-data',backend=fakeBackend();
@@ -104,12 +134,41 @@ test('startBackend hands the backend its port and hears it only once the backend
   try{
     fs.mkdirSync(path.join(resources,'backend'));fs.mkdirSync(path.join(directory,'logs'));
     // Names whatever RIKO_PORT it was given, then waits for stdin to close, as the managed backend does.
-    fs.writeFileSync(path.join(resources,'backend','riko-backend'),'#!/bin/sh\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT managed=$RIKO_MANAGED"\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT"\ncat >/dev/null\n',{mode:0o755});
+    // Its stderr (logging's console) goes to the launch log too, with this start's secrets redacted.
+    fs.writeFileSync(path.join(resources,'backend','riko-backend'),'#!/bin/sh\necho "token=$RIKO_API_TOKEN key=$RIKO_CONFIRM_KEY" >&2\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT managed=$RIKO_MANAGED"\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT"\ncat >/dev/null\necho "stopped" >&2\n',{mode:0o755});
     let heard;const listening=new Promise(resolve=>{heard=resolve;});
     const child=startBackend(directory,resources,{api_token:'t'.repeat(43),confirm_key:'k'.repeat(43)},9123,heard);
-    await listening;await stopBackend(child,5000,1000);
+    const closed=new Promise(resolve=>child.once('close',resolve));
+    await listening;await stopBackend(child,5000,1000);await closed;
     assert.equal(child.exitCode,0);assert.deepEqual(child.signalCode,null);
+    const log=fs.readFileSync(path.join(directory,'logs','backend-launch.log'),'utf8');
+    assert.match(log,/token=\[REDACTED\] key=\[REDACTED\]\n/);assert.match(log,/RIKO_BACKEND_LISTENING port=9123\n/);assert.match(log,/stopped\n/);
+    assert.doesNotMatch(log,/tttttttt|kkkkkkkk/);
   }finally{fs.rmSync(resources,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true});}
+});
+test('the launch log is capped with two backups and never holds this start\'s secrets, even split across chunks',()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'riko-launch-')),file=path.join(directory,'logs','backend-launch.log');
+  try{
+    assert.equal(LAUNCH_LOG_BYTES,5*1024*1024);
+    fs.mkdirSync(path.dirname(file));fs.writeFileSync(file,'x'.repeat(300));  // an older build's uncapped log: rotated at open
+    const secret='s3cr3t-token-value-0123456789',log=launchLog(file,{maxBytes:200,secrets:[secret,'short',undefined]}),out=log.stream(),err=log.stream();
+    assert.equal(fs.readFileSync(file+'.1','utf8'),'x'.repeat(300));assert.equal(fs.readFileSync(file,'utf8'),'');
+    out.write(Buffer.from('token='+secret.slice(0,10)));err.write('error: ');out.write(Buffer.from(secret.slice(10)+' ready\n'));  // split mid-secret
+    const accent=Buffer.from('é\n');err.write(accent.subarray(0,1));err.write(accent.subarray(1));  // a character split across chunks
+    assert.equal(fs.readFileSync(file,'utf8'),'token=[REDACTED] ready\nerror: é\n');
+    for(let index=0;index<12;index++)out.write(`line ${index} `+'y'.repeat(40)+'\n');  // past 200 bytes, twice over
+    out.write('tail without newline '+secret.slice(0,5));err.end();out.end();log.close();
+    const files=fs.readdirSync(path.dirname(file)).sort();
+    assert.deepEqual(files,['backend-launch.log','backend-launch.log.1','backend-launch.log.2']);  // two backups, no more
+    for(const name of files)assert.ok(fs.statSync(path.join(path.dirname(file),name)).size<=200,name);
+    const text=files.map(name=>fs.readFileSync(path.join(path.dirname(file),name),'utf8')).join('');
+    assert.ok(!text.includes(secret)&&text.includes('line 11 ')&&fs.readFileSync(file,'utf8').endsWith('tail without newline '+secret.slice(0,5)));
+    // A line longer than the buffer is written in pieces, a secret straddling a piece still redacted.
+    const long=launchLog(path.join(directory,'long.log'),{secrets:[secret]}),stream=long.stream();
+    stream.write('z'.repeat(64*1024-10)+secret+'z'.repeat(10));stream.write('\n');stream.end();long.close();
+    const written=fs.readFileSync(path.join(directory,'long.log'),'utf8');
+    assert.ok(!written.includes(secret.slice(0,8))&&written.includes('[REDACTED]')&&written.endsWith('z'.repeat(10)+'\n'));
+  }finally{fs.rmSync(directory,{recursive:true,force:true});}
 });
 function fakeChild({exitOnShutdown=false,signalCode=null}={}){const child=Object.assign(new EventEmitter(),{exitCode:null,signalCode,signals:[],written:'',kill(signal='SIGTERM'){child.signals.push(signal);return true;}});child.stdin={end(text){child.written+=text;if(exitOnShutdown)setImmediate(()=>child.emit('exit',0,null));}};return child;}
 test('stopBackend asks for shutdown, then escalates to SIGTERM and SIGKILL',async()=>{const hung=fakeChild();await stopBackend(hung,20,20);assert.equal(hung.written,'shutdown\n');assert.deepEqual(hung.signals,['SIGTERM','SIGKILL']);const quick=fakeChild({exitOnShutdown:true});await stopBackend(quick,20,20);assert.deepEqual(quick.signals,[]);const crashed=fakeChild({signalCode:'SIGABRT'}),started=Date.now();await stopBackend(crashed,1000,1000);assert.ok(Date.now()-started<500);assert.equal(crashed.written,'');});
@@ -159,5 +218,20 @@ test('the macOS app is a hardened arm64 DMG whose processes may use the micropho
   assert.equal(mac.icon,'../release-stage/mac/icon.icns');
   assert.ok(MANIFEST.backends.find(backend=>backend.id==='metal').cmake_flags.includes('-DCMAKE_OSX_DEPLOYMENT_TARGET='+mac.minimumSystemVersion));
   assert.ok(!builder.files.some(pattern=>pattern.startsWith('build')),'build resources stay out of app.asar');
+});
+test('electron-builder copies the staged backend and native bundles with their library links kept as links',{skip:process.platform==='win32'&&'Windows bundles hold no links'},async()=>{
+  // tools/release/build.py stages each versioned library once (libggml.so -> .so.0 -> .so.0.25.3) and PyInstaller links
+  // libraries into _internal; extraResources goes through app-builder-lib's copyFiles, which must not turn them into copies.
+  const builder=YAML.parse(fs.readFileSync(new URL('../electron-builder.yml',import.meta.url),'utf8'));
+  assert.deepEqual(builder.extraResources.filter(item=>item.from.startsWith('../release-stage/')).map(item=>item.to),['backend','native','notices']);
+  const {copyFiles,FileMatcher}=require('app-builder-lib/out/fileMatcher'),stage=temporary('riko-stage-'),resources=temporary('riko-resources-');
+  try{
+    const bundle=path.join(stage,'native','cuda');fs.mkdirSync(bundle,{recursive:true});
+    fs.writeFileSync(path.join(bundle,'libggml.so.0.25.3'),'ggml');fs.symlinkSync('libggml.so.0.25.3',path.join(bundle,'libggml.so.0'));fs.symlinkSync('libggml.so.0',path.join(bundle,'libggml.so'));
+    await copyFiles([new FileMatcher(path.join(stage,'native'),path.join(resources,'native'),value=>value)]);
+    const copied=path.join(resources,'native','cuda');
+    assert.equal(fs.readlinkSync(path.join(copied,'libggml.so')),'libggml.so.0');assert.equal(fs.readlinkSync(path.join(copied,'libggml.so.0')),'libggml.so.0.25.3');
+    assert.ok(!fs.lstatSync(path.join(copied,'libggml.so.0.25.3')).isSymbolicLink());assert.equal(fs.readFileSync(path.join(copied,'libggml.so'),'utf8'),'ggml');
+  }finally{fs.rmSync(stage,{recursive:true,force:true});fs.rmSync(resources,{recursive:true,force:true});}
 });
 test('packaged apps cannot be relaunched as plain Node to borrow their microphone permission',()=>{const builder=YAML.parse(fs.readFileSync(new URL('../electron-builder.yml',import.meta.url),'utf8'));assert.deepEqual(builder.electronFuses,{runAsNode:false,enableNodeOptionsEnvironmentVariable:false,enableNodeCliInspectArguments:false});});

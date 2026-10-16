@@ -20,6 +20,21 @@ class Speech:
     def close(self): pass
 
 
+class Adapter:
+    """An activity adapter (runtime/activity.py) answering each field from `answers` (a value, an exception, or a callable)."""
+    def __init__(self, idle=None, active_app=None, unsupported=()):
+        self.answers, self.unsupported, self.calls = {'idle': idle, 'active_app': active_app}, set(unsupported), []
+    def capabilities(self):
+        return {field: {'supported': field not in self.unsupported, 'reason': 'not here' if field in self.unsupported else ''} for field in ('idle', 'active_app')}
+    def sample(self, **kwargs):
+        self.calls.append(kwargs)
+        [field] = [field for field, wanted in kwargs.items() if wanted]
+        answer = self.answers[field]
+        answer = answer() if callable(answer) else answer
+        if isinstance(answer, Exception): raise answer
+        return {'idle_seconds' if field == 'idle' else 'active_app': answer}
+
+
 def engine(tmp_path, monkeypatch, *, adapter=None, generate=None, raw=None):
     monkeypatch.setattr('process.app_core.runtime.session.SpeechQueue', Speech)
     config = SimpleNamespace(root=tmp_path, paths=DataPaths.at(tmp_path), raw=raw or {}, character_name='Riko', tools=SimpleNamespace(max_iterations=8), **audio_sections({}))
@@ -32,8 +47,8 @@ def engine(tmp_path, monkeypatch, *, adapter=None, generate=None, raw=None):
 
 
 def test_default_disabled_and_sources_require_consent(tmp_path, monkeypatch):
-    calls = []
-    adapter = SimpleNamespace(sample=lambda **kwargs: calls.append(kwargs) or {'idle_seconds': 100})
+    adapter = Adapter(idle=100)
+    calls = adapter.calls
     initiative = engine(tmp_path, monkeypatch, adapter=adapter)
     initiative.poll()
     assert not calls
@@ -43,17 +58,15 @@ def test_default_disabled_and_sources_require_consent(tmp_path, monkeypatch):
     assert 'idle_seconds' not in initiative.environment
     initiative.update({'enabled': True, 'observe_idle': True})
     initiative.poll(initiative.last_sample + 3)
-    assert calls == [{'idle': True, 'active_app': False}]
+    assert calls == [{'idle': True}]  # one call per allowed field
     initiative.update({'enabled': False})
     assert initiative.environment == {}
     initiative.session.close()
 
 
 def test_idle_return_and_app_transitions(tmp_path, monkeypatch):
-    values = iter([{'idle_seconds': 0, 'active_app': {'window_title': 'Editor'}},
-                   {'idle_seconds': 6, 'active_app': {'window_title': 'Editor'}},
-                   {'idle_seconds': 0, 'active_app': {'window_title': 'Browser'}}])
-    initiative = engine(tmp_path, monkeypatch, adapter=SimpleNamespace(sample=lambda **kwargs: next(values)))
+    idle, apps = iter([0, 6, 0]), iter([{'window_title': 'Editor'}, {'window_title': 'Editor'}, {'window_title': 'Browser'}])
+    initiative = engine(tmp_path, monkeypatch, adapter=Adapter(idle=lambda: next(idle), active_app=lambda: next(apps)))
     initiative.update({'enabled': True, 'observe_idle': True, 'observe_active_app': True, 'idle_seconds': 5})
     observed = []
     unsubscribe = event_bus.subscribe(lambda event: observed.append(event.type))
@@ -66,6 +79,57 @@ def test_idle_return_and_app_transitions(tmp_path, monkeypatch):
     finally:
         unsubscribe()
         initiative.session.close()
+
+
+def test_an_unsupported_field_is_never_sampled_and_is_not_an_error(tmp_path, monkeypatch):
+    adapter = Adapter(idle=12, active_app={'app_name': 'Finder'}, unsupported={'active_app'})
+    initiative = engine(tmp_path, monkeypatch, adapter=adapter)
+    try:
+        assert initiative.snapshot()['perception'] == {'idle': 'off', 'active_app': 'off'}
+        initiative.update({'enabled': True, 'observe_idle': True, 'observe_active_app': True})
+        assert initiative.snapshot()['perception'] == {'idle': 'waiting', 'active_app': 'unsupported'}
+        initiative.poll(initiative.last_sample + 3)
+        snapshot = initiative.snapshot()
+        assert adapter.calls == [{'idle': True}] and snapshot['error'] == '' and snapshot['environment']['idle_seconds'] == 12
+        assert snapshot['perception'] == {'idle': 'available', 'active_app': 'unsupported'}
+        assert snapshot['capabilities']['active_app'] == {'supported': False, 'reason': 'not here'}
+        assert initiative.session.runtime_snapshot()['perception'] | {'computer': None} == {'screen': 'unavailable', 'computer': None,
+            'idle': 'available', 'active_application': 'unsupported'}
+    finally: initiative.session.close()
+
+
+def test_each_field_reports_its_own_failure_and_a_desktop_without_the_service_turns_unsupported(tmp_path, monkeypatch):
+    from process.app_core.runtime.activity import ActivityUnsupported
+    adapter = Adapter(idle=RuntimeError('D-Bus timed out'), active_app={'window_title': 'Editor', 'app_name': 'Code'})
+    initiative = engine(tmp_path, monkeypatch, adapter=adapter)
+    try:
+        initiative.update({'enabled': True, 'observe_idle': True, 'observe_active_app': True})
+        initiative.poll(initiative.last_sample + 3)
+        snapshot = initiative.snapshot()
+        assert snapshot['perception'] == {'idle': 'error', 'active_app': 'available'} and snapshot['error'] == 'Idle awareness: D-Bus timed out'
+        assert snapshot['environment']['active_app']['app_name'] == 'Code' and 'idle_seconds' not in snapshot['environment']
+        adapter.answers['idle'] = ActivityUnsupported('this desktop offers no idle-time service')
+        initiative.poll(initiative.last_sample + 3)
+        snapshot = initiative.snapshot()
+        assert snapshot['perception'] == {'idle': 'unsupported', 'active_app': 'available'} and snapshot['error'] == ''
+        initiative.error = 'Initiative returned empty decision JSON'  # a decision's error is not the sampler's to clear
+        initiative.poll(initiative.last_sample + 3)
+        assert initiative.error == 'Initiative returned empty decision JSON'
+    finally: initiative.session.close()
+
+
+def test_app_condition_matches_an_app_name_where_no_window_title_is_offered(tmp_path, monkeypatch):
+    initiative = engine(tmp_path, monkeypatch)
+    try:
+        initiative.update({'enabled': True})
+        rule = {**initiative.settings['rules'][0], 'app_contains': 'figma'}
+        initiative.environment = {'active_app': {'app_name': 'Figma', 'bundle_id': 'com.figma.Desktop', 'process_id': 7}}
+        assert initiative.evaluate(rule, {'type': 'initiative.tick'})
+        initiative.last_presented = initiative.last_evaluation = float('-inf')
+        initiative.rule_last.clear()
+        initiative.environment = {'active_app': {'app_name': 'Safari', 'process_id': 8}}
+        assert not initiative.evaluate(rule, {'type': 'initiative.tick'})
+    finally: initiative.session.close()
 
 
 def test_bubble_default_cooldown_and_settings_persistence(tmp_path, monkeypatch):

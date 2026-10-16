@@ -26,14 +26,25 @@ def electron_processes(request: ElectronProcesses, backend: Services):
 class ResourceEstimate(BaseModel):
     changes: dict = Field(default_factory=dict)
 
+PATH_SUFFIXES = ('_path', '_dir', '_directory', '_folder', '_file', '_root')
+
 @router.post('/api/resources/estimate')
 def resource_estimate(request: ResourceEstimate, backend: Services):
     import os
     import tempfile
     from pathlib import Path
-    from ..resources.vram_estimate import estimate
+    from ..resources.vram_estimate import draft_telemetry, estimate
     from ..configuration.settings_store import LOCK
+    from ..kernel.safe_paths import local_path
     store = backend.settings_store()
+    # The estimate stats and reads a draft's model files, so its paths are checked as text first (kernel/safe_paths.py: on
+    # Windows, stat-ing a network path contacts that host with the user's credentials).
+    unsafe = {}
+    for key, value in request.changes.items():
+        if isinstance(key, str) and key.endswith(PATH_SUFFIXES) and isinstance(value, str) and value:
+            try: local_path(value, store.path.parent)
+            except ValueError as exc: unsafe[key] = str(exc)
+    if unsafe: raise HTTPException(400, 'Invalid estimate settings: ' + '; '.join(f'{key}: {value}' for key, value in unsafe.items()))
     with LOCK:
         _, output, errors = store.prepare(request.changes)
         # A prompt+output mismatch does not prevent estimating the selected KV
@@ -48,7 +59,7 @@ def resource_estimate(request: ResourceEstimate, backend: Services):
         finally: Path(temporary).unlink(missing_ok=True)
     if 'initiative.context_window_tokens' in request.changes:
         candidate.runtime.initiative_n_ctx = request.changes['initiative.context_window_tokens']
-    projected = estimate(candidate, backend.gpu_monitor.sample(backend.provider()))
+    projected = estimate(candidate, draft_telemetry(backend.gpu_monitor.sample(backend.provider()), backend.config.runtime, candidate.runtime))
     if errors: projected.setdefault('warnings', []).extend('Unsavable draft: ' + value for value in errors.values())
     return {'estimate': projected, 'validation_errors':errors, 'draft': bool(request.changes)}
 

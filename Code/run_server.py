@@ -12,7 +12,7 @@ RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'f
 # kernel/, which code imports partly inside functions (chat's metrics, the background budgets): the release check imports
 # each by name, as it loads every name of the lazy process.app_core facade. tests/test_release_build.py keeps it equal to kernel/.
 KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('audio_config', 'background_budget', 'cancellation', 'code_paths', 'lifecycle',
-    'messages', 'metrics', 'output_filter', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
+    'messages', 'metrics', 'model_pins', 'output_filter', 'safe_paths', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
 # Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
 DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
 
@@ -84,30 +84,90 @@ def native_bundle_problems(library, loaded):
             if is_driver(name) or path.resolve().parent != bundle]
 
 
+def native_device_problems(dll):
+    """riko_devices, after riko_create initialised the backends: version 1 JSON listing ggml's devices, the CPU among them
+    (printed with their memory). [] when it does; a bridge without the export is an older riko-native."""
+    import ctypes
+    import json
+    try: devices = dll.riko_devices
+    except AttributeError: return ['riko_devices missing: an older riko-native; rebuild it from this checkout (tools/llama_cpp/README.md)']
+    devices.argtypes, devices.restype = [ctypes.c_char_p, ctypes.c_size_t], ctypes.c_int
+    buffer = ctypes.create_string_buffer(65536)
+    length = devices(buffer, len(buffer))
+    text = buffer.value.decode('utf-8', errors='replace')
+    if not 0 <= length < len(buffer): return [f'riko_devices returned {length}: {text}']
+    try:
+        data = json.loads(text)
+        listed = data['devices'] if isinstance(data, dict) and data.get('version') == 1 and isinstance(data.get('devices'), list) else None
+        if listed is None or not all(isinstance(device, dict) for device in listed): raise ValueError('not a version 1 device list')
+    except ValueError as exc: return [f'riko_devices returned no device list ({exc}): {text[:300]}']
+    print('ggml devices: ' + ', '.join(f'{device.get("name")} ({device.get("description")}, {device.get("type")}, '
+        f'{int(device.get("memory_total") or 0) // 1024 ** 2} MiB)' for device in listed), flush=True)
+    return [] if any(device.get('type') == 'cpu' for device in listed) else ['riko_devices lists no CPU device']
+
+
+def native_release_problems(library, modules=None, system=()):
+    """Why a native bundle cannot ship ([] when it can), loading it as the app does: its six exports (the app treats
+    riko_devices as optional, for older bridges, but a new bundle must have it); no library it links resolves from outside
+    the bundle (a toolkit, SDK or LD_LIBRARY_PATH users lack) and no NVIDIA driver library loads with it. riko_create, given
+    no arguments, initialises ggml's backends and fails before it reads a model; riko_devices then lists ggml's devices,
+    which must include the CPU. With modules
+    (native_backends.backend_modules: GGML_BACKEND_DL), ggml looks for them only beside the executable and in the working
+    directory, so a CPU module loaded from the bundle proves that the bridge loads from its own folder; every module there
+    must then load with its dependencies from the bundle too, except a dependency matching `system`
+    (native_backends.system_libraries: hip's ROCm), which users install and the build machine may lack. Initialised, cudart
+    may load the driver (on a machine that has one), so only bundle libraries count from then on."""
+    import ctypes
+    import fnmatch
+    import re
+    library = Path(library).resolve()
+    names = {file.name for file in library.parent.iterdir()}
+    directory = os.add_dll_directory(str(library.parent)) if os.name == 'nt' else None
+    try:
+        dll = ctypes.CDLL(str(library))
+        for symbol in ('riko_create', 'riko_request', 'riko_set_interval', 'riko_stop', 'riko_destroy'): getattr(dll, symbol)
+        problems = native_bundle_problems(library, loaded_libraries(names | DRIVER_LIBRARIES))
+        dll.riko_create.argtypes, dll.riko_create.restype = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_void_p
+        error = ctypes.create_string_buffer(8192)
+        if dll.riko_create(b'[]', 0, error, len(error)): problems.append('riko_create accepted empty arguments')
+        print(f'riko_create without arguments: {error.value.decode("utf-8", errors="replace")}', flush=True)
+        problems += native_device_problems(dll)
+        if modules:
+            def module(name): return name == modules['gpu'] or any(fnmatch.fnmatch(name, pattern) for pattern in modules['cpu'])
+            loaded = {name for name in loaded_libraries(names) if name in names}
+            print(f'Backend modules riko_create loaded: {", ".join(sorted(filter(module, loaded))) or "none"}', flush=True)
+            if not any(fnmatch.fnmatch(name, pattern) for name in loaded for pattern in modules['cpu']):
+                problems.append(f'riko_create loaded no CPU backend module ({" or ".join(modules["cpu"])}) from {library.parent}')
+            for name in sorted(filter(module, names - loaded)):  # those it found no device for or did not pick, by name
+                try: ctypes.CDLL(str(library.parent / name))
+                except OSError as failure:
+                    lacking = re.match(r'([^:\s]+): cannot open shared object file', str(failure))  # glibc names the library it lacks
+                    if lacking and any(fnmatch.fnmatch(lacking[1], pattern) for pattern in system):
+                        print(f'{name} needs {lacking[1]} from the system, which this machine lacks (not bundled)', flush=True)
+                    else: problems.append(f'{name} does not load: {failure}')
+        problems += native_bundle_problems(library, {name: path for name, path in loaded_libraries(names).items() if name in names})
+    finally:
+        if directory: directory.close()
+    return list(dict.fromkeys(problems))
+
+
 def release_check(library=None):
     """`--release-check [library]`: can this build do what an installed app needs? tools/release/build.py runs it on the
     frozen backend once per native backend, without the build's toolkit paths; tests/test_release_build.py runs it on this
     tree without a library. It needs no GPU, audio device, credentials, network or model, and touches no user data."""
-    import ctypes
     import importlib
     import json
     import subprocess
     import tempfile
     import yaml
-    from process.app_core.configuration.native_backends import backends_for, bundled_library, library_name
+    from process.app_core.configuration.native_backends import backend_modules, backends_for, bundled_library, library_name, system_libraries
     shipped, name = backends_for(sys.platform), library_name(sys.platform)  # the frozen copy bundled:<backend> resolves with
     if library and (Path(library).name != name or Path(library).absolute().parent.name not in shipped):
         raise SystemExit(f'{library} is not where bundled:<backend> looks on {sys.platform}: native/<{"|".join(shipped)}>/{name}')
     if library:
-        library = Path(library).resolve()
-        directory = os.add_dll_directory(str(library.parent)) if os.name == 'nt' else None
-        try:
-            dll = ctypes.CDLL(str(library))
-            for symbol in ('riko_create', 'riko_request', 'riko_set_interval', 'riko_stop', 'riko_destroy'): getattr(dll, symbol)
-        finally:
-            if directory: directory.close()
-        problems = native_bundle_problems(library, loaded_libraries({file.name for file in library.parent.iterdir()} | DRIVER_LIBRARIES))
-        if problems: raise SystemExit('The native bundle is not self-contained:\n  ' + '\n  '.join(problems))
+        backend, library = Path(library).absolute().parent.name, Path(library).resolve()
+        problems = native_release_problems(library, backend_modules(backend), system_libraries(backend))
+        if problems: raise SystemExit('The native bundle cannot ship:\n  ' + '\n  '.join(problems))
     for module in RELEASE_MODULES + KERNEL_MODULES: importlib.import_module(module)
     core = importlib.import_module('process.app_core')
     for name in core.__all__: getattr(core, name)
@@ -209,11 +269,13 @@ def main():
                 raise SystemExit(f'Port {port} is already in use ({exc}); stop the other process or set RIKO_PORT, and try again.') from None
             time.sleep(.5)
     listener.listen(2048)
-    backend.api_secrets()
+    from process.app_core.configuration.debug_logging import redact_handlers, redact_secrets
+    redact_secrets(*(backend.api_secrets() or ()))  # this start's token and confirmation key never reach a log
     # electron/release.cjs listeningLine: main sends the token only once this names the port it gave us.
     if os.environ.get('RIKO_MANAGED') == '1': print(f'RIKO_BACKEND_LISTENING port={port}', flush=True)
-    server = this.Server(this.uvicorn.Config(app, host="127.0.0.1", port=port,
-                log_level="info", timeout_graceful_shutdown=2), backend.stop_turn)
+    settings = this.uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info", timeout_graceful_shutdown=2)
+    redact_handlers('uvicorn', 'uvicorn.error', 'uvicorn.access')  # the stderr handlers uvicorn installed as its Config was built
+    server = this.Server(settings, backend.stop_turn)
     if os.environ.get('RIKO_MANAGED') == '1':
         import faulthandler
         import threading

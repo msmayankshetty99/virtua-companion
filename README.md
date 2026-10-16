@@ -102,13 +102,20 @@ so you can start the external server and continue without restarting the app.
 Follow-up defaults to 10 seconds after playback. Sustained user speech interrupts
 after 1.5 seconds by default; brief interjections preserve context without stopping
 capture. Stop overrides speaking priority. Audible text position is estimated,
-not word-aligned. Use headphones: speaker echo rejection is not implemented, and
-closing an HTTP stream cannot guarantee server-side synthesis cancellation.
+not word-aligned. Speaker echo is not cancelled: through speakers Riko hears herself,
+so by default her echo can interrupt her and be saved as your words. With speakers,
+set `voice.barge_in: echo_gate` (while she plays, only speech clearly louder than
+her echo counts, about 4-6 times; each reply learns her echo's level in its first
+seconds, ignoring the microphone meanwhile) or
+`stop_only` (the microphone ignores everything while she plays; press Stop), or use
+headphones. Closing an HTTP stream cannot guarantee server-side synthesis cancellation.
 
 Configure `avatar.model` for your compatible VRM. The default path is
 `electron/public/models/riko.vrm`; models are local assets, not bundled in Git.
-Julia uses normal Hugging Face caching, not a checked-in model directory. VTube
-Studio, NDI and face tracking are not used.
+Julia uses normal Hugging Face caching, not a checked-in model directory. Julia-1 is
+downloaded at a pinned commit (`emotion.revision`, `memory.system1_revision`) and the
+Python code it ships is checked file by file before it runs. VTube Studio, NDI and
+face tracking are not used.
 
 Video effects live in `effects/greenscreens/` (`.mp4`, `.webm`, `.mov`, `.m4v`);
 playback depends on Electron codec support. Media tools are limited to approved
@@ -148,7 +155,23 @@ Replace the paths; use your configured store if different. Do not add this serve
 to the companion's own `mcp.json`: its task tools are already registered. External
 clients can share the SQLite database. `tests/test_tasks.py` covers the stdio entry
 point with a real subprocess round trip. For other tool servers, copy
-`mcp.json.example` to `mcp.json` and edit it.
+`mcp.json.example` to `mcp.json`, edit it, and point `tools.mcp_config` at it.
+
+MCP servers are third-party code, so Riko treats them that way:
+
+- **Approval.** Each tool from an MCP server asks before every call until you
+  allow it in Settings -> Tools (Electron asks you to confirm), or set
+  `"require_approval": false` for that server in `mcp.json`.
+- **Environment.** A stdio server starts with a minimal environment (PATH, HOME or
+  the Windows system folders, locale and temp settings, and `RIKO_DATA_DIR` /
+  `RIKO_CONFIG`), never the backend's API keys or the Discord token. Put the
+  values a server needs in its `env`, or list the names it may inherit in
+  `inherit_env` (for example `["HTTPS_PROXY"]`). The backend log notes how many
+  variables each server started without.
+- **Untrusted text.** The model sees a server's tool descriptions, results and
+  errors framed as untrusted data, never as instructions, with the text in its
+  parameter definitions shortened; the Activity panel shows the raw result. A tool
+  whose definition is still over 32 KiB is not loaded.
 
 ## Optional Discord entry point
 
@@ -238,7 +261,7 @@ do not erase blobs from historical commits; see the repository review.
 - ASR: [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper).
 # Performance diagnostics
 
-Settings -> Performance & logs includes logging level (DEBUG, INFO, WARNING, ERROR), file logging, inference timings, rotation size and backup count. Restart Python after saving these settings. The rotating file is `logs/debug.log`; review it before sharing. Timing instrumentation does not record conversation text. DEBUG records inference slot wait/context packing and Julia interpretation duration; INFO records generation duration and throughput.
+Settings -> Performance & logs includes logging level (DEBUG, INFO, WARNING, ERROR), file logging, inference timings, rotation size and backup count. Restart Python after saving these settings. The rotating file is `logs/debug.log`; review it before sharing. Secrets (API keys, tokens, this start's API token) are redacted there and in the console. The packaged app also writes the backend's console output to `logs/backend-launch.log` (whatever file logging says, since it is what a startup crash leaves): capped at 5 MiB with two older copies, its secrets redacted. Timing instrumentation does not record conversation text. DEBUG records inference slot wait/context packing and Julia interpretation duration; INFO records generation duration and throughput.
 
 Chat displays live llama.cpp per-request token counts and tokens/second from `timings_per_token`. Other providers use explicitly labelled estimates until final usage arrives. Counts include reasoning tokens. Julia remains live for cumulative partial user transcriptions. Settings -> Custom neural network settings manages the agent-expression probe and training data.
 

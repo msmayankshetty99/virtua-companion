@@ -23,6 +23,8 @@ EDGES = {
     # Features register their settings sections (kernel/schema.py); app_core/__init__.py, not configuration, imports them.
     'configuration': {'kernel': 'load', 'persistence': 'load'},
     'conversation': {'emotion': 'lazy', 'kernel': 'load', 'persistence': 'load'},
+    # Media, avatar and import paths are checked as text before anything resolves them (kernel/safe_paths.py).
+    'desktop': {'kernel': 'load'},
     'emotion': {'kernel': 'load'},
     # ResourceEvents computes resource.<topic> on a kernel DaemonExecutor, so a publisher's thread never runs a getter.
     'events': {'kernel': 'load'},
@@ -33,7 +35,8 @@ EDGES = {
     'inference': {'events': 'lazy', 'kernel': 'load'},
     'integrations': {'audio': 'load', 'desktop': 'lazy', 'events': 'load', 'kernel': 'load', 'persistence': 'load'},
     'persistence': {'emotion': 'lazy', 'events': 'lazy', 'kernel': 'load'},
-    'resources': {'audio': 'lazy', 'events': 'lazy', 'inference': 'load'},
+    # The estimate resolves a torch model's device (kernel/torch_device.py) only when it computes one.
+    'resources': {'audio': 'lazy', 'events': 'lazy', 'inference': 'load', 'kernel': 'lazy'},
     'runtime': {'animation': 'lazy', 'audio': 'load', 'events': 'load', 'kernel': 'load', 'persistence': 'load', 'tools': 'lazy'},
     'tools': {'events': 'load', 'kernel': 'load', 'persistence': 'load'},  # the factory registers the desktop tools
 }

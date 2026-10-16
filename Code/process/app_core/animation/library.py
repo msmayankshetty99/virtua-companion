@@ -7,6 +7,7 @@ from pathlib import Path
 import struct
 import threading
 
+from ..kernel.safe_paths import local_path
 from ..kernel.schema import Section, Setting, register
 from ..kernel.validation import boolean, number
 from ..persistence.atomic import atomic_write
@@ -142,7 +143,7 @@ class AnimationLibrary:
         return path
 
     def import_file(self, source, options=None):
-        source = Path(source).expanduser().resolve()
+        source = local_path(source, Path.cwd()).resolve()  # any local file; a network path is refused before it resolves
         kind = 'vrma' if source.suffix.lower() == '.vrma' else 'pose' if source.name.lower().endswith('.pose.json') else None
         if kind is None: raise ValueError('Import supports .vrma and .pose.json; convert other formats first')
         if not source.is_file() or not 0 < source.stat().st_size <= MAX_BYTES: raise ValueError('Missing or oversized animation file')

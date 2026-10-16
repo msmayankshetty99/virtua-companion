@@ -3,7 +3,9 @@
 however it is named. tool_approvals.json is {"version": 2, "sources": {source: {name: bool}}, "legacy": {name: bool}},
 true meaning ask before each call; a file from before sources ({name: bool}) loads as legacy and is rewritten on the
 next save. The file also keeps a top-level {name: bool} mirror, ignored here: builds before sources read only that, so a
-downgrade still asks before any tool that some source asks before (it fails closed, never open)."""
+downgrade still asks before any tool that some source asks before (it fails closed, never open). A tool without a rule
+follows its default: tools.require_approval for Riko's own, and for a configured MCP server's "ask first" unless that
+server's mcp.json entry says "require_approval": false (server_defaults)."""
 from collections.abc import Mapping
 from copy import deepcopy
 from contextvars import ContextVar
@@ -33,8 +35,8 @@ def flags(rules): return {name: rule for name, rule in rules.items() if type(rul
 
 
 class ToolApprovals:
-    def __init__(self, path, default=False):
-        self.path, self.default = path, default
+    def __init__(self, path, default=False, server_defaults=None):
+        self.path, self.default, self.server_defaults = path, default, dict(server_defaults or {})  # {mcp:<name>: bool}
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.pending, self.policy, self.legacy = {}, {}, {}
@@ -66,17 +68,23 @@ class ToolApprovals:
             legacy = self.legacy.get(key[1])
             return legacy if key[0] == RIKO or legacy is True else None
 
+    def fallback(self, key):
+        """Whether the tool (source, name) asks first without a rule: a configured server's does unless mcp.json says not."""
+        return self.server_defaults.get(key[0], True) if key[0].startswith('mcp:') else self.default
+
     def required(self, key):
         """Whether each call of the tool (source, name) needs approval: every call while the policy is unreadable."""
         rule = self.rule(key)
-        return bool(self.error) or (self.default if rule is None else rule)
+        return bool(self.error) or (self.fallback(key) if rule is None else rule)
 
     def snapshot(self, tools=None):
-        """policy maps each tool in tools (approval_keys) to its rule; without tools, Riko's own tools by name."""
+        """policy maps each tool in tools (approval_keys) to its rule, required to whether it asks first now (its rule, else
+        its default: fallback()); without tools, Riko's own tools by name."""
         with self.lock:
             keys = approval_keys(tools) if tools is not None else {name: (RIKO, name) for name in [*self.legacy, *(n for s, n in self.policy if s == RIKO)]}
             # Report the enforced default: while the policy is unreadable every tool needs approval.
             return {'default_required': self.default or bool(self.error), 'policy': {name: rule for name, key in keys.items() if (rule := self.rule(key)) is not None},
+                'required': {name: self.required(key) for name, key in keys.items()},
                 'error': self.error, 'pending': [deepcopy(v['request']) for v in self.pending.values() if v['decision'] is None]}
 
     def configure(self, policy, names):
@@ -98,7 +106,7 @@ class ToolApprovals:
             def enforced(key):  # this build's rule for key once saved: explicit, then legacy, then the default
                 rule = updated.get(key)
                 if rule is None: rule = legacy.get(key[1]) if key[0] == RIKO or legacy.get(key[1]) is True else None
-                return self.default if rule is None else rule
+                return self.fallback(key) if rule is None else rule
             mirror = dict(legacy)  # for older builds, by name alone: ask first when any registered source would ask
             for key in {*updated, *keys.values()}: mirror[key[1]] = mirror.get(key[1], False) or enforced(key)
             atomic_write(self.path, json.dumps({**mirror, 'version': VERSION, 'sources': sources, **({'legacy': legacy} if legacy else {})}, indent=2))

@@ -44,6 +44,7 @@ class InferenceProvider(Lane, Protocol):
     def set_pause_background(self, enabled: bool) -> None: ...  # runtime.pause_background_on_live, applied live
     def set_expression_idle(self, idle: Callable[[], bool]) -> None: ...  # the session's quiet check (RuntimeStatus.is_quiet)
     def expression_idle(self) -> bool: ...
+    def devices(self) -> list[dict] | None: ...  # ggml's devices with their memory (riko_devices), None when unknown
     def close(self) -> None: ...
 
 
@@ -101,6 +102,7 @@ class BaseProvider:
     def set_pause_background(self, enabled): pass
     def set_expression_idle(self, idle): self._expression_idle = idle
     def expression_idle(self): return self._expression_idle()
+    def devices(self): return None  # only the in-process llama.cpp provider can ask ggml
     def close(self): pass
 
 

@@ -81,7 +81,7 @@ export function fakeChild(){
 export function fakeRelease(log,{port=9123,microphone=()=>Promise.resolve(null)}={}){
  const release={children:[],started:[]};const record=(method,args)=>log.push({target:release,method,args});
  Object.assign(release,{
-  hardware:async()=>{record('hardware',[]);return {cpu:'Test CPU'};},
+  hardware:async(...args)=>{record('hardware',args);return {cpu:'Test CPU'};},
   saveSetup:(...args)=>{record('saveSetup',args);return args[0];},installRoot:exe=>path.dirname(exe),
   askMicrophone:preferences=>{record('askMicrophone',[preferences]);return microphone();},
   freePort:async()=>{record('freePort',[]);return port;},

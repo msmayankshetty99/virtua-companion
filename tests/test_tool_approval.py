@@ -158,3 +158,44 @@ def test_the_mirror_also_asks_first_for_a_name_a_server_tool_asks_about_by_defau
     saved = json.loads(path.read_text(encoding='utf-8'))
     assert saved['todo_list'] is True and saved['sources'] == {'riko': {'todo_list': False}}
     assert [ToolApprovals(path, True).required(key) for key in tools.values()] == [False, True]
+
+
+def test_a_configured_servers_tools_ask_first_unless_its_mcp_json_entry_opts_out(tmp_path):
+    from process.app_core.tools.tool import RIKO
+    path = tmp_path / 'tool_approvals.json'
+    gate = ToolApprovals(path, False, {'mcp:trusted': False})  # tools.require_approval: false
+    tools = {'lookup': (RIKO, 'lookup'), 'fetch': ('mcp:web', 'fetch'), 'web__lookup': ('mcp:web', 'lookup'), 'read': ('mcp:trusted', 'read')}
+    try:
+        assert [gate.required(key) for key in tools.values()] == [False, True, True, False]
+        assert gate.snapshot(tools)['required'] == {'lookup': False, 'fetch': True, 'web__lookup': True, 'read': False}
+        gate.configure({'fetch': False, 'read': True}, tools)  # an explicit rule wins over either default
+        assert [gate.required(key) for key in tools.values()] == [False, False, True, True]
+        saved = json.loads(path.read_text(encoding='utf-8'))
+        assert saved['lookup'] is True  # the name-only mirror older builds read asks first: the server's lookup does
+        assert gate.authorize('web__lookup', {}, 'call', timeout=.05, key=('mcp:web', 'lookup')) is False  # asked, nobody answered
+    finally: gate.close()
+    path.write_text('{"fetch": false, "lookup": false}', encoding='utf-8')  # saved before rules had sources
+    old = ToolApprovals(path, False)
+    assert old.required((RIKO, 'lookup')) is False and old.required(('mcp:web', 'fetch')) is True  # a legacy free pass never reaches a server
+
+
+def test_from_config_reads_each_servers_require_approval(tmp_path, monkeypatch):
+    from process.app_core.configuration.config import load_config
+    from process.app_core.tools import registry as registry_module
+    (tmp_path / 'mcp.json').write_text(json.dumps({'mcpServers': {'open': {'command': 'x', 'require_approval': False},
+        'default': {'command': 'x'}, 'typo': {'command': 'x', 'require_approval': 'false'}}}), encoding='utf-8')
+    (tmp_path / 'character_config.yaml').write_text('tools:\n  mcp_config: mcp.json\n  require_approval: false\n', encoding='utf-8')
+    class Fake:
+        def __init__(self, server): self.server = server
+        def list_tools(self): return [{'name': 'tool_' + self.server['command'], 'inputSchema': {'type': 'object'}}]
+        def close(self): pass
+    connected, notes = [], []
+    monkeypatch.setattr(registry_module, 'connect', lambda server: connected.append(server) or Fake(server))
+    class Activity:
+        def notify(self, source, text, level='info'): notes.append(text)
+    registry = ToolRegistry.from_config(load_config(tmp_path / 'character_config.yaml'), activity=Activity())
+    try:
+        assert registry.approvals.server_defaults == {'mcp:open': False}
+        assert not registry.approvals.required(('mcp:open', 'tool_x')) and registry.approvals.required(('mcp:default', 'tool_x'))
+        assert len(connected) == 2 and any('typo' in note and 'require_approval must be true or false' in note for note in notes)
+    finally: registry.close()

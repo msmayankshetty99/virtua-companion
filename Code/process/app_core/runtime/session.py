@@ -240,9 +240,11 @@ class SessionManager:
         initiative = self.initiative.snapshot() if self.initiative else None
         return {'observed_at': datetime.now().astimezone().isoformat(timespec='seconds'),
                 'runtime': runtime, 'desktop': desktop,
+                # idle/active_application: off, unsupported (this OS or desktop), waiting, available or error, from the last sample
                 'perception': {'screen': 'unavailable',
                     'computer': initiative['environment'] if initiative else {},
-                    'active_application': 'enabled' if initiative and initiative['settings']['enabled'] and initiative['settings']['observe_active_app'] else 'unavailable'}}
+                    'idle': initiative['perception']['idle'] if initiative else 'unavailable',
+                    'active_application': initiative['perception']['active_app'] if initiative else 'unavailable'}}
 
     def present_initiative(self, message, *, spoken=False, guard=lambda: False):
         """Commit a background proposal only while foreground interaction is idle."""

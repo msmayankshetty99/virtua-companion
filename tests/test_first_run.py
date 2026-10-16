@@ -94,6 +94,10 @@ def test_setup_writes_bundled_backend_only_for_a_bundle_this_os_ships(tmp_path):
     with pytest.raises(ValueError, match=r'^Choose CUDA or Vulkan$'): setup_config({**FORM, 'backend': 'metal'}, 'win32', mac)
     with pytest.raises(ValueError, match='Choose CUDA or Vulkan'): setup_config({**FORM, 'backend': '../native'}, 'linux', mac)
     with pytest.raises(ValueError, match='No native backend ships for freebsd'): setup_config(FORM, 'freebsd', mac)
+    # The opt-in hip bundle: written when the installation holds it, refused (by its missing library) when it does not.
+    assert setup_config({**FORM, 'backend': 'hip'}, 'linux', application(tmp_path / 'hip', 'hip', 'linux'))['runtime']['native_library'] == 'bundled:hip'
+    with pytest.raises(ValueError, match=r'Packaged native backend is missing: .*hip.libriko-native\.so'): setup_config({**FORM, 'backend': 'hip'}, 'linux', mac)
+    with pytest.raises(ValueError, match=r'^Choose CUDA or Vulkan$'): setup_config({**FORM, 'backend': 'hip'}, 'win32', mac)
 
 
 def test_setup_text_is_checked_as_settings_checks_an_edit_and_leaves_nothing_behind(host, monkeypatch):

@@ -106,6 +106,14 @@ def test_an_existing_file_keeps_its_permissions_and_a_new_one_is_owner_only(tmp_
     assert (shared.stat().st_mode & 0o777, private.stat().st_mode & 0o777) == (0o644, 0o600)
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX permission bits')
+def test_an_explicit_mode_replaces_the_existing_files_permissions(tmp_path):
+    backup = tmp_path / 'character_config.yaml.previous'
+    backup.write_text('old', encoding='utf-8'); backup.chmod(0o644)
+    atomic_write(backup, 'api_key: x', mode=0o600)  # settings_store's backup: owner-only whatever an older build left
+    assert backup.stat().st_mode & 0o777 == 0o600 and backup.read_text() == 'api_key: x'
+
+
 def test_a_leftover_fixed_temporary_name_no_longer_blocks_history_saves(tmp_path):
     path = tmp_path / 'chat_history.json'
     (tmp_path / 'chat_history.json.tmp').mkdir()  # e.g. a stale or still-scanned temporary file under the old fixed name

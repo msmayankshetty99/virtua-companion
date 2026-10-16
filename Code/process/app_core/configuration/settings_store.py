@@ -15,10 +15,15 @@ import threading
 from . import schema
 from .config import AppConfig, load_config
 from .paths import DataPaths
-from .schema import UNKNOWN, field, flatten  # noqa: F401  (callers and tests import field and UNKNOWN from here)
+from .schema import UNKNOWN, field, flatten, secret  # noqa: F401  (callers and tests import field and UNKNOWN from here)
+from ..kernel.safe_paths import local_path
 from ..persistence.atomic import atomic_write
 
 LOCK = threading.RLock()
+# What Settings sends for a saved secret (schema.secret: API keys, tokens, passwords) instead of its value; a change equal to
+# it means "keep the saved value" (kept()). The renderer never receives a secret, so a page that displays text cannot leak it.
+SECRET_MASK = '\u2022' * 8
+EXTERNAL = 'Set outside character_config.yaml (an environment variable or a top-level key); a value saved here overrides it.'
 
 
 class SettingsConflict(ValueError): pass
@@ -31,6 +36,37 @@ def unknown_warnings(raw):
 
 
 def revision(text): return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def kept(changes):
+    """changes without the secrets left as SECRET_MASK: an untouched masked field keeps its saved value."""
+    if not isinstance(changes, dict): return changes
+    return {path: value for path, value in changes.items() if not (value == SECRET_MASK and secret(path))}
+
+
+def stored(raw, path):
+    """The YAML's own value at a dotted path (None when absent), not the effective one."""
+    node = raw
+    for key in path.split('.'):
+        if not isinstance(node, dict) or key not in node: return None
+        node = node[key]
+    return node
+
+
+def mask(values, fields, raw):
+    """Replace each secret in values (and say so on its field): SECRET_MASK for one the YAML holds; '' for one that comes
+    from elsewhere (RIKO_API_KEY, a legacy top-level key), so an environment variable is never sent; the default as is. A
+    key PyYAML reads as a number (api_key: 123456789) is a secret too."""
+    specs = {item['path']: item for item in fields}
+    for path, value in values.items():
+        if not secret(path) or isinstance(value, bool) or not isinstance(value, (str, int, float)) or value == '': continue
+        spec, saved = specs.get(path), stored(raw, path)
+        if saved is not None and saved != '': values[path], state = SECRET_MASK, 'saved'
+        elif value != schema.declared_default(path): values[path], state = '', 'external'
+        else: continue
+        if spec is not None:
+            spec['secret_state'] = state
+            if state == 'external': spec['help'] = ' '.join(filter(None, (spec.get('help'), EXTERNAL)))
 
 
 def value_error(spec, value, current):
@@ -84,14 +120,19 @@ class SettingsStore:
         warnings = unknown_warnings(raw)
         for item in fields:
             if any(item['path'] == path or item['path'].startswith(path + '.') for path in warnings): item.update(unknown=True, help=UNKNOWN)
+        mask(values, fields, raw)  # after the fields, built from the real values
         pending = self.pending(candidate)
         # restart_pending ({path: restart scope}) and rules (checks across settings, kernel/schema.py Rule) are additions;
-        # restart_required used to be always true.
-        result = {'revision': revision(text), 'values': values, 'fields': fields, 'path': str(self.path), 'restart_required': bool(pending),
+        # restart_required used to be always true. The config's absolute path is no longer sent.
+        result = {'revision': revision(text), 'values': values, 'fields': fields, 'restart_required': bool(pending),
             'restart_pending': pending, 'rules': schema.rules()}
         return {**result, 'warnings': warnings} if warnings else result
 
     def _values(self, raw): return schema.values(load_config(self.path, recover=True), raw)  # effective defaults, not just what the YAML holds
+
+    def stored_values(self):
+        """The effective values, secrets unmasked: for comparisons in the backend only, never for a response."""
+        return self._values(self._read()[1])
 
     def pending(self, candidate):
         """{path: restart scope} for saved settings that differ from what the running backend loaded, both read as it
@@ -105,8 +146,10 @@ class SettingsStore:
         text, raw = self._read()
         values = self._values(raw); errors = {}
         if not isinstance(changes, dict) or len(changes) > 300: raise ValueError('Invalid settings patch')
+        changes = kept(changes)
         for path, value in changes.items():
             if path not in values: errors[path] = 'Unknown setting'; continue
+            if secret(path) and isinstance(value, str) and SECRET_MASK in value: errors[path] = 'Type the whole new value, or clear the field'; continue
             error = value_error(field(path, values[path]), value, values[path])
             if error: errors[path] = error
             else:
@@ -144,7 +187,7 @@ class SettingsStore:
 
     def validate(self, changes):
         with LOCK:
-            _, _, errors = self.prepare(changes)
+            _, _, errors = self.prepare(kept(changes))
             warnings = unknown_warnings(self._read()[1])
             return {'valid': not errors, 'errors': errors, **({'warnings': warnings} if warnings else {})}
 
@@ -175,6 +218,7 @@ class SettingsStore:
 
     def save(self, changes, expected_revision):
         with LOCK:
+            changes = kept(changes)
             text, output, errors = self.prepare(changes)
             if revision(text) != expected_revision or revision(self.path.read_text(encoding='utf-8')) != expected_revision:
                 raise SettingsConflict('Configuration changed outside this editor. Reload before saving.')
@@ -187,9 +231,8 @@ class SettingsStore:
                 saved_preferences = json.loads(preferences.read_text(encoding='utf-8'))
                 if not isinstance(saved_preferences, dict): raise ValueError('Live initiative preferences must be an object')
                 saved_preferences.update(budget_changes)
-            # Keep a previous config, including its comments and unknown settings.
-            backup = self.path.with_suffix(self.path.suffix + '.previous')
-            backup.write_text(text, encoding='utf-8')
+            # Keep a previous config, including its comments and unknown settings: owner-only, like the config (it may hold keys).
+            atomic_write(self.path.with_suffix(self.path.suffix + '.previous'), text, mode=0o600)
             fd, temporary = tempfile.mkstemp(prefix='.settings-save-', dir=self.path.parent)
             try:
                 with os.fdopen(fd, 'w', encoding='utf-8') as stream:
@@ -204,9 +247,21 @@ class SettingsStore:
             # Whether this save needs a restart; snapshot()'s restart_pending also names earlier saves still waiting for one.
             return {**self.snapshot(), 'saved': True, 'restart_required': any(schema.restart_scope(key) != 'none' for key in changes)}
 
-    def check_path(self, value):
-        if not isinstance(value, str) or len(value) > 4096: raise ValueError('Invalid path')
-        path = Path(value).expanduser()
-        if not path.is_absolute(): path = self.path.parent / path
-        executable = shutil.which(value)
-        return {'resolved': executable or str(path.resolve()), 'exists': path.exists(), 'directory': path.is_dir(), 'executable': executable}
+    def check_path(self, key, value):
+        """Settings' path check for the file or folder setting key: whether value exists, as an absolute path (never
+        symlink-resolved), or the PATH match of a bare command for an executable. Any other setting, and a network or
+        device path (kernel/safe_paths.py: checked as text, so it is never contacted), is refused."""
+        if not isinstance(value, str) or not value or len(value) > 4096: raise ValueError('Invalid path')
+        values = self.stored_values()
+        if not isinstance(key, str) or key not in values or not schema.offered(key) or not field(key, values[key])['file']:
+            raise ValueError('Path checks are only for file and folder settings')
+        if key == 'runtime.native_library' and value.startswith('bundled:'):  # a library inside the installed app, not a path
+            from ..kernel.code_paths import CodePaths
+            from .native_backends import bundled_library
+            path = bundled_library(value.split(':', 1)[1], CodePaths.current().bundle)
+            return {'resolved': str(path), 'exists': path.is_file(), 'directory': False, 'executable': False}
+        if key.endswith('executable') and not any(separator in value for separator in '/\\'):
+            command = shutil.which(value)
+            if command: return {'resolved': command, 'exists': True, 'directory': False, 'executable': True}
+        path = local_path(value, self.path.parent)
+        return {'resolved': str(path), 'exists': path.exists(), 'directory': path.is_dir(), 'executable': False}

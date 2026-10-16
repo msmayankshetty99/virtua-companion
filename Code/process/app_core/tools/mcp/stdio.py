@@ -3,14 +3,54 @@ from __future__ import annotations
 
 from concurrent.futures import TimeoutError
 import json
+import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
 import time
 
 from ..tool import ToolCancelled
+
+logger = logging.getLogger(__name__)
+# An MCP server is third-party code, and the backend's environment holds API keys (RIKO_API_KEY, OPENAI_API_KEY, HF_TOKEN),
+# the Discord token and whatever else the user exported. A server starts with only what a process needs to run (the
+# official MCP SDK's default set), Riko's data location (so a configured Code/task_mcp_server.py finds the store), the
+# names its mcp.json entry lists in inherit_env, and its own env.
+SAFE_ENVIRONMENT = {
+    'nt': ('APPDATA', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'PATH', 'PATHEXT', 'PROCESSOR_ARCHITECTURE', 'SYSTEMDRIVE',
+        'SYSTEMROOT', 'TEMP', 'TMP', 'USERNAME', 'USERPROFILE', 'WINDIR', 'COMSPEC', 'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)',
+        'PROGRAMW6432', 'COMMONPROGRAMFILES', 'NUMBER_OF_PROCESSORS', 'OS'),
+    'posix': ('HOME', 'LOGNAME', 'USER', 'PATH', 'SHELL', 'TERM', 'LANG', 'TZ', 'TMPDIR', 'XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME',
+        'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'SSL_CERT_FILE', 'SSL_CERT_DIR')}
+RIKO_ENVIRONMENT = ('RIKO_DATA_DIR', 'RIKO_CONFIG')
+ENVIRONMENT_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_()]*')
+
+
+def server_environment(declared=None, inherit=(), environ=None, *, windows=None):
+    """An MCP server's environment: the safe set and RIKO_DATA_DIR/RIKO_CONFIG from environ (os.environ), the names in
+    inherit, then declared (its mcp.json env), which wins. Names match case-insensitively on Windows; a value starting with
+    '()' (an exported shell function) is dropped. MCP stdio is UTF-8: Python servers on Windows write the ANSI code page
+    unless told otherwise, and one byte that does not decode would stop the stderr drain, so PYTHONIOENCODING is utf-8
+    unless declared says otherwise (it changes only their stdio, not their file encodings)."""
+    environ = os.environ if environ is None else environ
+    windows = os.name == 'nt' if windows is None else windows
+    fold = str.upper if windows else str
+    wanted = {fold(name) for name in (*SAFE_ENVIRONMENT['nt' if windows else 'posix'], *RIKO_ENVIRONMENT, *inherit)}
+    kept = {name: value for name, value in environ.items()
+        if (fold(name) in wanted or not windows and name.startswith('LC_')) and not str(value).startswith('()')}
+    return {'PYTHONIOENCODING': 'utf-8', **kept, **(declared or {})}
+
+
+def inherited_names(value):
+    """mcp.json's inherit_env for one server: a list of environment variable names, else ValueError (the server is not
+    loaded and the Tools notice says why)."""
+    if value is None: return ()
+    if not isinstance(value, (list, tuple)) or not all(isinstance(name, str) and ENVIRONMENT_NAME.fullmatch(name) for name in value):
+        raise ValueError('inherit_env must be a list of environment variable names')
+    return tuple(value)
 
 
 def resolve_command(command, env):
@@ -25,15 +65,16 @@ def resolve_command(command, env):
 
 class StdioMCPClient:
     """Minimal MCP JSON-RPC stdio client with a persistent server process."""
-    def __init__(self, command: str, args: list[str] | None = None, env: dict[str, str] | None = None):
-        self.command, self.args, self.env = command, args, env
+    def __init__(self, command: str, args: list[str] | None = None, env: dict[str, str] | None = None, inherit=()):
+        self.command, self.args, self.env, self.inherit = command, args, env, inherited_names(inherit)
         self._restart_lock = threading.Lock()
+        withheld = len(set(os.environ) - set(server_environment(self.env, self.inherit)))
+        if withheld: logger.info('MCP server %s starts without %d of the backend\'s environment variables; list names in its inherit_env to pass them',
+            os.path.basename(str(command)), withheld)
         self._start()
 
     def _start(self):
-        # MCP stdio is UTF-8. Python servers on Windows write the ANSI code page unless told otherwise, and one byte that
-        # does not decode would stop the stderr drain; PYTHONIOENCODING changes only their stdio, not their file encodings.
-        environment = {'PYTHONIOENCODING': 'utf-8', **os.environ, **(self.env or {})}
+        environment = server_environment(self.env, self.inherit)  # never the backend's whole environment (its keys and tokens)
         process = subprocess.Popen([resolve_command(self.command, environment), *(self.args or [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', bufsize=1, env=environment)
         responses = queue.Queue(maxsize=256)

@@ -1,6 +1,7 @@
 import React, {useEffect, useState} from 'react';
 import useResource from './use_resource.jsx';
 import {request} from './api.mjs';
+import {awarenessToggles,perceptionLine,privacyNote} from './initiative_model.mjs';
 
 export default function InitiativeSettings() {
   const [status, setStatus, streamError] = useResource('initiative');
@@ -36,17 +37,16 @@ export default function InitiativeSettings() {
   return <section className="panel">
     <h2>Initiative & event rules</h2>
     <p>Optional background checks can initiate conversation. Disabled by default; bubbles by default.</p>
-    <p>Idle monitoring reads time since keyboard/mouse activity, not keys. App monitoring shares the foreground window title and process ID with your configured model provider. No screenshots are captured.</p>
+    <p>{privacyNote(status?.capabilities)}</p>
     {error && <p role="alert">{error}</p>}
     {streamError&&<p role="alert">{streamError}</p>}
     {!settings ? <button onClick={load}>Connect / retry</button> : <>
       {[
-        ['enabled', 'Enable initiative checks'],
-        ['observe_idle', 'Allow computer idle/return awareness'],
-        ['observe_active_app', 'Allow foreground window title/process awareness'],
-        ['spoken_enabled', 'Allow spoken presentation for spoken rules'],
-        ['allow_urgent_spoken', 'Allow model-marked urgent spoken overrides'],
-      ].map(([key, label]) => <label key={key} style={{display: 'block'}}><input type="checkbox" checked={settings[key]} onChange={e => change(key, e.target.checked)}/>{label}</label>)}
+        {key: 'enabled', label: 'Enable initiative checks'},
+        ...awarenessToggles(status?.capabilities),
+        {key: 'spoken_enabled', label: 'Allow spoken presentation for spoken rules'},
+        {key: 'allow_urgent_spoken', label: 'Allow model-marked urgent spoken overrides'},
+      ].map(({key, label, disabled, reason}) => <label key={key} style={{display: 'block'}} title={reason || undefined}><input type="checkbox" disabled={!!disabled} checked={settings[key] && !disabled} onChange={e => change(key, e.target.checked)}/>{label}{reason && <span className="caption"> · {reason}</span>}</label>)}
       {[
         ['interval_seconds', 'Periodic check interval (seconds)', 10],
         ['idle_seconds', 'Become idle after (seconds)', 5],
@@ -60,7 +60,7 @@ export default function InitiativeSettings() {
         <label><input type="checkbox" checked={rule.enabled} onChange={e => ruleChange(index, 'enabled', e.target.checked)}/>Enabled</label>
         <label>Event<select value={rule.event} onChange={e => ruleChange(index, 'event', e.target.value)}>{status.triggers.map(trigger => <option key={trigger.event} value={trigger.event}>{trigger.description}</option>)}</select></label>
         <label>Minimum idle seconds<input type="number" min="0" value={rule.min_idle_seconds || 0} onChange={e => ruleChange(index, 'min_idle_seconds', Number(e.target.value))}/></label>
-        <label>Window title contains<input value={rule.app_contains || ''} onChange={e => ruleChange(index, 'app_contains', e.target.value)}/></label>
+        <label>App name or window title contains<input value={rule.app_contains || ''} onChange={e => ruleChange(index, 'app_contains', e.target.value)}/></label>
         <label>Rule cooldown seconds<input type="number" min="0" value={rule.cooldown_seconds} onChange={e => ruleChange(index, 'cooldown_seconds', Number(e.target.value))}/></label>
         <label>Model instruction<textarea maxLength="2000" value={rule.instruction} onChange={e => ruleChange(index, 'instruction', e.target.value)}/></label>
         <label>Presentation<select value={rule.presentation} onChange={e => ruleChange(index, 'presentation', e.target.value)}><option value="bubble">Bubble</option><option value="spoken">Spoken (requires permission)</option></select></label>
@@ -74,6 +74,7 @@ export default function InitiativeSettings() {
       <input maxLength="2000" value={context} onChange={e => setContext(e.target.value)} placeholder="Event context"/>
       <button onClick={testEvent}>Publish custom event</button>
       <p>{!status.settings.enabled ? 'Checks disabled' : status.busy ? 'Evaluating an event…' : 'Observer ready'}{status.error && ` · ${status.error}`}</p>
+      {status.perception && <p className="caption">{perceptionLine(status.perception)}</p>}
       <p>Last model check: {status.last_check || 'None yet'}{status.last_decision && ` · ${status.last_decision.initiate ? 'Initiate' : 'Remain silent'}`}</p>
       <pre>{JSON.stringify(status.environment, null, 2)}</pre>
     </>}

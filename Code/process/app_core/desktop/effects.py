@@ -81,12 +81,12 @@ class EffectLibrary:
         return max(candidates, key=lambda rule: rule.min_intensity, default=None)
 
     def find_asset(self, name: str) -> Path | None:
-        requested = Path(name)
-        if requested.exists(): return requested
+        """A discovered asset named name (file name or stem), else name in the library's folder when it is a bare file
+        name. The model chose name, so nothing here touches the filesystem; resolve_media checks the result."""
         for paths in self.assets.values():
             for path in paths:
                 if path.name == name or path.stem == name: return path
-        return None
+        return self.directory / name if isinstance(name, str) and name and Path(name).name == name and '\\' not in name else None
 
 
 class EffectsModel:

@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 from ..kernel.code_paths import CodePaths
-from .native_backends import backends_for, bundled_library, manifest
+from .native_backends import backends_for, bundled_library, manifest, release_backends
 from .paths import config_file
 from .settings_store import SettingsStore
 
@@ -40,7 +40,8 @@ def setup_config(choices, platform=None, bundle=None):
     shipped, backend = backends_for(platform), choices.get('backend')
     if backend not in shipped:
         labels = {item['id']: item['label'] for item in manifest()['backends']}
-        raise ValueError('Choose ' + ' or '.join(labels[name] for name in shipped) if shipped else f'No native backend ships for {platform}')
+        # The default bundles: an optional one (hip) is offered only where installed, and its missing bundle is reported below.
+        raise ValueError('Choose ' + ' or '.join(labels[name] for name in release_backends(platform)) if shipped else f'No native backend ships for {platform}')
     library = bundled_library(backend, bundle if bundle is not None else CodePaths.current().bundle, platform)
     if not library.exists(): raise ValueError(f'Packaged native backend is missing: {library}')
     context, output, threads = (whole(choices.get(key)) for key in ('context', 'output', 'threads'))

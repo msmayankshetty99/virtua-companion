@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 
+from process.app_core.tools.mcp import untrusted_output
 from process.app_core.tools.registry import RegisteredTool, StdioMCPClient, ToolRegistry
 
 
@@ -84,6 +85,6 @@ for line in sys.stdin:
         assert any(m.get('method') == 'notifications/cancelled' and m['params']['requestId'] == call['id'] for m in logged())
         assert registry._running['slow'].done()
         answer = registry.execute('fast', {})  # the late 'slow' reply is skipped, not mistaken for this one
-        assert not answer.is_error and answer.content == 'fast answer'
+        assert not answer.is_error and answer.content == untrusted_output('test', 'fast', 'fast answer')  # framed: a server's text
         assert client.process.poll() is None  # the server was not restarted
     finally: registry.close()

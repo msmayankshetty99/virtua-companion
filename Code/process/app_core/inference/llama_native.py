@@ -26,6 +26,9 @@ CANCEL = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
 # Every NativeRuntime from riko_create until riko_destroy returns; a None handle is still loading. ggml-metal keeps
 # its devices in a C++ static whose destructor, run by exit(), asserts that every Metal buffer was already freed.
 _LIVE = set()
+# riko_devices runs on telemetry threads: at exit, no call may still be in flight when exit() runs those destructors.
+_DEVICES_LOCK, _EXITING = threading.Lock(), False
+DEVICE_TYPES = {'cpu', 'gpu', 'igpu', 'accel', 'other'}
 
 
 def release_native(timeout):
@@ -42,6 +45,10 @@ def release_native(timeout):
 def _release_at_exit():
     # Python's atexit runs before C++ static destructors. A context that cannot be destroyed in time is left to the
     # OS instead: os._exit skips those destructors, so Metal cannot turn the exit into a GGML_ASSERT abort.
+    global _EXITING
+    locked = _DEVICES_LOCK.acquire(timeout=2)  # a device query finishes in microseconds; never hang the exit on one
+    _EXITING = True
+    if locked: _DEVICES_LOCK.release()
     if not _LIVE: return
     try:
         import signal
@@ -54,6 +61,8 @@ def _release_at_exit():
 
 
 class NativeRuntime:
+    devices_function, devices_warned = None, False  # riko_devices, when the bridge has it (_bind)
+
     def __init__(self, library, arguments, interval=0):
         path = Path(library).resolve()
         self.lock, self.requests, self.closed, self.handle = threading.Lock(), set(), False, None
@@ -81,6 +90,35 @@ class NativeRuntime:
         self.dll.riko_set_interval.restype = ctypes.c_int
         self.dll.riko_stop.argtypes = self.dll.riko_destroy.argtypes = [ctypes.c_void_p]
         self.dll.riko_stop.restype = self.dll.riko_destroy.restype = None
+        # Optional: a bridge built before riko_devices lacks it (ctypes raises AttributeError), and telemetry falls back.
+        self.devices_function = getattr(self.dll, 'riko_devices', None)
+        if self.devices_function is not None:
+            self.devices_function.argtypes, self.devices_function.restype = [ctypes.c_char_p, ctypes.c_size_t], ctypes.c_int
+
+    def devices(self):
+        """ggml's devices with their memory in bytes (riko_devices), or None: an older bridge, a closed runtime, the process
+        exiting, or a failure (logged once). Metal's figures are this process's working set, not the whole GPU's."""
+        function = self.devices_function
+        if function is None: return None
+        with _DEVICES_LOCK:
+            if _EXITING or self.closed: return None
+            buffer = ctypes.create_string_buffer(16384)
+            length = function(buffer, len(buffer))
+            if length >= len(buffer):  # the list outgrew the buffer (nothing was written): once more, with room for it
+                buffer = ctypes.create_string_buffer(length + 256)
+                length = function(buffer, len(buffer))
+        text = buffer.value.decode('utf-8', errors='replace')
+        if length == -2: return None  # before the first riko_create (the backends are not initialised)
+        try:
+            if length < 0: raise RuntimeError(text or f'riko_devices returned {length}')
+            if length >= len(buffer): raise RuntimeError('riko_devices outgrew its buffer twice')
+            data = json.loads(text)
+            if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('devices'), list): raise ValueError('unknown riko_devices format')
+            return [parse_device(device) for device in data['devices']]
+        except (RuntimeError, ValueError) as exc:
+            if not self.devices_warned: logger.warning('riko_devices failed; GPU telemetry falls back to other sources: %s', exc)
+            self.devices_warned = True
+            return None
 
     def set_interval(self, interval):
         with self.lock:
@@ -119,6 +157,19 @@ class NativeRuntime:
         _LIVE.discard(self)  # before the handle clears: release_native reads a None handle as still loading
         self.handle = None
         if self.directory: self.directory.close()
+
+
+def parse_device(device):
+    """One riko_devices entry, checked: {index, name, description, backend, type, device_id (PCI bus id or None),
+    memory_free, memory_total (bytes)}."""
+    if not isinstance(device, dict): raise ValueError('riko_devices entry is not an object')
+    for key in ('name', 'description', 'backend'):
+        if not isinstance(device.get(key), str): raise ValueError(f'riko_devices entry without a text {key}')
+    for key in ('index', 'memory_free', 'memory_total'):
+        if type(device.get(key)) is not int or device[key] < 0: raise ValueError(f'riko_devices entry without a whole {key}')
+    if device.get('type') not in DEVICE_TYPES: raise ValueError(f'riko_devices entry of unknown type {device.get("type")!r}')
+    if device.get('device_id') is not None and not isinstance(device['device_id'], str): raise ValueError('riko_devices device_id is not text')
+    return {key: device.get(key) for key in ('index', 'name', 'description', 'backend', 'type', 'device_id', 'memory_free', 'memory_total')}
 
 
 class NativeResponse:
@@ -301,6 +352,19 @@ class InProcessLlamaProvider(LlamaContextProvider):
 
     def probe_idle(self): return self.scheduler.idle() and self.expression_idle()
 
+    def devices(self):
+        """riko_devices' list, each device marked `model` (llama.cpp offloads this model to it; none with n_gpu_layers 0) and
+        `main` (the one device with split_mode none, or the only model device); None before the model loads or with a bridge
+        without it."""
+        native = self.native
+        devices = native.devices() if native else None
+        if devices is None: return None
+        from .devices import model_devices
+        chosen = model_devices(devices, split_mode=self.config.split_mode, main_gpu=self.config.main_gpu) or [] if self.config.n_gpu_layers else []
+        indices = {device['index'] for device in chosen}
+        main = chosen[0]['index'] if len(chosen) == 1 else None
+        return [{**device, 'model': device['index'] in indices, 'main': device['index'] == main} for device in devices]
+
     def _start(self):
         with self.start_lock:
             if self.closed: raise RuntimeError('Native provider closed')
@@ -323,6 +387,8 @@ class InProcessLlamaProvider(LlamaContextProvider):
             logger.info('Inference transport=in_process requested_gpu_layers=%s threads=%s flash_attention=%s kv_k=%s kv_v=%s slots=%s probe_interval=%s native=%r',
                 self.config.n_gpu_layers, self.config.n_threads, self.config.flash_attn, self.config.type_k, self.config.type_v,
                 self.config.parallel_slots, interval, notes)
+            for line in notes.splitlines():  # a GGML_BACKEND_DL bundle whose GPU module did not load or found no device
+                if line.startswith('riko-native: '): logger.warning('%s', line.removeprefix('riko-native: '))
             offload = re.search(r'offloaded (\d+)/(\d+) layers', notes)
             if offload and self.config.n_gpu_layers == -1 and int(offload[1]) < int(offload[2]):
                 logger.warning('llama.cpp put only %s of %s layers on the GPU to keep 1 GiB of GPU memory free; replies will be slower. '

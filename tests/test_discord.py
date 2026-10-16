@@ -282,6 +282,21 @@ def test_bot_import_and_command_registration_do_not_construct_models(tmp_path):
     asyncio.run(run())
 
 
+def test_resources_summary_keeps_memory_kind_scope_and_the_model_gpu_but_no_process_ids():
+    pytest.importorskip('discord')
+    from process.app_core.integrations.discord.commands import resource_summary
+    metal = {'key': 'ggml:MTL0', 'index': 0, 'name': 'Apple M5 Pro', 'backend': 'MTL', 'ggml_device': 'MTL0', 'llm': True, 'main': True,
+        'memory_kind': 'unified', 'memory_scope': 'process', 'total_mib': 38339, 'used_mib': 548, 'free_mib': 37791, 'owned_mib': 548,
+        'other_mib': None, 'attribution_complete': False, 'owned_processes': [{'pid': 4242, 'used_mib': 548, 'category': 'Python'}],
+        'pci_bus_id': None, 'uuid': None}
+    summary = resource_summary({'available': True, 'gpus': [metal], 'main_key': 'ggml:MTL0', 'source': 'llama.cpp devices (riko_devices)',
+        'ggml_devices': [{'index': 2, 'name': 'CPU'}], 'errors': {}})
+    assert summary == {'available': True, 'source': 'llama.cpp devices (riko_devices)', 'main_key': 'ggml:MTL0', 'gpus': [{'key': 'ggml:MTL0',
+        'name': 'Apple M5 Pro', 'backend': 'MTL', 'memory_kind': 'unified', 'memory_scope': 'process', 'llm': True, 'total_mib': 38339,
+        'used_mib': 548, 'free_mib': 37791, 'owned_mib': 548, 'other_mib': None, 'attribution_complete': False}]}
+    assert resource_summary({'available': False, 'gpus': [], 'error': 'none'}) == {'available': False, 'source': None, 'main_key': None, 'gpus': []}
+
+
 def test_stop_is_scoped_to_user_and_turn_and_retains_other_queued_jobs(tmp_path):
     pytest.importorskip('discord')
     from process.app_core.integrations.discord.bot import CompanionBot, Job

@@ -133,7 +133,7 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
     catch(e){setError(e.message);}
   }
   async function checkPath(field) {
-    try {const value=await request('/api/settings/path',{method:'POST',body:{value:String(inputs[field.path]||'')}});setPathChecks(old=>({...old,[field.path]:value}));}
+    try {const value=await request('/api/settings/path',{method:'POST',body:{key:field.path,value:String(inputs[field.path]||'')}});setPathChecks(old=>({...old,[field.path]:value}));}
     catch(e){setError(e.message);}
   }
   function preset(name){setInputs(old=>syncPool({...old,...runtimePresets[name]}));setNotice(name==='compact'?'Compact preset quantizes the KV cache, which turns flash attention on. If your GPU backend lacks flash attention for this model, attention runs on the CPU.':'Preset applied to your draft. Review and save when ready.');}
@@ -147,6 +147,8 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
    function fieldLabel(field){return preferences.advancedExplanations?field.technicalLabel||field.label:simpleLabel(field);}
    function renderField(field,prefix='setting-'){
     const id=prefix+field.path.replaceAll('.','-'),value=inputs[field.path],message=errors[field.path];
+    // A saved secret arrives masked (secret_state 'saved'), never as its value: left as is it keeps the key, typing replaces it.
+    const masked=field.secret_state==='saved'&&value===snapshot?.values?.[field.path];
     const modelList=/model(_id)?$/.test(field.path)||field.path==='runtime.hf_repo_id';
     return <div className={'setting-field '+(field.multiline?'wide ':'')+(message?'invalid':'')} key={field.path}>
      <label htmlFor={id}>{fieldLabel(field)}{preferences.advancedExplanations&&<span className="field-path">{field.path}</span>}</label>
@@ -155,8 +157,9 @@ export default function SettingsPage({preferences, updatePreferences, onDirty}) 
       :field.options?<select id={id} value={value} disabled={field.readonly} aria-invalid={!!message} onChange={e=>change(field.path,e.target.value)}>{!field.options.includes(value)&&<option value={value}>{value||'Automatic'}</option>}{field.options.map(option=><option key={option}>{option}</option>)}</select>
       :field.kind==='number'?<NumericSetting field={field} id={id} value={value} invalid={!!message} onChange={value=>change(field.path,value)}/>
       :field.multiline?<textarea id={id} rows={field.kind==='json'?5:4} disabled={field.readonly} spellCheck={field.kind!=='json'} value={value} aria-invalid={!!message} onChange={e=>change(field.path,e.target.value)}/>
-      :<div className="field-input"><input id={id} disabled={field.readonly} type={field.secret?'password':'text'} value={value} placeholder={field.nullable?'Automatic / not set':undefined} list={field.path==='runtime.hf_filename'?'gguf-files':modelList?'hf-models':undefined} aria-invalid={!!message} onFocus={()=>{if(modelList){setModelQuery(String(value));setModelGGUF(field.path==='runtime.hf_repo_id');}}} onChange={e=>{change(field.path,e.target.value);if(modelList)setModelQuery(e.target.value);}}/>{field.file&&<><button className="icon-button" title="Browse" aria-label={'Browse '+field.label} disabled={field.readonly} onClick={()=>browse(field)}><FolderOpen size={16}/></button><button className="icon-button" title="Check path" aria-label={'Check '+field.label} disabled={!value} onClick={()=>checkPath(field)}><Check size={16}/></button></>}</div>}
+      :<div className="field-input"><input id={id} disabled={field.readonly} type={field.secret?'password':'text'} autoComplete={field.secret?'off':undefined} value={value} placeholder={field.secret_state==='external'?'Set outside character_config.yaml':field.nullable?'Automatic / not set':undefined} list={field.path==='runtime.hf_filename'?'gguf-files':modelList?'hf-models':undefined} aria-invalid={!!message} onFocus={e=>{if(masked)e.target.select();if(modelList){setModelQuery(String(value));setModelGGUF(field.path==='runtime.hf_repo_id');}}} onChange={e=>{change(field.path,e.target.value);if(modelList)setModelQuery(e.target.value);}}/>{field.file&&<><button className="icon-button" title="Browse" aria-label={'Browse '+field.label} disabled={field.readonly} onClick={()=>browse(field)}><FolderOpen size={16}/></button><button className="icon-button" title="Check path" aria-label={'Check '+field.label} disabled={!value} onClick={()=>checkPath(field)}><Check size={16}/></button></>}</div>}
      <Explanation simple={simpleHelp(field)}>{field.help&&<p className="caption">{field.help}</p>}</Explanation>
+     {masked&&<small className="caption">Saved. Type a new key to replace it, or clear the field to remove it.</small>}
      {message&&<small className="field-error" role="alert">{message}</small>}
      {pathChecks[field.path]&&<small>{pathChecks[field.path].exists||pathChecks[field.path].executable?'✓ Found':'Not found (output paths may be created later)'} · {pathChecks[field.path].resolved}</small>}
      {field.path==='runtime.hf_filename'&&<><small>{hfNotice}</small>{files.length>0&&<select aria-label="Available GGUF files" value={files.includes(value)?value:''} onChange={e=>change(field.path,e.target.value)}><option value="">Choose a GGUF…</option>{files.map(file=><option key={file}>{file}</option>)}</select>}</>}
