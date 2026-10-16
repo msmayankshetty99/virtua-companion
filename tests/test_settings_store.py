@@ -241,9 +241,92 @@ def test_missing_default_settings_can_be_saved_into_new_yaml_sections(store):
 
 
 def test_explicit_path_check_never_reads_file_contents(store):
-    result=store.check_path(str(store.path))
+    result=store.check_path('memory.store_file', str(store.path))
     assert result['exists'] and not result['directory']
     assert 'contents' not in result
+
+
+def test_path_check_is_only_for_file_settings_and_never_contacts_a_network_path(store, monkeypatch):
+    with pytest.raises(ValueError, match='only for file and folder settings'): store.check_path('runtime.n_ctx', str(store.path))
+    with pytest.raises(ValueError, match='only for file and folder settings'): store.check_path('no.such_file', str(store.path))
+    touched = []
+    for name in ('resolve', 'exists', 'is_dir', 'stat'):
+        original = getattr(Path, name)
+        def spy(self, *args, _original=original, **kwargs):
+            if 'attacker' in str(self): touched.append(str(self)); raise AssertionError('a network path reached the filesystem')
+            return _original(self, *args, **kwargs)
+        monkeypatch.setattr(Path, name, spy)
+    for value in ('//attacker/share/x.gguf', r'\\attacker\share\x.gguf'):
+        with pytest.raises(ValueError, match='Network and device paths'): store.check_path('memory.store_file', value)
+    assert not touched
+    calls = []
+    monkeypatch.setattr(shutil, 'which', lambda value, *args, **kwargs: calls.append(value) or '/usr/bin/' + value)
+    assert store.check_path('sovits_ping_config.executable', 'sovits') == {'resolved': '/usr/bin/sovits', 'exists': True, 'directory': False, 'executable': True}
+    store.check_path('memory.store_file', 'memory_store.json'); store.check_path('sovits_ping_config.executable', 'bin/sovits')
+    assert calls == ['sovits']  # only a bare command of an executable setting is looked up on PATH
+    relative = store.check_path('memory.store_file', 'persistent_memories/../memory_store.json')
+    assert relative == {'resolved': str(store.path.parent / 'memory_store.json'), 'exists': False, 'directory': False, 'executable': False}
+
+
+def test_secrets_are_masked_and_never_sent_back(store, monkeypatch):
+    from process.app_core.configuration.settings_store import SECRET_MASK
+    monkeypatch.delenv('RIKO_API_KEY', raising=False)
+    assert store.snapshot()['values']['runtime.api_key'] == 'local'  # the default is no secret
+    store.path.write_text(store.path.read_text().replace('runtime:\n', 'runtime:\n  api_key: sk-saved-secret-123456\n'))
+    snapshot = store.snapshot()
+    field = next(item for item in snapshot['fields'] if item['path'] == 'runtime.api_key')
+    assert snapshot['values']['runtime.api_key'] == SECRET_MASK and field['secret'] and field['secret_state'] == 'saved'
+    assert 'sk-saved-secret' not in json.dumps(snapshot) and 'path' not in snapshot  # nor the config's absolute path
+    assert store.stored_values()['runtime.api_key'] == 'sk-saved-secret-123456'  # the backend's own comparisons
+    # Saving other settings with the mask untouched keeps the key; the result is masked too.
+    result = store.save({'runtime.api_key': SECRET_MASK, 'runtime.n_ctx': 4096}, snapshot['revision'])
+    assert result['saved'] and 'api_key: sk-saved-secret-123456' in store.path.read_text() and 'sk-saved' not in json.dumps(result)
+    assert not result['restart_required'] or 'runtime.api_key' not in result['restart_pending']
+    assert store.validate({'runtime.api_key': SECRET_MASK})['valid']
+    refused = store.save({'runtime.api_key': SECRET_MASK + 'x'}, result['revision'])
+    assert not refused['saved'] and refused['errors']['runtime.api_key'] == 'Type the whole new value, or clear the field'
+    replaced = store.save({'runtime.api_key': 'sk-new-key-654321'}, result['revision'])
+    assert replaced['saved'] and 'sk-new-key-654321' in store.path.read_text() and replaced['values']['runtime.api_key'] == SECRET_MASK
+    cleared = store.save({'runtime.api_key': ''}, replaced['revision'])
+    assert cleared['saved'] and "api_key: ''" in store.path.read_text()
+
+
+def test_a_secret_from_the_environment_or_a_top_level_key_is_never_sent(store, monkeypatch):
+    from process.app_core.configuration.settings_store import EXTERNAL, SECRET_MASK
+    monkeypatch.setenv('RIKO_API_KEY', 'sk-environment-secret-42')
+    snapshot = store.snapshot()
+    field = next(item for item in snapshot['fields'] if item['path'] == 'runtime.api_key')
+    assert snapshot['values']['runtime.api_key'] == '' and field['secret_state'] == 'external' and EXTERNAL in field['help']
+    assert 'sk-environment-secret' not in json.dumps(snapshot)
+    assert store.save({'runtime.n_ctx': 4096}, snapshot['revision'])['saved'] and 'api_key' not in store.path.read_text()
+    monkeypatch.delenv('RIKO_API_KEY')
+    store.path.write_text('api_key: sk-legacy-top-level-77\n' + store.path.read_text())
+    snapshot = store.snapshot()
+    assert snapshot['values']['api_key'] == SECRET_MASK and snapshot['values']['runtime.api_key'] == ''
+    assert 'sk-legacy-top-level' not in json.dumps(snapshot)
+
+
+def test_a_secret_pyyaml_reads_as_a_number_is_masked_and_kept(store, monkeypatch):
+    from process.app_core.configuration.settings_store import SECRET_MASK
+    monkeypatch.delenv('RIKO_API_KEY', raising=False)
+    store.path.write_text(store.path.read_text().replace('runtime:\n', 'runtime:\n  api_key: 123456789012345\n') + 'discord:\n  password: 87654321\n')
+    snapshot = store.snapshot()
+    field = next(item for item in snapshot['fields'] if item['path'] == 'runtime.api_key')
+    assert snapshot['values']['runtime.api_key'] == SECRET_MASK and field['kind'] == 'text' and field['secret'] and field['secret_state'] == 'saved'
+    assert snapshot['values']['discord.password'] == SECRET_MASK  # an unknown secret-like key too
+    assert '123456789012345' not in json.dumps(snapshot) and '87654321' not in json.dumps(snapshot)
+    result = store.save({'runtime.api_key': SECRET_MASK, 'runtime.n_ctx': 4096}, snapshot['revision'])
+    assert result['saved'] and 'api_key: 123456789012345' in store.path.read_text()
+    replaced = store.save({'runtime.api_key': '555'}, result['revision'])
+    assert replaced['saved'] and "api_key: '555'" in store.path.read_text()
+
+
+def test_previous_config_backup_is_owner_only(store):
+    if os.name == 'nt': pytest.skip('POSIX permission bits')
+    backup = store.path.with_suffix('.yaml.previous')
+    backup.write_text('old'); backup.chmod(0o644)
+    assert store.save({'runtime.n_ctx': 4096}, store.snapshot()['revision'])['saved']
+    assert backup.stat().st_mode & 0o777 == 0o600 and 'n_ctx: 8192' in backup.read_text()
 
 
 def test_concurrent_same_name_tool_results_update_the_correct_activity():

@@ -1,6 +1,7 @@
 """run_server.main and configure_logging, without the real desktop_server app (whose lifespan builds the services) and
 without binding its port, where a developer's backend may be running."""
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import socket as real_socket
 import sys
@@ -9,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 import run_server
-from process.app_core.configuration.debug_logging import SafeFormatter, configure_logging
+from process.app_core.configuration import debug_logging
+from process.app_core.configuration.debug_logging import SafeFormatter, configure_logging, redact_handlers, redact_secrets
 from process.app_core.configuration.paths import DataPaths
 from process.app_core.desktop import api_guard  # main() imports it while socket and time are faked below
 
@@ -57,14 +59,60 @@ def test_debug_log_file_redacts_secrets(tmp_path, monkeypatch):
     settings = config(tmp_path, file_enabled=True)
     settings.runtime.api_key = 'sk-local-model-key-987654'
     configure_logging(settings)
-    handler = next(handler for handler in logging.getLogger().handlers if isinstance(handler.formatter, SafeFormatter))
-    assert handler.baseFilename == str(tmp_path / 'logs' / 'debug.log') and handler.level == logging.INFO
+    handler = next(handler for handler in logging.getLogger().handlers if isinstance(handler, RotatingFileHandler))
+    assert isinstance(handler.formatter, SafeFormatter) and handler.baseFilename == str(tmp_path / 'logs' / 'debug.log') and handler.level == logging.INFO
     logging.getLogger('process.app_core.test').warning('token=%s key %s header Bearer abc.def', secret, settings.runtime.api_key)
     handler.flush()
     text = (tmp_path / 'logs' / 'debug.log').read_text(encoding='utf-8')
     assert 'Diagnostic logging enabled level=INFO' in text
     assert secret not in text and 'sk-local-model-key-987654' not in text and 'abc.def' not in text
     assert text.count('[REDACTED]') >= 3
+
+
+def record(message, *args, name='uvicorn.error'):
+    return logging.LogRecord(name, logging.INFO, __file__, 1, message, args, None)
+
+
+@pytest.mark.parametrize('file_enabled', [True, False])
+def test_the_console_handler_redacts_secrets_too_whether_or_not_debug_log_is_written(tmp_path, monkeypatch, file_enabled):
+    monkeypatch.setattr(logging.getLogger(), 'handlers', [])  # as at a real start: basicConfig adds the console handler
+    monkeypatch.setattr(debug_logging, 'REDACTED', set())
+    monkeypatch.setenv('RIKO_CONFIRM_KEY', 'confirm-key-value-0123456789')
+    monkeypatch.setenv('SOME_SERVICE_TOKEN', 'service-token-value-0123')
+    settings = config(tmp_path, file_enabled=file_enabled)
+    settings.runtime.api_key = 'sk-local-model-key-987654'
+    configure_logging(settings)
+    console = next(handler for handler in logging.getLogger().handlers if not isinstance(handler, RotatingFileHandler))
+    assert isinstance(console.formatter, SafeFormatter) and console.formatter._fmt == debug_logging.CONSOLE_FORMAT
+    text = console.format(record('keys %s %s %s', 'confirm-key-value-0123456789', 'service-token-value-0123', 'sk-local-model-key-987654'))
+    assert text.endswith('keys [REDACTED] [REDACTED] [REDACTED]')
+    redact_secrets('token-minted-after-setup-42', 'short')  # run_server adds the API token once it is minted
+    for handler in logging.getLogger().handlers:
+        assert handler.format(record('token %s, short', 'token-minted-after-setup-42')).endswith('token [REDACTED], short')
+
+
+def test_uvicorns_own_handlers_keep_their_format_and_redact(monkeypatch):
+    logger = logging.getLogger('riko-test-uvicorn')
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('UVICORN %(levelname)s %(message)s'))
+    monkeypatch.setattr(logger, 'handlers', [handler])
+    redact_secrets('uvicorn-secret-value-1234')
+    redact_handlers('riko-test-uvicorn'); redact_handlers('riko-test-uvicorn')  # wrapping twice is wrapping once
+    assert isinstance(handler.formatter, SafeFormatter) and not isinstance(handler.formatter.inner, SafeFormatter)
+    assert handler.format(record('GET /x Authorization: Bearer abc.def %s', 'uvicorn-secret-value-1234')) == 'UVICORN INFO GET /x Authorization: Bearer [REDACTED] [REDACTED]'
+
+
+def test_main_redacts_the_minted_secrets_and_uvicorns_handlers(monkeypatch, tmp_path):
+    recorder = Recorder()
+    recorder.app.state.backend.api_secrets = lambda: recorder.events.append('api_secrets') or ('minted-token-value-0123', 'minted-confirm-key-4567')
+    installed, build = logging.StreamHandler(), recorder.config
+    def config_with_handlers(app, **kwargs):  # uvicorn.Config installs its stderr handlers as it is built
+        monkeypatch.setattr(logging.getLogger('uvicorn'), 'handlers', [installed])
+        return build(app, **kwargs)
+    monkeypatch.setattr(recorder, 'config', config_with_handlers)
+    start(monkeypatch, tmp_path, recorder, 'logging:\n  file_enabled: false\n')
+    assert isinstance(installed.formatter, SafeFormatter)
+    assert installed.format(record('%s %s', 'minted-token-value-0123', 'minted-confirm-key-4567')) == '[REDACTED] [REDACTED]'
 
 
 class Recorder:

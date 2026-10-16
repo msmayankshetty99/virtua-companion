@@ -619,9 +619,10 @@ class MemoryStore:
             self.condition.notify_all()
         if return_records:
             return [{**{k: v for k, v in asdict(r).items() if k != 'formation_context'}, 'text': excerpt, 'text_truncated': excerpt != r.text} for r, excerpt in selected]
-        return '### Relevant memories\n' + '\n'.join(
-            f'- [{r.memory_type}; {"derived interpretation" if r.derived else "original"}; id={r.id}{"; excerpt" if text != r.text else ""}] {text} (tags: {", ".join(r.tags)})'
-            for r, text in selected)
+        # One JSON object per memory, which conversation/chat.py frames as untrusted recalled data (recalled()): the encoding
+        # keeps a stored newline or 'SYSTEM:' line inside its string, so nothing a memory quotes can pose as a message.
+        return '\n'.join(json.dumps({'id': r.id, 'type': r.memory_type, 'origin': 'derived interpretation' if r.derived else 'original',
+            **({'excerpt': True} if text != r.text else {}), 'tags': list(r.tags), 'text': text}, ensure_ascii=False) for r, text in selected)
 
     def close(self):
         with self.condition:

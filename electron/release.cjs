@@ -109,19 +109,58 @@ function askMicrophone(preferences,platform=process.platform){
  if(status!=='not-determined')return Promise.resolve(null);
  return Promise.resolve().then(()=>preferences.askForMediaAccess('microphone')).catch(()=>false);
 }
+// logs/backend-launch.log: the packaged backend's stdout and stderr, all a startup crash leaves ('Backend stopped' points
+// here), written whatever logging.file_enabled says. Capped like debug.log: past maxBytes (and at open, when an older build
+// left it larger) .log becomes .log.1, which becomes .log.2. Writes are synchronous (little volume; closing and renaming
+// between writes behave the same on every OS) and never throw. Each stream is buffered by line, at most 64 KiB, so a secret
+// split across chunks is still found: this start's API token and confirmation key are written as [REDACTED].
+const LAUNCH_LOG_BYTES=5*1024*1024,LINE_BUFFER=64*1024;
+function launchLog(file,{maxBytes=LAUNCH_LOG_BYTES,backups=2,secrets=[]}={}){
+ const values=[...new Set(secrets)].filter(value=>typeof value==='string'&&value.length>=8).sort((a,b)=>b.length-a.length);
+ const keep=Math.max(0,...values.map(value=>value.length-1)),redact=text=>values.reduce((result,value)=>result.split(value).join('[REDACTED]'),text);
+ let fd=null,size=0;
+ function open(){try{fs.mkdirSync(path.dirname(file),{recursive:true});fd=fs.openSync(file,'a');size=fs.fstatSync(fd).size;}catch{fd=null;}}
+ function rotate(){
+  if(fd!==null){try{fs.closeSync(fd);}catch{}fd=null;}
+  try{if(backups<1)fs.rmSync(file,{force:true});for(let index=backups;index>=1;index--){const from=index===1?file:`${file}.${index-1}`;if(fs.existsSync(from))fs.renameSync(from,`${file}.${index}`);}}catch{}
+  open();
+ }
+ function write(text){
+  if(!text)return;const bytes=Buffer.from(redact(text),'utf8');
+  if(fd!==null&&size>0&&size+bytes.length>maxBytes)rotate();
+  if(fd===null)return;
+  try{fs.writeSync(fd,bytes);size+=bytes.length;}catch{}
+ }
+ open();if(fd!==null&&size>=maxBytes)rotate();
+ const {StringDecoder}=require('string_decoder');
+ return {
+  stream(){
+   const decoder=new StringDecoder('utf8');let pending='';
+   // A line too long to hold is cut short of its last characters, which may begin a secret still arriving (redacted first,
+   // so a whole one already there cannot straddle the cut).
+   const flush=all=>{
+    let cut=all?pending.length:pending.lastIndexOf('\n')+1;
+    if(!cut&&pending.length>=LINE_BUFFER){pending=redact(pending);cut=pending.length-keep;}
+    if(cut>0){write(pending.slice(0,cut));pending=pending.slice(cut);}
+   };
+   return {write(chunk){pending+=typeof chunk==='string'?chunk:decoder.write(chunk);flush(false);},end(){pending+=decoder.end();flush(true);}};
+  },
+  close(){if(fd!==null){try{fs.closeSync(fd);}catch{}fd=null;}},
+ };
+}
 function startBackend(directory,resources,secrets={},port,onListening=()=>{}){
  const executable=backendExecutable(resources);
- const logPath=path.join(directory,'logs','backend-launch.log');
- const log=fs.openSync(logPath,'a');
  // This start's API token and confirmation key go to the backend only; it removes them from its own environment.
  const own=secrets.api_token&&secrets.confirm_key?{RIKO_API_TOKEN:secrets.api_token,RIKO_CONFIRM_KEY:secrets.confirm_key}:{};
  const env={...process.env,...own,...(process.platform==='darwin'?{PATH:finderPath(process.env.PATH)}:{}),RIKO_MANAGED:'1',RIKO_PORT:String(port),RIKO_DATA_DIR:directory,RIKO_CONFIG:path.join(directory,'character_config.yaml'),HF_HOME:path.join(directory,'models','huggingface'),TORCH_HOME:path.join(directory,'models','torch'),XDG_CACHE_HOME:path.join(directory,'models','cache'),RIKO_BUNDLE_ROOT:resources};
+ const log=launchLog(path.join(directory,'logs','backend-launch.log'),{secrets:[secrets.api_token,secrets.confirm_key]});
  let child;
- try{child=spawn(executable,[],{cwd:directory,env,stdio:['pipe','pipe',log],windowsHide:true});}finally{fs.closeSync(log);}
+ try{child=spawn(executable,[],{cwd:directory,env,stdio:['pipe','pipe','pipe'],windowsHide:true});}catch(error){log.close();throw error;}
  child.stdin.on('error',()=>{});
- const output=fs.createWriteStream(logPath,{flags:'a'}),listening=watchListening(port,onListening);
- child.stdout.on('data',chunk=>{output.write(chunk);listening(chunk);});
- child.stdout.on('end',()=>output.end());
+ const output=log.stream(),errors=log.stream(),listening=watchListening(port,onListening);
+ let open=2;const closed=stream=>()=>{stream.end();if(--open===0)log.close();};
+ child.stdout.on('data',chunk=>{output.write(chunk);listening(chunk);});child.stdout.once('close',closed(output));
+ child.stderr.on('data',chunk=>errors.write(chunk));child.stderr.once('close',closed(errors));
  return child;
 }
 // Only a YAML boolean true starts it (launch_config.cjs reads the file as the backend does): a quoted 'no' is not consent.
@@ -134,4 +173,4 @@ function startSovits(settings){
 }
 // Ask first; the backend gives itself 14 s. uvicorn ignores SIGTERM while already shutting down, so escalate to SIGKILL.
 function stopBackend(child,grace=15000,force=3000){return new Promise(resolve=>{if(!child||child.exitCode!==null||child.signalCode!==null){resolve();return;}let timer=setTimeout(()=>{child.kill();timer=setTimeout(()=>{child.kill('SIGKILL');resolve();},force);},grace);child.once('exit',()=>{clearTimeout(timer);resolve();});child.stdin.end('shutdown\n');});}
-module.exports={hardware,saveSetup,backendExecutable,backendAnswer,installRoot,askMicrophone,startBackend,nativeLibrary:native.nativeLibrary,startSovits,stopBackend,watchListening,listeningLine,freePort,finderPath,LISTENING};
+module.exports={hardware,saveSetup,backendExecutable,backendAnswer,installRoot,askMicrophone,startBackend,launchLog,LAUNCH_LOG_BYTES,nativeLibrary:native.nativeLibrary,startSovits,stopBackend,watchListening,listeningLine,freePort,finderPath,LISTENING};

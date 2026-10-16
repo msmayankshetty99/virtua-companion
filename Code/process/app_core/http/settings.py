@@ -1,5 +1,6 @@
 """/api/settings: the YAML through SettingsStore, the confirmation that security-sensitive changes need, and the hooks that
 apply a saved setting without a restart."""
+import hashlib
 import re
 from copy import deepcopy
 
@@ -28,6 +29,15 @@ def security_sensitive(key, value=None):
     return isinstance(value, str) and key != 'avatar.model' and bool(LOCATION.match(value))  # the avatar endpoint serves only .vrm files
 
 
+def shown(key, value):
+    """A change as the native confirmation dialog shows it, and the challenge signs it: a secret's new value (schema.secret)
+    only as a fingerprint, so a typed API key never appears on screen. The fingerprint still binds the approval to that value."""
+    from ..configuration.schema import secret
+    if isinstance(value, dict): return {name: shown(f'{key}.{name}', item) for name, item in value.items()}
+    if not secret(key) or value is None or value == '' or isinstance(value, (bool, list, tuple)): return value
+    return 'new secret, sha256 ' + hashlib.sha256(str(value).encode('utf-8')).hexdigest()[:16]
+
+
 @router.get('/api/settings')
 def get_settings(backend: Services): return backend.settings_store().snapshot()
 
@@ -42,16 +52,19 @@ def validate_settings(request: SettingsPatch, backend: Services):
 
 @router.put('/api/settings')
 def save_settings(request: SettingsPatch, backend: Services, x_riko_confirmation: str | None = Header(default=None)):
-    from ..configuration.settings_store import SettingsConflict
-    try: current = backend.settings_store().snapshot()['values']
+    from ..configuration.settings_store import SettingsConflict, kept
+    changes = kept(request.changes)  # a secret left masked keeps its saved value
+    # Compared with the saved values, secrets unmasked (the snapshot masks them), so retyping the same key asks nothing.
+    try: current = backend.settings_store().stored_values()
     except (OSError, ValueError, TypeError): current = {}
-    backend.require_confirmation('settings', {key: value for key, value in request.changes.items()
+    backend.require_confirmation('settings', {key: shown(key, value) for key, value in changes.items()
         if security_sensitive(key, value) and current.get(key) != value}, x_riko_confirmation)
     try:
-        result = backend.settings_store().save(request.changes, request.revision)
+        result = backend.settings_store().save(changes, request.revision)
         if result.get('saved'):
             from ..configuration.schema import live_hooks
-            for name, paths in live_hooks(request.changes).items(): LIVE[name](backend, result['values'], paths)
+            # result['values'] has its secrets masked: a live hook that ever needs a secret must read the config instead.
+            for name, paths in live_hooks(changes).items(): LIVE[name](backend, result['values'], paths)
         return result
     except SettingsConflict as exc: raise HTTPException(409, str(exc))
     except (ValueError, TypeError) as exc: raise HTTPException(400, str(exc))
@@ -87,12 +100,16 @@ def live_initiative_budgets(backend, values, paths):  # the running initiative t
 LIVE = {'probe_interval': live_probe_interval, 'background_pause': live_background_pause, 'avatar': live_avatar,
     'initiative_budgets': live_initiative_budgets}
 
-class PathCheck(BaseModel):
+class PathCheck(BaseModel):  # a file to import (/api/avatar/models/import)
+    value: str
+
+class SettingsPathCheck(BaseModel):  # the file or folder setting key, and the value its form holds
+    key: str
     value: str
 
 @router.post('/api/settings/path')
-def check_settings_path(request: PathCheck, backend: Services):
-    try: return backend.settings_store().check_path(request.value)
+def check_settings_path(request: SettingsPathCheck, backend: Services):
+    try: return backend.settings_store().check_path(request.key, request.value)
     except (ValueError, OSError) as exc: raise HTTPException(400, str(exc))
 
 @router.get('/api/settings/huggingface/search')

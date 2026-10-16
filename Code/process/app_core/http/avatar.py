@@ -1,11 +1,10 @@
 """/api/avatar: the configured VRM, the imported avatar library, wake animations and the renderer's animation results."""
-from pathlib import Path
-
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..desktop.media import resolve_media
+from ..kernel.safe_paths import local_path
 from .backend import Services
 from .settings import PathCheck
 
@@ -15,9 +14,9 @@ router = APIRouter()
 @router.get('/api/avatar/model')
 def avatar_model(backend: Services):
     config = backend.config
-    asset = Path(config.avatar.get('model', 'character_files/Mita.vrm')).expanduser()
-    asset = (asset if asset.is_absolute() else config.root / asset).resolve()
-    # Only the explicitly configured VRM, not arbitrary renderer-supplied paths.
+    # Only the explicitly configured VRM, not arbitrary renderer-supplied paths; a network path is refused before it resolves.
+    try: asset = local_path(config.avatar.get('model', 'character_files/Mita.vrm'), config.root).resolve()
+    except ValueError: raise HTTPException(404, 'Configured VRM model not found') from None
     if asset.suffix.lower() != '.vrm' or not asset.is_file(): raise HTTPException(404, 'Configured VRM model not found')
     return FileResponse(asset, media_type='model/gltf-binary', headers={'Cache-Control': 'no-store'})
 

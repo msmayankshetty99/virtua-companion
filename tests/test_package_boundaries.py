@@ -23,6 +23,8 @@ EDGES = {
     # Features register their settings sections (kernel/schema.py); app_core/__init__.py, not configuration, imports them.
     'configuration': {'kernel': 'load', 'persistence': 'load'},
     'conversation': {'emotion': 'lazy', 'kernel': 'load', 'persistence': 'load'},
+    # Media, avatar and import paths are checked as text before anything resolves them (kernel/safe_paths.py).
+    'desktop': {'kernel': 'load'},
     'emotion': {'kernel': 'load'},
     # ResourceEvents computes resource.<topic> on a kernel DaemonExecutor, so a publisher's thread never runs a getter.
     'events': {'kernel': 'load'},

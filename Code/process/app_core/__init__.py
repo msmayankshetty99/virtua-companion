@@ -51,7 +51,7 @@ def _declare_settings():
     from .animation import library  # noqa: F401
     from .emotion import probe  # noqa: F401  emotion.probe
     from .runtime import initiative  # noqa: F401
-    from .desktop.avatar_models import review_settings  # desktop imports nothing from app_core, so its check is added here
+    from .desktop.avatar_models import review_settings  # desktop imports nothing but kernel from app_core, so its check is added here
     _schema.register(_schema.Section('avatar', review=review_settings))
 
 

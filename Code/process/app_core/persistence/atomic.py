@@ -43,17 +43,20 @@ def replace_file(source, target):
             time.sleep(REPLACE_BACKOFF_SECONDS * 2 ** attempt)
 
 
-def atomic_write(path, data, encoding='utf-8'):
+def atomic_write(path, data, encoding='utf-8', *, mode=None):
     """Replace path with data (str or bytes) through a unique temporary file beside it, synced before the rename.
 
     Raises OSError with the original file untouched and no temporary file left when any step fails. An existing
-    file keeps its permission bits; a new one is owner-only.
+    file keeps its permission bits; a new one is owner-only. mode (POSIX permission bits, such as 0o600) sets them
+    whatever the existing file had.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = data.encode(encoding) if isinstance(data, str) else data
-    try: mode = stat.S_IMODE(os.stat(path).st_mode) if os.name != 'nt' else None
-    except OSError: mode = None
+    if os.name == 'nt': mode = None
+    elif mode is None:
+        try: mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError: pass
     for leftover in path.parent.glob(f'.{glob.escape(path.name)}.*.tmp'):  # a process killed mid-write leaves its copy
         try:
             if time.time() - leftover.stat().st_mtime > STALE_TEMPORARY_SECONDS: leftover.unlink()

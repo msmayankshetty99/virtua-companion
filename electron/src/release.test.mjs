@@ -6,7 +6,7 @@ import path from 'node:path';
 import {createRequire} from 'node:module';
 import {EventEmitter} from 'node:events';
 const require=createRequire(import.meta.url);
-const {hardware,saveSetup,backendExecutable,backendAnswer,installRoot,askMicrophone,startBackend,startSovits,stopBackend,watchListening,listeningLine,freePort,finderPath,LISTENING}=require('../release.cjs');
+const {hardware,saveSetup,backendExecutable,backendAnswer,installRoot,askMicrophone,startBackend,launchLog,LAUNCH_LOG_BYTES,startSovits,stopBackend,watchListening,listeningLine,freePort,finderPath,LISTENING}=require('../release.cjs');
 const {MANIFEST}=require('../native_backends.cjs');
 const YAML=require('yaml');
 const form={backend:'cuda',repo:'owner/model',filename:'model.gguf',context:8192,output:1024,threads:4,memories:'I like tea.\nMy name is Alex.',sovitsAuto:false};
@@ -134,12 +134,41 @@ test('startBackend hands the backend its port and hears it only once the backend
   try{
     fs.mkdirSync(path.join(resources,'backend'));fs.mkdirSync(path.join(directory,'logs'));
     // Names whatever RIKO_PORT it was given, then waits for stdin to close, as the managed backend does.
-    fs.writeFileSync(path.join(resources,'backend','riko-backend'),'#!/bin/sh\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT managed=$RIKO_MANAGED"\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT"\ncat >/dev/null\n',{mode:0o755});
+    // Its stderr (logging's console) goes to the launch log too, with this start's secrets redacted.
+    fs.writeFileSync(path.join(resources,'backend','riko-backend'),'#!/bin/sh\necho "token=$RIKO_API_TOKEN key=$RIKO_CONFIRM_KEY" >&2\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT managed=$RIKO_MANAGED"\necho "RIKO_BACKEND_LISTENING port=$RIKO_PORT"\ncat >/dev/null\necho "stopped" >&2\n',{mode:0o755});
     let heard;const listening=new Promise(resolve=>{heard=resolve;});
     const child=startBackend(directory,resources,{api_token:'t'.repeat(43),confirm_key:'k'.repeat(43)},9123,heard);
-    await listening;await stopBackend(child,5000,1000);
+    const closed=new Promise(resolve=>child.once('close',resolve));
+    await listening;await stopBackend(child,5000,1000);await closed;
     assert.equal(child.exitCode,0);assert.deepEqual(child.signalCode,null);
+    const log=fs.readFileSync(path.join(directory,'logs','backend-launch.log'),'utf8');
+    assert.match(log,/token=\[REDACTED\] key=\[REDACTED\]\n/);assert.match(log,/RIKO_BACKEND_LISTENING port=9123\n/);assert.match(log,/stopped\n/);
+    assert.doesNotMatch(log,/tttttttt|kkkkkkkk/);
   }finally{fs.rmSync(resources,{recursive:true,force:true});fs.rmSync(directory,{recursive:true,force:true});}
+});
+test('the launch log is capped with two backups and never holds this start\'s secrets, even split across chunks',()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'riko-launch-')),file=path.join(directory,'logs','backend-launch.log');
+  try{
+    assert.equal(LAUNCH_LOG_BYTES,5*1024*1024);
+    fs.mkdirSync(path.dirname(file));fs.writeFileSync(file,'x'.repeat(300));  // an older build's uncapped log: rotated at open
+    const secret='s3cr3t-token-value-0123456789',log=launchLog(file,{maxBytes:200,secrets:[secret,'short',undefined]}),out=log.stream(),err=log.stream();
+    assert.equal(fs.readFileSync(file+'.1','utf8'),'x'.repeat(300));assert.equal(fs.readFileSync(file,'utf8'),'');
+    out.write(Buffer.from('token='+secret.slice(0,10)));err.write('error: ');out.write(Buffer.from(secret.slice(10)+' ready\n'));  // split mid-secret
+    const accent=Buffer.from('é\n');err.write(accent.subarray(0,1));err.write(accent.subarray(1));  // a character split across chunks
+    assert.equal(fs.readFileSync(file,'utf8'),'token=[REDACTED] ready\nerror: é\n');
+    for(let index=0;index<12;index++)out.write(`line ${index} `+'y'.repeat(40)+'\n');  // past 200 bytes, twice over
+    out.write('tail without newline '+secret.slice(0,5));err.end();out.end();log.close();
+    const files=fs.readdirSync(path.dirname(file)).sort();
+    assert.deepEqual(files,['backend-launch.log','backend-launch.log.1','backend-launch.log.2']);  // two backups, no more
+    for(const name of files)assert.ok(fs.statSync(path.join(path.dirname(file),name)).size<=200,name);
+    const text=files.map(name=>fs.readFileSync(path.join(path.dirname(file),name),'utf8')).join('');
+    assert.ok(!text.includes(secret)&&text.includes('line 11 ')&&fs.readFileSync(file,'utf8').endsWith('tail without newline '+secret.slice(0,5)));
+    // A line longer than the buffer is written in pieces, a secret straddling a piece still redacted.
+    const long=launchLog(path.join(directory,'long.log'),{secrets:[secret]}),stream=long.stream();
+    stream.write('z'.repeat(64*1024-10)+secret+'z'.repeat(10));stream.write('\n');stream.end();long.close();
+    const written=fs.readFileSync(path.join(directory,'long.log'),'utf8');
+    assert.ok(!written.includes(secret.slice(0,8))&&written.includes('[REDACTED]')&&written.endsWith('z'.repeat(10)+'\n'));
+  }finally{fs.rmSync(directory,{recursive:true,force:true});}
 });
 function fakeChild({exitOnShutdown=false,signalCode=null}={}){const child=Object.assign(new EventEmitter(),{exitCode:null,signalCode,signals:[],written:'',kill(signal='SIGTERM'){child.signals.push(signal);return true;}});child.stdin={end(text){child.written+=text;if(exitOnShutdown)setImmediate(()=>child.emit('exit',0,null));}};return child;}
 test('stopBackend asks for shutdown, then escalates to SIGTERM and SIGKILL',async()=>{const hung=fakeChild();await stopBackend(hung,20,20);assert.equal(hung.written,'shutdown\n');assert.deepEqual(hung.signals,['SIGTERM','SIGKILL']);const quick=fakeChild({exitOnShutdown:true});await stopBackend(quick,20,20);assert.deepEqual(quick.signals,[]);const crashed=fakeChild({signalCode:'SIGABRT'}),started=Date.now();await stopBackend(crashed,1000,1000);assert.ok(Date.now()-started<500);assert.equal(crashed.written,'');});

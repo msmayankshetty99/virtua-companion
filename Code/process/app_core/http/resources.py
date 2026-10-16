@@ -26,6 +26,8 @@ def electron_processes(request: ElectronProcesses, backend: Services):
 class ResourceEstimate(BaseModel):
     changes: dict = Field(default_factory=dict)
 
+PATH_SUFFIXES = ('_path', '_dir', '_directory', '_folder', '_file', '_root')
+
 @router.post('/api/resources/estimate')
 def resource_estimate(request: ResourceEstimate, backend: Services):
     import os
@@ -33,7 +35,16 @@ def resource_estimate(request: ResourceEstimate, backend: Services):
     from pathlib import Path
     from ..resources.vram_estimate import draft_telemetry, estimate
     from ..configuration.settings_store import LOCK
+    from ..kernel.safe_paths import local_path
     store = backend.settings_store()
+    # The estimate stats and reads a draft's model files, so its paths are checked as text first (kernel/safe_paths.py: on
+    # Windows, stat-ing a network path contacts that host with the user's credentials).
+    unsafe = {}
+    for key, value in request.changes.items():
+        if isinstance(key, str) and key.endswith(PATH_SUFFIXES) and isinstance(value, str) and value:
+            try: local_path(value, store.path.parent)
+            except ValueError as exc: unsafe[key] = str(exc)
+    if unsafe: raise HTTPException(400, 'Invalid estimate settings: ' + '; '.join(f'{key}: {value}' for key, value in unsafe.items()))
     with LOCK:
         _, output, errors = store.prepare(request.changes)
         # A prompt+output mismatch does not prevent estimating the selected KV

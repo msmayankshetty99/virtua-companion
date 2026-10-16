@@ -113,3 +113,12 @@ test('a field the draft provider does not use never blocks Save, even with a lef
   assert.deepEqual(settingsPatch(fields, values, {'runtime.provider': 'llama_cpp', 'runtime.api_mode': 'chat'}).errors, {});
   assert.deepEqual(settingsPatch(fields, values, {'runtime.provider': 'openai', 'runtime.api_mode': 'chat'}).errors, {'runtime.api_mode': 'Choose a supported value'});
 });
+
+test('a masked secret left as is sends nothing; clearing it or typing a new one is a change', () => {
+  const mask='•'.repeat(8),fields=[{path:'runtime.api_key',kind:'text',secret:true,secret_state:'saved'},{path:'runtime.n_ctx',kind:'number'}];
+  const snapshot={fields,values:{'runtime.api_key':mask,'runtime.n_ctx':4096}},inputs=inputValues(snapshot);
+  assert.equal(inputs['runtime.api_key'],mask);  // the form holds the mask, never the key
+  assert.deepEqual(settingsPatch(fields,snapshot.values,{...inputs,'runtime.n_ctx':'8192'}).changes,{'runtime.n_ctx':8192});
+  assert.deepEqual(settingsPatch(fields,snapshot.values,{...inputs,'runtime.api_key':''}).changes,{'runtime.api_key':''});
+  assert.deepEqual(settingsPatch(fields,snapshot.values,{...inputs,'runtime.api_key':'sk-new'}).changes,{'runtime.api_key':'sk-new'});
+});

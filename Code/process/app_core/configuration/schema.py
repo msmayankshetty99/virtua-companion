@@ -206,10 +206,21 @@ def restart_scope(path): return resolve(path, 'restart') or 'python'
 def quoted(path): return setting(path).quoted
 
 
+SECRET = re.compile(r'(?i)(^|_)(api_key|token|password|passphrase|secret)$')
+
+
+def secret(path):
+    """Whether a setting holds a credential, by its last name (api_key, *_token, password, ...; not *_tokens budgets or
+    tokenizer_model): Settings masks its value and never sends it back (configuration/settings_store.py)."""
+    return bool(SECRET.search(str(path).rsplit('.', 1)[-1]))
+
+
 def field(path, value):
     """The form for one value: what its Setting declares, else inferred from the value and the sections around it."""
     spec, default = setting(path), declared_default(path)
-    kind = 'text' if spec.quoted else spec.kind or ('boolean' if type(value) is bool else 'number' if type(value) in (int, float)
+    # A credential is text even when PyYAML reads it as a number (api_key: 123456789), so Settings masks it (secret()).
+    kind = 'text' if spec.quoted or not spec.kind and secret(path) and type(value) in (int, float) else spec.kind or (
+        'boolean' if type(value) is bool else 'number' if type(value) in (int, float)
         else 'json' if isinstance(value, (list, dict)) else 'text')
     # A numeric default says whether it is a whole number: YAML's 1 for a temperature no longer makes 0.7 an error.
     # A whole-number default makes a field integer unless the YAML holds a fraction the backend accepts (initiative seconds).
@@ -225,7 +236,7 @@ def field(path, value):
     if kind == 'number' and 'min' not in result and path.endswith(('_seconds', '_tokens', '_length', '_size', '_dimension', '_results')): result['min'] = 0
     if 'importance' in path or 'temperature' in path:
         result.setdefault('min', 0); result.setdefault('max', 2 if 'temperature' in path else 1)
-    result['secret'] = any(s in path.lower() for s in ('api_key', 'token', 'password')) and kind == 'text' and 'tokenizer' not in path
+    result['secret'] = secret(path) and kind == 'text'
     result['file'] = kind == 'text' and (bool(spec.file) or path.endswith(('_file', '_path', '_directory', '_dir')))
     result['multiline'] = kind == 'json' or 'prompt' in path or 'rules' in path
     result['restart_scope'] = scope  # RESTART in kernel/schema.py

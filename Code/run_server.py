@@ -12,7 +12,7 @@ RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'f
 # kernel/, which code imports partly inside functions (chat's metrics, the background budgets): the release check imports
 # each by name, as it loads every name of the lazy process.app_core facade. tests/test_release_build.py keeps it equal to kernel/.
 KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('audio_config', 'background_budget', 'cancellation', 'code_paths', 'lifecycle',
-    'messages', 'metrics', 'output_filter', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
+    'messages', 'metrics', 'output_filter', 'safe_paths', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
 # Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
 DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
 
@@ -269,11 +269,13 @@ def main():
                 raise SystemExit(f'Port {port} is already in use ({exc}); stop the other process or set RIKO_PORT, and try again.') from None
             time.sleep(.5)
     listener.listen(2048)
-    backend.api_secrets()
+    from process.app_core.configuration.debug_logging import redact_handlers, redact_secrets
+    redact_secrets(*(backend.api_secrets() or ()))  # this start's token and confirmation key never reach a log
     # electron/release.cjs listeningLine: main sends the token only once this names the port it gave us.
     if os.environ.get('RIKO_MANAGED') == '1': print(f'RIKO_BACKEND_LISTENING port={port}', flush=True)
-    server = this.Server(this.uvicorn.Config(app, host="127.0.0.1", port=port,
-                log_level="info", timeout_graceful_shutdown=2), backend.stop_turn)
+    settings = this.uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info", timeout_graceful_shutdown=2)
+    redact_handlers('uvicorn', 'uvicorn.error', 'uvicorn.access')  # the stderr handlers uvicorn installed as its Config was built
+    server = this.Server(settings, backend.stop_turn)
     if os.environ.get('RIKO_MANAGED') == '1':
         import faulthandler
         import threading

@@ -31,7 +31,7 @@ class SurfaceGeometry:
 
     def __init__(self, events, *, settings_file=None, write=None):
         """settings_file: desktop_settings.json (DataPaths.desktop_settings), read only by load_settings; write(path, text)
-        replaces it durably (persistence/atomic.atomic_write, which the factory passes, so desktop imports nothing else from app_core)."""
+        replaces it durably (persistence/atomic.atomic_write, which the factory passes; desktop imports only kernel)."""
         if settings_file is not None and write is None: raise TypeError('A settings file needs its writer')
         self.events, self._settings_file, self._write = events, settings_file, write
         self._lock, self._write_lock = threading.Lock(), threading.Lock()

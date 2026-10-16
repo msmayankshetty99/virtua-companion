@@ -16,7 +16,8 @@ import uuid
 from ..kernel.messages import ToolResult
 from ..kernel.workers import DaemonExecutor
 from .isolation import IsolatedWorkers
-from .mcp import HTTPMCPClient, MCPTool, StdioMCPClient, configured_servers, connect, resolve_command, server_tools
+from .mcp import (HTTPMCPClient, MCPTool, StdioMCPClient, approval_defaults, configured_servers, connect, resolve_command, server_tools,
+    untrusted_description, untrusted_output, untrusted_schema)
 from .schema import local_definition
 from .tool import NAME, RIKO, RegisteredTool, Tool, ToolActivity, ToolCancelled, local_tool
 
@@ -63,6 +64,14 @@ class ToolRegistry:
     def _add_external(self, tool):
         tool.read_only = False  # the MCP specification treats a server's annotations as untrusted
         original = tool.remote_name or tool.name
+        try:  # its parameter text is capped like its description
+            schema = untrusted_schema(tool.input_schema)
+            if isinstance(tool, RegisteredTool): tool.schema = schema
+            else: tool.input_schema = schema
+        except ValueError as exc:
+            logger.warning('MCP tool %r from %s was left out: %s', original, tool.source, exc)
+            self.activity.notify('tools', f'Tool {original!r} from {tool.source} was not loaded: {exc}', 'error')
+            return None
         server = INVALID.sub('_', tool.source.removeprefix('mcp:'))
         for name in [original, f'{server}__{INVALID.sub("_", str(original))}']:
             if isinstance(name, str) and NAME.fullmatch(name) and name not in self.tools:
@@ -85,7 +94,9 @@ class ToolRegistry:
         return [self.register(tool, source=source) for tool in server_tools(client, trusted=source == RIKO, owner=owner)]
 
     def definitions(self, provider="openai", *, read_only=False):
-        """Each tool's definition for the model, with its current choices as enums; read_only keeps the read-only ones."""
+        """Each tool's definition for the model, with its current choices as enums; read_only keeps the read-only ones. A
+        configured server's description is framed as untrusted and capped (mcp.untrusted_description), and its schema was
+        capped when it was registered (mcp.untrusted_schema)."""
         result = []
         for tool in list(self.tools.values()):
             if read_only and not tool.read_only: continue
@@ -93,10 +104,11 @@ class ToolRegistry:
             if tool.choices:
                 for key, options in tool.choices().items():
                     if key in schema.get('properties', {}) and options: schema['properties'][key]['enum'] = list(options)[:128]
+            description = tool.description if tool.source == RIKO else untrusted_description(tool.source.removeprefix('mcp:'), tool.description)
             if provider == "openai":
-                result.append({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": schema}})
+                result.append({"type": "function", "function": {"name": tool.name, "description": description, "parameters": schema}})
             else:
-                result.append({"name": tool.name, "description": tool.description, "parameters": schema})
+                result.append({"name": tool.name, "description": description, "parameters": schema})
         return result
 
     def close(self):
@@ -152,6 +164,9 @@ class ToolRegistry:
                 if cancelled(): raise ToolCancelled('Tool call cancelled')
             result, error = tool.result(future.result())
             activity.tool_finished(name, result, error, activity_id=activity_id)
+            # A configured server's result (an error too) reaches the model framed as untrusted data; the activity panel
+            # above keeps it raw. Messages the registry writes itself (cancelled, timed out) are not the server's.
+            if tool.source != RIKO: result = untrusted_output(tool.source.removeprefix('mcp:'), tool.remote_name or tool.name, result)
             if corrections: result = {'result':result,'effective_arguments':arguments,'input_corrections':corrections}
             return ToolResult(call_id or str(uuid.uuid4()), name, result, error)
         except ToolCancelled:
@@ -172,7 +187,9 @@ class ToolRegistry:
         except Exception as exc:
             logger.exception("Tool %s failed", name)
             activity.tool_finished(name, str(exc), True, activity_id=activity_id)
-            return ToolResult(call_id or str(uuid.uuid4()), name, str(exc), True)
+            # A server's failure carries its text as well (a JSON-RPC error message, an HTTP reason), so it is framed too.
+            message = str(exc) if tool.source == RIKO else untrusted_output(tool.source.removeprefix('mcp:'), tool.remote_name or tool.name, str(exc), key='error')
+            return ToolResult(call_id or str(uuid.uuid4()), name, message, True)
 
     @classmethod
     def from_config(cls, config, activity=None, local_tools=None):
@@ -183,7 +200,8 @@ class ToolRegistry:
         registry = cls(timeout_seconds=config.tools.timeout_seconds, require_approval=config.tools.require_approval, activity=activity,
             disabled=config.tools.disabled)
         from .approval import ToolApprovals
-        registry.approvals = ToolApprovals(config.paths.tool_approvals, config.tools.require_approval)
+        # A configured server's tools ask before each call unless its mcp.json entry says "require_approval": false.
+        registry.approvals = ToolApprovals(config.paths.tool_approvals, config.tools.require_approval, approval_defaults(servers))
         try:
             from .builtin import iter_tools
             for tool in iter_tools(config.paths.todo_list): registry.register_local(tool, owner='builtin')
@@ -192,6 +210,7 @@ class ToolRegistry:
             for name, server in servers.items():
                 client = None
                 try:
+                    if 'require_approval' in server and type(server['require_approval']) is not bool: raise ValueError('require_approval must be true or false')
                     client = connect(server)
                     registry.register_mcp(client, source=f'mcp:{name}', owner=name)
                 except Exception as exc:
