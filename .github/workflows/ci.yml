@@ -27,11 +27,11 @@ jobs:
         # bash -eo pipefail stops a step at its first failing command; Windows' default pwsh checks only the last one.
         shell: bash
     env:
-      # tests/test_emotion.py would otherwise download Julia-1 and import code from it.
+      # No Hugging Face downloads: tests/conftest.py already refuses Julia-1's, and this catches any other model.
       HF_HUB_OFFLINE: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: '3.11'
           cache: pip
@@ -45,7 +45,7 @@ jobs:
         run: |
           python -m pip install --require-hashes -r tools/release/requirements-lock.txt --extra-index-url https://download.pytorch.org/whl/cpu
           python -m pip install --require-hashes --no-deps -r tools/release/requirements-lock-no-deps.txt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '22'
           cache: npm
@@ -68,8 +68,8 @@ jobs:
       run:
         working-directory: electron
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '22'
           cache: npm

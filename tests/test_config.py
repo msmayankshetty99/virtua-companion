@@ -1,4 +1,5 @@
 import logging
+import re
 
 import pytest
 
@@ -83,3 +84,18 @@ def test_an_unknown_key_seen_before_logging_is_configured_is_logged_by_the_next_
     with caplog.at_level(logs.WARNING, logger='process.app_core.kernel.validation'):
         unknown('voice', {'early_typo': 1}, set())  # desktop_server's load, which reaches logs/debug.log
     assert [record.getMessage().split(':')[0] for record in caplog.records] == ['Ignoring voice.early_typo']
+
+
+@pytest.mark.parametrize('text, key', [('memory:\n  system1_revision: main\n', 'memory.system1_revision'),
+    ('emotion:\n  revision: v1.0\n', 'emotion.revision'), ('emotion:\n  revision: a85b127\n', 'emotion.revision'),
+    ('memory:\n  system1_revision: 12345\n', 'memory.system1_revision')])
+def test_julia_revisions_must_be_full_commits_because_julia_ships_code_that_runs_here(tmp_path, text, key):
+    with pytest.raises(ValueError, match=re.escape(key) + ' must be a full 40-character commit hash'): load_config(write(tmp_path, text))
+
+
+def test_julia_revisions_default_to_the_pin_and_accept_another_commit(tmp_path):
+    from process.app_core.kernel.model_pins import JULIA_REVISION
+    defaults = load_config(tmp_path / 'missing.yaml')
+    assert defaults.memory.system1_revision == defaults.emotion.revision == JULIA_REVISION
+    config = load_config(write(tmp_path, f"memory:\n  system1_revision: '{'b' * 40}'\nemotion:\n  revision: {'c' * 40}\n"))
+    assert (config.memory.system1_revision, config.emotion.revision) == ('b' * 40, 'c' * 40)

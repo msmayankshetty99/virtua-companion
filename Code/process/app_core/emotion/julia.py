@@ -7,27 +7,13 @@ from collections import deque
 from pathlib import Path
 from typing import Callable
 
+from ..kernel.model_pins import JULIA_MODEL_ID, JULIA_REVISION
 from ..kernel.torch_device import validate as validate_device
+from . import teacher
 from .models import EMOTIONS, EmotionEvent, EmotionState
+from .teacher import load_julia  # noqa: F401  (its old home: tests/test_torch_device.py imports it from here)
 
 logger = logging.getLogger(__name__)
-
-
-def load_julia(julia, source, device, **options):
-    """Load without leaking Julia's process-wide torch settings; a failed GPU load retries on CPU.
-
-    Julia's FastEngine moves inputs to the device only for CUDA, so on MPS every predict fails
-    ('Passed CPU tensor to MPS op'): run it on CPU there until upstream supports MPS.
-    """
-    from ..kernel.torch_device import preserve_torch_globals, resolve
-    target = resolve(device)
-    if target == 'mps': logger.info('Julia 1 does not support MPS yet; using CPU'); target = 'cpu'
-    with preserve_torch_globals():
-        try: return julia.load_model(source, device=target, **options), target
-        except Exception as exc:
-            if target == 'cpu': raise
-            logger.warning('Julia 1 could not load on %s; retrying on CPU: %s', target, exc)
-            return julia.load_model(source, device='cpu', **options), 'cpu'
 
 
 class JuliaEmotionEngine:
@@ -38,7 +24,7 @@ class JuliaEmotionEngine:
     whole conversation or waiting for a completed turn.
     """
 
-    def __init__(self, model_path: str | Path | None, *, model_id: str = "SupersonicLabs/Julia-1",
+    def __init__(self, model_path: str | Path | None, *, model_id: str = JULIA_MODEL_ID, revision: str = JULIA_REVISION,
                  cache_dir: str | Path | None = None,
                  device: str = "cpu", strict_encoding: bool = True, max_length: int = 8192,
                  context_tokens: int = 1024,
@@ -46,7 +32,7 @@ class JuliaEmotionEngine:
                  on_event: Callable[[EmotionEvent], None] | None = None,
                  fallback: bool = True):
         self.model_path = Path(model_path).expanduser() if model_path else None
-        self.model_id = model_id
+        self.model_id, self.revision = model_id, revision
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
         self.device, self.active_device = validate_device(device), None
         self.strict_encoding = strict_encoding
@@ -70,30 +56,25 @@ class JuliaEmotionEngine:
             return self._model
         self._load_attempted = True
         try:
-            from importlib import import_module
-            if self.model_path and self.model_path.exists():
-                source = str(self.model_path)
+            manifest = None  # the user's own folder: its code is theirs, so it is not checked
+            if self.model_path and self.model_path.exists(): source = str(self.model_path)
             else:
-                # Download once to the standard Hugging Face cache. No clone,
-                # checked-in model directory, or manual model installation is needed.
-                from huggingface_hub import snapshot_download
-                source = snapshot_download(self.model_id, cache_dir=str(self.cache_dir) if self.cache_dir else None)
-            # Julia's native runtime is shipped with the model repository. Add
-            # the cached snapshot to import search rather than installing it.
-            import sys
-            if source not in sys.path:
-                sys.path.insert(0, source)
-            julia = import_module("julia")
+                # Downloaded once into the Hugging Face cache at the pinned commit, its bundled code checked before it runs.
+                source = teacher.snapshot(self.model_id, self.revision, self.cache_dir)
+                manifest = teacher.verify(source, self.model_id, self.revision)
             self._resolved_source = source
-            self._model, self.active_device = load_julia(julia, source, self.device, strict_encoding=self.strict_encoding,
-                max_length=self.max_length, head_length=max(128, self.max_length - self.context_tokens))
-            from .compat import compatible_engine
-            compatible_engine(self._model)
+            self._model, self.active_device = teacher.shared_model(source, self.device, manifest=manifest, **self.load_options)
         except Exception as exc:
             if not self.fallback:
                 raise RuntimeError(f"Unable to load Julia 1 emotion model: {exc}") from exc
             logger.warning("Julia 1 model unavailable; using fallback emotion interpreter: %s", exc)
         return self._model
+
+    @property
+    def load_options(self) -> dict:
+        """Julia's load_model options for this engine; memory's System 1 shares the model when it asks for the same."""
+        return {'strict_encoding': self.strict_encoding, 'max_length': self.max_length,
+            'head_length': max(128, self.max_length - self.context_tokens)}
 
     def ensure_loaded(self):
         """Load the model now rather than at its first use, once; the model, or None when it fell back."""

@@ -16,7 +16,8 @@ router = APIRouter()
 # file access, or decide what runs unattended. Classified by name, so settings added later with these
 # names are covered; any other value that is a URL or an absolute path is treated the same way.
 SENSITIVE_SETTING_NAMES = {'native_library', 'mcp_config', 'executable', 'arguments', 'auto_start', 'api_key', 'url',
-    'provider', 'model_id', 'embedding_model', 'asr_model', 'require_approval', 'system1_enabled'}
+    'provider', 'model_id', 'embedding_model', 'asr_model', 'require_approval', 'system1_enabled',
+    'revision', 'system1_revision'}  # Julia-1's commit: another one runs other code (emotion/teacher.py)
 LOCATION = re.compile(r'\s*([a-z][a-z0-9+.-]*://|[/\\~]|[a-z]:[/\\])', re.IGNORECASE)
 def security_sensitive(key, value=None):
     # An empty mapping in the YAML is one editable value, so a whole section can arrive at once: check each leaf.

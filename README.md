@@ -102,13 +102,20 @@ so you can start the external server and continue without restarting the app.
 Follow-up defaults to 10 seconds after playback. Sustained user speech interrupts
 after 1.5 seconds by default; brief interjections preserve context without stopping
 capture. Stop overrides speaking priority. Audible text position is estimated,
-not word-aligned. Use headphones: speaker echo rejection is not implemented, and
-closing an HTTP stream cannot guarantee server-side synthesis cancellation.
+not word-aligned. Speaker echo is not cancelled: through speakers Riko hears herself,
+so by default her echo can interrupt her and be saved as your words. With speakers,
+set `voice.barge_in: echo_gate` (while she plays, only speech clearly louder than
+her echo counts, about 4-6 times; each reply learns her echo's level in its first
+seconds, ignoring the microphone meanwhile) or
+`stop_only` (the microphone ignores everything while she plays; press Stop), or use
+headphones. Closing an HTTP stream cannot guarantee server-side synthesis cancellation.
 
 Configure `avatar.model` for your compatible VRM. The default path is
 `electron/public/models/riko.vrm`; models are local assets, not bundled in Git.
-Julia uses normal Hugging Face caching, not a checked-in model directory. VTube
-Studio, NDI and face tracking are not used.
+Julia uses normal Hugging Face caching, not a checked-in model directory. Julia-1 is
+downloaded at a pinned commit (`emotion.revision`, `memory.system1_revision`) and the
+Python code it ships is checked file by file before it runs. VTube Studio, NDI and
+face tracking are not used.
 
 Video effects live in `effects/greenscreens/` (`.mp4`, `.webm`, `.mov`, `.m4v`);
 playback depends on Electron codec support. Media tools are limited to approved

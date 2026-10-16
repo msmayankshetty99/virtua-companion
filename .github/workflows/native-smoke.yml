@@ -55,8 +55,8 @@ jobs:
       MODEL_SHA256: 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db
       MODEL: ${{ github.workspace }}/.native/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: '3.11'
           cache: pip
@@ -66,7 +66,7 @@ jobs:
         run: echo "commit=$(python -c "import runpy; print(runpy.run_path('tools/release/build.py')['PIN'])")" >> "$GITHUB_OUTPUT"
       - name: Restore the llama.cpp checkout
         id: llama-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: .native/llama.cpp-smoke
           key: llama.cpp-${{ steps.pin.outputs.commit }}
@@ -80,7 +80,7 @@ jobs:
       - name: Cache the unpatched checkout
         # Saved before the patch and the build, so every run patches the pin afresh; build.py refuses any other commit.
         if: steps.llama-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: .native/llama.cpp-smoke
           key: llama.cpp-${{ steps.pin.outputs.commit }}
@@ -89,7 +89,7 @@ jobs:
         run: python tools/release/build.py --smoke-bundle metal "$LLAMA_CPP" "$RUNNER_TEMP/native/metal"
       - name: Restore the model
         id: model-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: .native/models
           key: gguf-${{ env.MODEL_SHA256 }}
@@ -103,7 +103,7 @@ jobs:
       - name: Cache the model
         # Once verified, and whether or not the tests below pass.
         if: steps.model-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: .native/models
           key: gguf-${{ env.MODEL_SHA256 }}

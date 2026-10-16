@@ -13,7 +13,7 @@ permissions:
 jobs:
   hip:
     # Only when asked (never on a tag push), so a default release's size and time do not change: the Linux hip bundle, built
-    # in native-smoke.yml's compile container by the same action, for the ubuntu leg below to stage (RIKO_OPTIONAL_BUNDLES).
+    # in rocm-compile.yml's container by the same action, for the ubuntu leg below to stage (RIKO_OPTIONAL_BUNDLES).
     if: ${{ inputs.hip }}
     runs-on: ubuntu-22.04
     container: rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df
@@ -22,14 +22,14 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: ./.github/actions/hip-bundle
         with:
           destination: native-hip/hip
       - name: Pack the hip bundle
         # A tar keeps the versioned library links, which an artifact upload would turn into copies.
         run: tar -C native-hip -cf native-hip.tar hip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: native-hip
           path: native-hip.tar
@@ -48,6 +48,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     # The native CUDA/Vulkan builds and the freeze take hours on hosted runners; the checks that can hang have their own limits.
     timeout-minutes: 300
+    env:
+      # LunarG's published SHA-256 for each download (https://sdk.lunarg.com/sdk/sha/<version>/<os>/<file>.txt, matching
+      # https://vulkan.lunarg.com/sdk/files.json), recorded 2026-10-16: a file that differs is never extracted or run.
+      VULKAN_SDK_VERSION: 1.3.296.0
+      VULKAN_SDK_LINUX_SHA256: 79b0a1593dadc46180526250836f3e53688a9a5fb42a0e5859eb72316dc4d53e
+      VULKAN_SDK_WINDOWS_SHA256: acb4ae0786fd3e558f8b3c36cc3eba91638984217ba8a6795ec64d2f9ffd8c4b
     defaults:
       run:
         # bash -eo pipefail stops a step at its first failing command; Windows' default pwsh checks only the last one.
@@ -56,11 +62,11 @@ jobs:
       - name: Requested HIP bundle was not built
         if: runner.os == 'Linux' && inputs.hip && needs.hip.result != 'success'
         run: echo "::error::The hip job ended '${{ needs.hip.result }}'; the Linux packages are not built without the requested HIP bundle" && exit 1
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: '3.11'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '22'
       - name: Linux build prerequisites
@@ -70,7 +76,8 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          curl --fail --location --retry 3 https://sdk.lunarg.com/sdk/download/1.3.296.0/linux/vulkansdk-linux-x86_64-1.3.296.0.tar.xz --output "$RUNNER_TEMP/vulkan-sdk.tar.xz"
+          curl --fail --location --retry 3 "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkansdk-linux-x86_64-$VULKAN_SDK_VERSION.tar.xz" --output "$RUNNER_TEMP/vulkan-sdk.tar.xz"
+          echo "$VULKAN_SDK_LINUX_SHA256  $RUNNER_TEMP/vulkan-sdk.tar.xz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/vulkan-sdk"
           tar -xJf "$RUNNER_TEMP/vulkan-sdk.tar.xz" -C "$RUNNER_TEMP/vulkan-sdk" --strip-components=1
           echo "VULKAN_SDK=$RUNNER_TEMP/vulkan-sdk/x86_64" >> "$GITHUB_ENV"
@@ -79,7 +86,7 @@ jobs:
           LD_LIBRARY_PATH="$RUNNER_TEMP/vulkan-sdk/x86_64/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$RUNNER_TEMP/vulkan-sdk/x86_64/bin/glslc" --version
       - name: CUDA build toolkit
         if: runner.os != 'macOS'
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@c35baa1a18fd1fc9dcf47c5bd839bf30559c0bc3  # v0.2.24
         with:
           cuda: '12.4.1'
           method: network
@@ -87,10 +94,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Invoke-WebRequest https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/VulkanSDK-1.3.296.0-Installer.exe -OutFile "$env:RUNNER_TEMP/vulkan.exe"
-          Start-Process "$env:RUNNER_TEMP/vulkan.exe" -ArgumentList '--accept-licenses --default-answer --confirm-command install' -Wait
-          "VULKAN_SDK=C:\VulkanSDK\1.3.296.0" >> $env:GITHUB_ENV
-          "C:\VulkanSDK\1.3.296.0\Bin" >> $env:GITHUB_PATH
+          $installer = "$env:RUNNER_TEMP/vulkan.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/VulkanSDK-${env:VULKAN_SDK_VERSION}-Installer.exe" -OutFile $installer
+          $hash = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          if ($hash -ne ${env:VULKAN_SDK_WINDOWS_SHA256}) { throw "Vulkan SDK installer SHA-256 $hash is not LunarG's ${env:VULKAN_SDK_WINDOWS_SHA256}" }
+          $install = Start-Process $installer -ArgumentList '--accept-licenses --default-answer --confirm-command install' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($install.ExitCode)" }
+          "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_SDK_VERSION}" >> $env:GITHUB_ENV
+          "C:\VulkanSDK\${env:VULKAN_SDK_VERSION}\Bin" >> $env:GITHUB_PATH
       - name: Python runtime dependencies
         # Exactly the versions in the hash-locked files from tools/release/lock.py; torch is the CPU build. On macOS the lock
         # names the plain PyPI torch wheel, which --require-hashes selects even with the extra index.
@@ -114,7 +125,7 @@ jobs:
         run: python -m pytest tests/test_release_build.py tests/test_release_config.py tests/test_llama_native.py tests/test_responses_wire.py tests/test_settings_store.py tests/test_dependency_manifests.py -q --timeout=300
       - name: Opt-in HIP bundle
         if: runner.os == 'Linux' && needs.hip.result == 'success'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: native-hip
           path: ${{ runner.temp }}/native-hip
@@ -156,7 +167,7 @@ jobs:
         timeout-minutes: 30
         # build.py checked the unsigned stage; this repeats it under the hardened runtime and entitlements users get.
         run: python tools/release/build.py --check-app electron/release/mac-arm64/Riko.app
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: Riko-${{ runner.os }}-${{ runner.os == 'macOS' && 'arm64' || 'x64' }}${{ runner.os == 'Linux' && needs.hip.result == 'success' && '-hip' || '' }}
           path: |

@@ -8,9 +8,14 @@ from ..kernel.workers import DaemonExecutor
 from ..kernel.audio_config import FRAME_BYTES, FRAME_SAMPLES, SAMPLE_RATE
 from ..kernel.cancellation import TurnCancelled
 from ..events.bus import event_bus
+from .echo_gate import EchoGate
 from .voice_segments import VoiceSegments
 
 logger = logging.getLogger(__name__)
+SILENT = bytes(FRAME_BYTES)  # what the wake detector and the segmenter get for a frame of Riko's own echo
+# In echo_gate or stop_only, an utterance among her gated echo with less speech than this is an echo fragment that slipped
+# through, never transcribed: Whisper turns a few frames padded with silence into 'you' or 'Yeah.'.
+MIN_VOICED = .2
 
 
 class VoiceInput:
@@ -89,6 +94,8 @@ class VoiceInput:
             segmenter = VoiceSegments(self._enqueue, on_start, activity, pre_roll=voice.pre_roll_seconds,
                 gap=voice.transcription_gap_seconds, endpoint=voice.utterance_end_seconds, max_segment=voice.max_segment_seconds,
                 partial_interval=voice.live_transcript_interval_seconds)
+            # voice.barge_in: the default never looks at playback; the others gate frames heard while Riko's audio plays.
+            gate = EchoGate(voice, self.session.speech.playback if voice.barge_in != 'full_duplex' else None)
             last_level = overflow = 0.0
             if self.closed.is_set(): return
             event_bus.publish("voice.ready")
@@ -103,8 +110,9 @@ class VoiceInput:
                 for index in range(0, len(data) - FRAME_BYTES + 1, FRAME_BYTES):
                     frame = data[index:index + FRAME_BYTES]
                     samples = np.frombuffer(frame, dtype='<i2').astype('float32') / 32768
+                    rms = float(np.sqrt(np.mean(samples ** 2)))
                     if timestamp - last_level >= 0.05:
-                        event_bus.publish("voice.level", rms=float(np.sqrt(np.mean(samples ** 2))), peak=float(np.max(np.abs(samples))))
+                        event_bus.publish("voice.level", rms=rms, peak=float(np.max(np.abs(samples))))
                         last_level = timestamp
                     if not self.session.state.mic_enabled:
                         self.session.set_user_speaking(False)
@@ -112,13 +120,14 @@ class VoiceInput:
                         vad.reset_states()
                         continue
                     with torch.inference_mode(): probability = float(vad(torch.from_numpy(samples), SAMPLE_RATE))
-                    speaking = probability >= voice.vad_threshold
+                    speaking, echo = gate.decide(probability, rms, timestamp)
+                    heard = SILENT if echo else frame  # her echo never becomes an utterance's audio or pre-roll
                     self.session.set_user_speaking(speaking)
                     # A tool may claim speaking priority while an utterance that
                     # began before the reply is still being captured.
                     if segmenter.utterance_id and segmenter.anchor is None and self.session.status().speaking_priority:
                         segmenter.anchor = self.session.voice_anchor()
-                    self.session.wake.feed(frame, speaking)
+                    self.session.wake.feed(heard, speaking)
                     if self.session.wake.calibrating or getattr(self.session.wake, 'testing', False):
                         segmenter.reset()
                         continue
@@ -129,7 +138,7 @@ class VoiceInput:
                         # Detector-only audio must never become transcription pre-roll.
                         segmenter.reset()
                         continue
-                    segmenter.feed(frame, speaking, timestamp)
+                    segmenter.feed(heard, speaking, timestamp)
         except Exception as exc:
             logger.exception("Voice detection failed")
             if not self.closed.is_set(): event_bus.publish("voice.error", error=str(exc))
@@ -146,7 +155,7 @@ class VoiceInput:
                 if not segment.provisional: event_bus.publish('voice.transcribing', utterance_id=segment.utterance_id)
                 parts = self._parts.setdefault(segment.utterance_id, [])
                 partial_text = ''
-                if segment.pcm:
+                if segment.pcm and not self._echo_fragment(segment):
                     # The session's one Whisper model, shared with warmup and Discord (audio/asr.py AsrService).
                     text = self.session.transcribe(segment.pcm, beam_size=1, vad_filter=False, condition_on_previous_text=False)
                     if text:
@@ -174,6 +183,12 @@ class VoiceInput:
                 if segment.provisional:
                     with self._partial_lock: self._partial_pending.discard(segment.utterance_id)
                 self.jobs.task_done()
+
+    def _echo_fragment(self, segment):
+        """A segment of an utterance with under MIN_VOICED of speech whose audio holds frames gated as her echo (SILENT)."""
+        if segment.speech_seconds >= MIN_VOICED or self.session.config.voice.barge_in == 'full_duplex': return False
+        pcm = segment.pcm
+        return any(pcm[index:index + FRAME_BYTES] == SILENT for index in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES))
 
     def _abandoned(self):
         return self.closed.is_set() or self.session.wake.calibrating or getattr(self.session.wake, 'testing', False)

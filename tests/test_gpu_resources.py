@@ -383,7 +383,7 @@ def test_unified_memory_projection_uses_the_working_set_and_leaves_electron_out(
 def test_torch_model_rows_follow_their_device_settings(tmp_path, monkeypatch):
     import sys
     from process.app_core.resources import vram_estimate
-    monkeypatch.setattr(vram_estimate, 'weights_mib', lambda model_id, cache_dir=None, path=None: {'SupersonicLabs/Julia-1': 1000, 'sentence-transformers/all-MiniLM-L6-v2': 100}.get(model_id))
+    monkeypatch.setattr(vram_estimate, 'weights_mib', lambda model_id, cache_dir=None, path=None, revision=None: {'SupersonicLabs/Julia-1': 1000, 'sentence-transformers/all-MiniLM-L6-v2': 100}.get(model_id))
     c = config(tmp_path)
     row = lambda result, key: next(row for row in result['components'] if row['id'] == key)
     result = estimate(c, gpu(), metadata())  # the defaults: emotion off, memory models on the CPU
@@ -424,6 +424,18 @@ def test_weights_come_from_a_local_folder_or_the_cache_and_are_never_downloaded(
     assert weights_mib('ignored', path=folder) == 2
     monkeypatch.setenv('HF_HUB_OFFLINE', '1')
     assert weights_mib('nobody/not-cached-anywhere', cache_dir=tmp_path / 'empty-cache') is None
+
+
+def test_a_pinned_snapshots_weights_are_found_at_its_commit(tmp_path, monkeypatch):
+    # snapshot_download(revision=<commit>) writes no refs/main, so the estimate looks the weights up at that commit.
+    from process.app_core.resources.vram_estimate import weights_mib
+    commit = 'a' * 40
+    snapshot = tmp_path / 'models--someone--julia' / 'snapshots' / commit
+    snapshot.mkdir(parents=True)
+    (snapshot / 'model.safetensors').write_bytes(b'0' * 3 * 1024 ** 2)
+    monkeypatch.setenv('HF_HUB_OFFLINE', '1')
+    assert weights_mib('someone/julia', cache_dir=tmp_path, revision=commit) == 3
+    assert weights_mib('someone/julia', cache_dir=tmp_path) is None  # main: not downloaded as far as the cache knows
 
 
 def test_an_integrated_gpu_takes_ggml_shared_pool_not_the_vendor_carve_out(tmp_path):

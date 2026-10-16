@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import re
 import subprocess
 import sys
 
@@ -489,7 +490,8 @@ def test_hip_bundle_is_opt_in_and_built_by_the_compile_checked_recipe():
     hip, compile_job = release['jobs']['hip'], compile_workflow['jobs']['hip']
     assert hip['if'] == '${{ inputs.hip }}' and hip['container'] == compile_job['container'] == HIP_IMAGE
     action = {'uses': './.github/actions/hip-bundle', 'with': {'destination': 'native-hip/hip'}}
-    assert hip['steps'][1] == compile_job['steps'][1] == action and compile_job['steps'][0]['uses'] == 'actions/checkout@v4'
+    assert hip['steps'][1] == compile_job['steps'][1] == action and compile_job['steps'][0]['uses'] == hip['steps'][0]['uses']
+    assert re.fullmatch(r'actions/checkout@[0-9a-f]{40}', hip['steps'][0]['uses'])  # tests/test_ci_workflows.py: every action by commit
     assert hip['steps'][-2]['run'] == 'tar -C native-hip -cf native-hip.tar hip'  # an artifact upload would copy every link
     assert hip['steps'][-1]['with']['name'] == 'native-hip' and hip['steps'][-1]['with']['path'] == 'native-hip.tar'
     package = release['jobs']['package']

@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 
 from ..kernel.cancellation import BackgroundPreempted
+from ..kernel.model_pins import JULIA_REVISION
 from .atomic import atomic_write
 from .preserve import preserve_unreadable
 
@@ -137,9 +138,12 @@ RECORD_FIELDS = frozenset(item.name for item in fields(MemoryRecord))
 
 
 class JuliaMemoryDecider:
-    """Julia 1 classifier for memory retention and categorization (CPU unless memory.device picks CUDA)."""
-    def __init__(self, model_id, cache_dir=None, max_length=8192, device='cpu'):
-        self.model_id, self.cache_dir, self.max_length, self.device = model_id, cache_dir, max_length, device
+    """Julia 1 classifier for memory retention and categorization (CPU unless memory.device picks CUDA), downloaded at the
+    pinned commit revision and checked like the emotion engine's (emotion/teacher.py). options: Julia's load options;
+    the factory passes the emotion engine's when they encode memory's questions identically, so both share one model."""
+    def __init__(self, model_id, cache_dir=None, max_length=8192, device='cpu', revision=JULIA_REVISION, options=None):
+        self.model_id, self.cache_dir, self.max_length, self.device, self.revision = model_id, cache_dir, max_length, device, revision
+        self.options = dict(options) if options else dict(strict_encoding=True, max_length=max_length, head_length=512)
         self.model = None
         self.attempted = False
 
@@ -147,14 +151,9 @@ class JuliaMemoryDecider:
         if self.model is not None or self.attempted: return self.model
         self.attempted = True
         try:
-            from huggingface_hub import snapshot_download
-            import importlib, sys
-            path = snapshot_download(self.model_id, cache_dir=str(self.cache_dir) if self.cache_dir else None)
-            if path not in sys.path: sys.path.insert(0, path)
-            from ..emotion.julia import load_julia
-            self.model, _ = load_julia(importlib.import_module("julia"), path, self.device, strict_encoding=True, max_length=self.max_length, head_length=512)
-            from ..emotion.compat import compatible_engine
-            compatible_engine(self.model)
+            from ..emotion import teacher
+            path = teacher.snapshot(self.model_id, self.revision, self.cache_dir)
+            self.model, _ = teacher.shared_model(path, self.device, manifest=teacher.verify(path, self.model_id, self.revision), **self.options)
         except Exception as exc:
             logger.warning("Memory System 1 unavailable: %s", exc)
         return self.model
@@ -196,8 +195,9 @@ class MemoryStore:
     All model/embedding work happens outside the record lock. Queries always see
     current originals; indexes are optional immutable snapshots, never authority.
     """
-    def __init__(self, config, *, reflection_provider=None, parallelism=1, token_counter=None, start_worker=True):
-        # parallelism: reflections at once (the provider's background slots); token_counter: the provider's, else UTF-8 bytes
+    def __init__(self, config, *, reflection_provider=None, parallelism=1, token_counter=None, start_worker=True, julia_options=None):
+        # parallelism: reflections at once (the provider's background slots); token_counter: the provider's, else UTF-8 bytes;
+        # julia_options: System 1's Julia load options when it can share the emotion engine's model (factory.py)
         self.config, self.reflection_provider = config, reflection_provider
         self.token_counter = token_counter or (lambda text: len(text.encode('utf-8')))
         self.lock = threading.RLock()
@@ -214,7 +214,8 @@ class MemoryStore:
         self.embeddings_failed = False
         from ..kernel.torch_device import validate
         validate(config.device)
-        self.decider = JuliaMemoryDecider(config.system1_model_id, config.system1_cache_dir, config.system1_max_length, config.device) if config.system1_enabled else None
+        self.decider = JuliaMemoryDecider(config.system1_model_id, config.system1_cache_dir, config.system1_max_length, config.device,
+            config.system1_revision, julia_options) if config.system1_enabled else None
         if not self.records and config.default_memories:
             self.records = [MemoryRecord(text=item["text"], memory_type=item.get("memory_type", "factual"), importance=float(item.get("importance_score", item.get("importance", .5))), confidence=float(item.get("confidence", .9)), tags=list(item.get("tags", [])), source="configuration") for item in config.default_memories if item.get("text")]
             self._save()

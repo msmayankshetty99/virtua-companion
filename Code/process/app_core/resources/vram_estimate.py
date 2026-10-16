@@ -100,9 +100,9 @@ def torch_target(setting, *, mps=True):
     return device.split(':')[0], exact
 
 
-def weights_mib(model_id, cache_dir=None, path=None):
-    """A torch model's weights on disk (MiB), from its local folder or the Hugging Face cache, never downloaded; None when
-    neither has them."""
+def weights_mib(model_id, cache_dir=None, path=None, revision=None):
+    """A torch model's weights on disk (MiB), from its local folder or the Hugging Face cache (at revision: a pinned commit's
+    snapshot has no refs/main), never downloaded; None when neither has them."""
     def size(files): return sum(file.stat().st_size for file in files) / MIB if files else None
     try:
         if path and Path(path).is_dir():
@@ -110,7 +110,7 @@ def weights_mib(model_id, cache_dir=None, path=None):
             return size([file for file in files if file.suffix == '.safetensors'] or files)
         from huggingface_hub import try_to_load_from_cache
         def cached(name):
-            found = try_to_load_from_cache(model_id, name, cache_dir=str(cache_dir) if cache_dir else None)
+            found = try_to_load_from_cache(model_id, name, cache_dir=str(cache_dir) if cache_dir else None, revision=revision)
             return Path(found) if isinstance(found, str) else None
         for name in ('model.safetensors', 'pytorch_model.bin'):
             if (found := cached(name)): return size([found])
@@ -123,11 +123,12 @@ def weights_mib(model_id, cache_dir=None, path=None):
 
 
 def torch_models(config):
-    """The in-process torch models as (row id, label, [(name, device setting, mps allowed, model id, cache dir, local path)])."""
+    """The in-process torch models as (row id, label, [(name, device setting, mps allowed, model id, cache dir, local path,
+    revision)])."""
     emotion, memory = config.emotion, config.memory
-    julia = [('Julia emotion', emotion.device, False, emotion.model_id, emotion.cache_dir, emotion.model_path)] if emotion.enabled else []
-    remember = ([('Julia memory classifier', memory.device, False, memory.system1_model_id, memory.system1_cache_dir, None)] if memory.system1_enabled else []) \
-        + ([('sentence embeddings', memory.device, True, memory.embedding_model, None, None)] if memory.embeddings_enabled else [])
+    julia = [('Julia emotion', emotion.device, False, emotion.model_id, emotion.cache_dir, emotion.model_path, emotion.revision)] if emotion.enabled else []
+    remember = ([('Julia memory classifier', memory.device, False, memory.system1_model_id, memory.system1_cache_dir, None, memory.system1_revision)] if memory.system1_enabled else []) \
+        + ([('sentence embeddings', memory.device, True, memory.embedding_model, None, None, None)] if memory.embeddings_enabled else [])
     return [('emotion_model', 'Julia emotion model', julia, 'emotion disabled'),
             ('memory_models', 'Memory classifier and embeddings', remember, 'memory classifier and embeddings disabled')]
 
@@ -138,13 +139,13 @@ def torch_rows(config, add, used):
     for key, label, models, off in torch_models(config):
         low = high = 0
         notes = []
-        for name, setting, mps, model_id, cache_dir, path in models:
+        for name, setting, mps, model_id, cache_dir, path, revision in models:
             device, exact = torch_target(setting, mps=mps)
             if device == 'cpu':
                 notes.append(f'{name} on the CPU')
                 continue
             used.add(device if exact or device == 'mps' else 'auto')  # an unresolved auto on macOS: MPS or the CPU, no CUDA context
-            size = weights_mib(model_id, cache_dir, path)
+            size = weights_mib(model_id, cache_dir, path, revision=revision)
             top = None if size is None else size * 1.3 + 128
             low = None if low is None or (exact and size is None) else low + (size + 128 if exact else 0)
             high = None if high is None or top is None else high + top

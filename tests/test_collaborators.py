@@ -15,6 +15,7 @@ from process.app_core.desktop.tools import DesktopServices, EffectTool, iter_too
 from process.app_core.emotion.worker import EmotionWorker
 from process.app_core.inference.provider import BaseProvider
 from process.app_core.kernel.messages import ChatMessage, ModelResponse
+from process.app_core.kernel.model_pins import JULIA_REVISION
 from process.app_core.runtime.actions import ActionController
 from process.app_core.runtime.session import SessionManager
 from process.app_core.kernel.audio_config import audio_sections
@@ -81,9 +82,24 @@ def test_the_factory_passes_collaborators_explicitly_and_close_owns_them(tmp_pat
     assert closed == [('memory', 'first'), ('registry', 'first'), ('provider', 'first'), ('memory', 'second'), ('registry', 'second'), ('provider', 'second')]
 
 
+def test_memory_shares_the_emotion_engines_julia_model_only_when_it_encodes_alike(tmp_path, monkeypatch):
+    # emotion/teacher.py keys a model by (snapshot, device, options): the factory hands memory the engine's options only when
+    # strict encoding makes the engine's longer question head encode memory's questions identically.
+    for emotion, shared in (({}, False), ({'enabled': True}, True), ({'enabled': True, 'strict_encoding': False}, False),
+            ({'enabled': True, 'max_length': 4096}, False)):
+        root = tmp_path / str(len(list(tmp_path.iterdir())))
+        root.mkdir()
+        service, _, seen = build(root, monkeypatch, [], **emotion)
+        try:
+            engine = service.emotion_engine
+            assert seen['memory']['julia_options'] == (engine.load_options if shared else None)
+            if engine: assert engine.revision == JULIA_REVISION  # emotion.revision
+        finally: service.close()
+
+
 def test_the_probe_holds_its_reading_back_while_playback_drives_the_expression(tmp_path, monkeypatch):
     engine = SimpleNamespace(start_turn=lambda *args: None, observe_input=lambda *args, **kwargs: None, observe_output=lambda *args, **kwargs: None,
-        choose_tool_input=None, close=lambda: None)
+        choose_tool_input=None, close=lambda: None, load_options={'strict_encoding': True})
     monkeypatch.setattr(factory, 'JuliaEmotionEngine', lambda *args, **kwargs: engine)
     updates, probes = [], []
     monkeypatch.setattr(factory, 'ExpressionActionBridge', lambda on_emotion: SimpleNamespace(update=updates.append))

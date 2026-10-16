@@ -11,6 +11,7 @@ import re
 
 from ..kernel import schema
 from ..kernel.background_budget import validate_budget
+from ..kernel.model_pins import JULIA_REVISION, commit
 from ..kernel.schema import MISSING, Section, Setting, dataclass_defaults, register
 from ..kernel.validation import section, unknown
 
@@ -26,7 +27,14 @@ BLANK = Setting('')
 def check_memory(memory):
     memory = section('memory', memory)
     validate_budget(memory.get('reflection_context_window_tokens', 4096), memory.get('reflection_max_output_tokens', 1024), 'reflection')
+    commit('memory.system1_revision', memory.get('system1_revision', JULIA_REVISION))
     return memory
+
+
+def check_emotion(emotion):
+    emotion = section('emotion', emotion)
+    commit('emotion.revision', emotion.get('revision', JULIA_REVISION))
+    return emotion
 
 
 def check_tools(tools):
@@ -54,6 +62,9 @@ def without_probe(config, values): values.pop('emotion.probe', None)  # emotion.
 MODELS = dict(group='models')
 TOKENS, BACKGROUND, EMBEDDING = (dict(MODELS, section=name) for name in ('Token budgets', 'Background models', 'Embedding model'))
 RESTART_PYTHON = ' Restart Python to apply.'
+JULIA_REVISION_HELP = ('The Hugging Face commit of {model} to download and run. Julia-1 ships Python code that runs inside Riko, so this is '
+    'a full 40-character commit hash, never a branch: a new upstream commit changes nothing until you change this. The default is '
+    'the commit this version checks file by file; another commit\'s code runs unverified.{extra} Restart Python.')
 register(
     # The top level: what no section declares is character text, edited until Python restarts.
     Section('', group='character', title='Settings', restart='python', advanced=False, settings=(
@@ -67,15 +78,19 @@ register(
         Setting('reflection_context_window_tokens', range=(256, 1048576), **TOKENS,
             help='Total reflection context including evidence/instructions/output. Optional related evidence and formation history are token-trimmed; required focal content stays.'),
         Setting('system1_enabled', **BACKGROUND), Setting('system1_model_id', **BACKGROUND), Setting('system1_cache_dir', nullable=True, **BACKGROUND),
+        Setting('system1_revision', kind='text', quoted=True, label='Julia-1 revision', **BACKGROUND,
+            help=JULIA_REVISION_HELP.format(model='memory.system1_model_id', extra='')),
         Setting('system1_max_length', **TOKENS),
         Setting('device', options=(*DEVICES, 'mps'), label='Memory model device', **BACKGROUND,
             help='Device for the memory classifier (Julia-1) and the embedding model. CPU by default. auto picks CUDA, then Apple MPS, then CPU. The classifier stays on CPU under MPS; embeddings can use it. GPU use competes with the main model for memory, and a GPU that fails to load falls back to CPU. Restart Python.'),
         Setting('embeddings_enabled', **EMBEDDING), Setting('embedding_model', **EMBEDDING), Setting('embedding_dimension', **EMBEDDING),
         Setting('minimum_importance', range=(0, 1)), Setting('index_file', obsolete=True))),  # FAISS is gone; the index is rebuilt in memory
-    Section('emotion', group='models', title='Emotion model', effective=without_probe, settings=(
+    Section('emotion', group='models', title='Emotion model', check=check_emotion, effective=without_probe, settings=(
         Setting('device', options=DEVICES, label='Julia-1 compute device',
             help='Julia-1 teacher device: CPU by default, keeping GPU memory for the main model. CUDA is opt-in and needs a GPU build of torch (ROCm builds also report cuda); auto uses it when available. Julia does not support Apple MPS yet, so Macs use CPU. A GPU that fails to load falls back to CPU. The latent probe always runs on CPU. Restart Python.'),
         Setting('model_path', nullable=True), Setting('cache_dir', nullable=True),
+        Setting('revision', kind='text', quoted=True, label='Julia-1 revision',
+            help=JULIA_REVISION_HELP.format(model='emotion.model_id', extra=' Ignored when emotion.model_path exists.')),
         Setting('temperature', hidden=True), Setting('pause_during_inference', obsolete=True))),
     Section('tools', group='tools', title='Settings', check=check_tools, settings=(
         Setting('require_approval', help='Default for new/unconfigured tools. Per-tool live permissions override this default; approval bubbles expire after two minutes without executing.'),

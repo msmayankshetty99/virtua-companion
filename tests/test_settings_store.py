@@ -203,6 +203,29 @@ def test_resource_fields_are_grouped_with_models(store):
     assert fields['voice.wake_threshold']['group'] == 'voice'
 
 
+def test_julia_revisions_are_listed_as_commits_that_need_a_restart(store):
+    from process.app_core.kernel.model_pins import JULIA_REVISION
+    snapshot = store.snapshot()
+    fields = {field['path']: field for field in snapshot['fields']}
+    for path in ('memory.system1_revision', 'emotion.revision'):
+        assert fields[path]['group'] == 'models' and fields[path]['kind'] == 'text' and fields[path]['restart_scope'] == 'python'
+        assert snapshot['values'][path] == JULIA_REVISION and 'never a branch' in fields[path]['help']
+        assert 'full 40-character commit hash' in str(store.validate({path: 'main'}))
+
+
+def test_barge_in_settings_are_listed_with_their_options_and_shown_only_where_they_matter(store):
+    snapshot = store.snapshot()
+    fields, values = {field['path']: field for field in snapshot['fields']}, snapshot['values']
+    assert fields['voice.barge_in']['options'] == ['full_duplex', 'echo_gate', 'stop_only'] and values['voice.barge_in'] == 'full_duplex'
+    assert (values['voice.barge_in_vad_threshold'], values['voice.echo_coupling'], values['voice.echo_tail_seconds']) == (.85, None, .3)
+    assert fields['voice.echo_coupling']['visible_when'] == fields['voice.barge_in_vad_threshold']['visible_when'] == {'voice.barge_in': ['echo_gate']}
+    assert fields['voice.echo_tail_seconds']['visible_when'] == {'voice.barge_in': ['echo_gate', 'stop_only']}
+    assert all(fields[f'voice.{key}']['restart_scope'] == 'python' for key in ('barge_in', 'barge_in_vad_threshold', 'echo_coupling', 'echo_tail_seconds'))
+    assert 'headphones' in fields['voice.barge_in']['help'] and fields['voice.echo_coupling']['nullable']
+    assert store.validate({'voice.barge_in': 'echo_gate', 'voice.echo_coupling': None})['valid']
+    assert 'voice.barge_in' in str(store.validate({'voice.barge_in': 'half_duplex'})['errors'])
+
+
 def native(store):  # only llama_cpp allocates a KV pool, so only it has one to size
     store.path.write_text(store.path.read_text().replace('provider: lm_studio', 'provider: llama_cpp').replace('  model_path: null\n', '  model_path: test.gguf\n'))
     return store

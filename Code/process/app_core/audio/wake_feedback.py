@@ -44,7 +44,7 @@ def validate_settings(raw):
 SETTINGS = register(Section('wake_feedback', group='voice', title='Wake acknowledgement', strict=True, check=validate_settings, settings=(
     Setting('enabled', True), Setting('volume', .65, range=(0, 1), help='Default cue volume, 0–1. Respects the global audio toggle; avatar animation is independent.'),
     Setting('max_clip_seconds', 3.0, range=(.1, 10),
-        help='Maximum local acknowledgement length. Longer clips are rejected; microphone capture continues. Use headphones to avoid cue echo.'),
+        help='Maximum local acknowledgement length. Longer clips are rejected; microphone capture continues. Through speakers the cue\'s echo can be heard as your request: use headphones, or voice.barge_in echo_gate or stop_only, which treat it as Riko\'s own audio.'),
     Setting('cooldown_seconds', .5, range=(0, 30)),
     Setting('rules', [], help='JSON list of emotion/state rules with local audio (.wav/.flac/.ogg) and animation (.vrma) paths. Exact state+emotion wins, then state, emotion and wildcard. Assets must be in approved media roots. No assets means silent.'))))
 DEFAULTS = SETTINGS.defaults()

@@ -218,7 +218,7 @@ def missing_modules(destination, backend, platform=sys.platform):
 def smoke_bundle(backend, checkout, destination):
     """`build.py --smoke-bundle <backend> <checkout> <destination>`: one bundle as a release builds it, with the same patch,
     flags and library copying, from an unpatched checkout of PIN: native-smoke.yml's Metal bundle, and the hip bundle that
-    .github/actions/hip-bundle builds for native-smoke.yml's compile job and for release.yml's opt-in hip job."""
+    .github/actions/hip-bundle builds for rocm-compile.yml's compile job and for release.yml's opt-in hip job."""
     checkout, destination = Path(checkout).resolve(), Path(destination).resolve()
     head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=checkout, capture_output=True, text=True, check=True).stdout.strip()
     if head != PIN: raise RuntimeError(f'{checkout} is at {head}, not the pinned llama.cpp {PIN}')

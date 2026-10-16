@@ -10,6 +10,7 @@ from typing import Any
 from ..kernel.audio_config import SovitsConfig, SpeechConfig, VoiceConfig
 from ..kernel.background_budget import validate_budget
 from ..kernel.code_paths import CodePaths
+from ..kernel.model_pins import JULIA_MODEL_ID, JULIA_REVISION
 from . import schema
 from .paths import DataPaths, resolve
 
@@ -99,7 +100,8 @@ class MemoryConfig:
     reflection_context_window_tokens: int = 4096
     embeddings_enabled: bool = True
     system1_enabled: bool = True
-    system1_model_id: str = "SupersonicLabs/Julia-1"
+    system1_model_id: str = JULIA_MODEL_ID
+    system1_revision: str = JULIA_REVISION  # a commit: Julia-1 ships code that runs here (kernel/model_pins.py)
     system1_cache_dir: Path | None = None
     system1_max_length: int = 8192
     device: str = "cpu"
@@ -111,7 +113,8 @@ class MemoryConfig:
 class EmotionConfig:
     enabled: bool = False
     model_path: Path | None = None
-    model_id: str = "SupersonicLabs/Julia-1"
+    model_id: str = JULIA_MODEL_ID
+    revision: str = JULIA_REVISION  # a commit, as memory.system1_revision
     cache_dir: Path | None = None
     device: str = "cpu"
     strict_encoding: bool = True
@@ -248,7 +251,8 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
             reflection_context_window_tokens=memory_raw.get('reflection_context_window_tokens', 4096),
             embeddings_enabled=bool(memory_raw.get("embeddings_enabled", True)),
             system1_enabled=bool(memory_raw.get("system1_enabled", True)),
-            system1_model_id=str(memory_raw.get("system1_model_id", "SupersonicLabs/Julia-1")),
+            system1_model_id=str(memory_raw.get("system1_model_id", JULIA_MODEL_ID)),
+            system1_revision=memory_raw.get("system1_revision", JULIA_REVISION),
             system1_cache_dir=resolve(root, memory_raw.get("system1_cache_dir")),
             system1_max_length=int(memory_raw.get("system1_max_length", 8192)),
             device=str(memory_raw.get("device", "cpu")),
@@ -258,7 +262,8 @@ def load_config(path: str | Path | None = None, *, recover: bool | str = False) 
         emotion=EmotionConfig(
             enabled=bool(emotion_raw.get("enabled", False)),
             model_path=resolve(root, emotion_raw.get("model_path")),
-            model_id=str(emotion_raw.get("model_id", "SupersonicLabs/Julia-1")),
+            model_id=str(emotion_raw.get("model_id", JULIA_MODEL_ID)),
+            revision=emotion_raw.get("revision", JULIA_REVISION),
             cache_dir=resolve(root, emotion_raw.get("cache_dir")),
             device=str(emotion_raw.get("device", "cpu")),
             strict_encoding=bool(emotion_raw.get("strict_encoding", True)),

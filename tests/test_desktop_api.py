@@ -586,7 +586,7 @@ def test_confirmations_are_single_use_bound_to_the_change_and_expire():
 @pytest.mark.parametrize('key', ['runtime.native_library', 'runtime.provider', 'runtime.base_url', 'runtime.model_path',
     'runtime.hf_repo_id', 'tools.mcp_config', 'emotion.enabled', 'emotion.model_id', 'memory.system1_enabled',
     'memory.system1_model_id', 'memory.store_file', 'sovits_ping_config.url', 'sovits_ping_config.ref_audio_path',
-    'sovits_ping_config.executable', 'sovits_ping_config.arguments', 'voice.asr_model'])
+    'sovits_ping_config.executable', 'sovits_ping_config.arguments', 'voice.asr_model', 'emotion.revision', 'memory.system1_revision'])
 def test_settings_that_run_code_or_send_data_elsewhere_are_security_sensitive(key):
     assert security_sensitive(key)
 

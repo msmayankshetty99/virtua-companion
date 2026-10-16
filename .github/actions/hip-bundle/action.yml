@@ -3,7 +3,7 @@ description: >-
   The opt-in hip bundle (electron/native_backends.json), built by tools/release/build.py --smoke-bundle exactly as a release
   builds a bundle, inside the job's rocm/dev-ubuntu-22.04 container, then checked there without a GPU: the rpath that finds
   AMD's ROCm, and build.py --check-bundle (the six exports and riko_devices' device list, a CPU module from the bundle,
-  ggml-hip loading against ROCm 7.2.1). native-smoke.yml's compile job and release.yml's opt-in hip job both run it, so
+  ggml-hip loading against ROCm 7.2.1). rocm-compile.yml's compile job and release.yml's opt-in hip job both run it, so
   the compile job proves the release's recipe; neither runs a model on an AMD GPU.
 inputs:
   destination:

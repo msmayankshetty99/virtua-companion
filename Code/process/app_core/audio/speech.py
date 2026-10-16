@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from ..kernel.workers import DaemonExecutor
 
 from ..events.bus import event_bus
+from .echo_gate import PlaybackLevel, float_rms, pcm16_rms
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,11 @@ class AudioClip:
 
 
 class SpeechQueue:
+    playback = None  # PlaybackLevel: what was written, and when, for voice.barge_in's echo gate (audio/echo_gate.py)
+
     def __init__(self, config, state):
         self.config, self.state = config, state
+        self.playback = PlaybackLevel()
         self.queue = queue.Queue(maxsize=64)
         self.closed = threading.Event()
         self.requests = DaemonExecutor(max_workers=config.sovits.max_in_flight_requests, thread_name_prefix="tts-request")
@@ -145,7 +149,9 @@ class SpeechQueue:
                         output.abort()
                         event_bus.publish('wake.feedback.cancelled', **clip.context)
                         return
-                    output.write(pcm[start:start + 512] * getattr(self.state, 'audio_volume', 1.0))
+                    block = pcm[start:start + 512] * getattr(self.state, 'audio_volume', 1.0)
+                    if self.playback is not None: self.playback.wrote(float_rms(block), len(block) / rate, getattr(output, 'latency', 0.0), run=clip)
+                    output.write(block)
                 event_bus.publish('wake.feedback.completed', **clip.context)
             finally:
                 with self._response_lock:
@@ -225,7 +231,11 @@ class SpeechQueue:
                         event_bus.publish("speech.started", turn_id=turn_id, text=text,
                                           start_offset=start_offset, end_offset=end_offset,
                                           started_at=time.monotonic())
-                    output.write(scale_pcm16(pending[:size], getattr(self.state, 'audio_volume', 1.0)))
+                    data = scale_pcm16(pending[:size], getattr(self.state, 'audio_volume', 1.0))
+                    # Recorded just before it can sound: the microphone side compares its frames with it, and learns her echo
+                    # level afresh for each reply (run=turn_id; echo_gate.py).
+                    if self.playback is not None: self.playback.wrote(pcm16_rms(data), size / 2 / rate, getattr(output, 'latency', 0.0), run=turn_id)
+                    output.write(data)
                     audio_bytes += size
                     pending = pending[size:]
             if self.closed.is_set() or interrupt.is_set(): output.abort()

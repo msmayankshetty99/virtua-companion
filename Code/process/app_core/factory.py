@@ -63,6 +63,7 @@ def _build_chat_service(config, cleanup, desktop_state):
         emotion_engine = own(JuliaEmotionEngine(
             config.emotion.model_path,
             model_id=config.emotion.model_id,
+            revision=config.emotion.revision,
             cache_dir=config.emotion.cache_dir,
             device=config.emotion.device,
             strict_encoding=config.emotion.strict_encoding,
@@ -108,8 +109,11 @@ def _build_chat_service(config, cleanup, desktop_state):
     task_mcp = TaskMCP(task_store)
     from .tools.tool import RIKO
     registry.register_mcp(task_mcp, source=RIKO, owner='tasks')  # Riko's own server: its read-only hints are trusted
+    # One Julia-1 model for memory's System 1 and the emotion engine when they agree (emotion/teacher.py shares it per snapshot,
+    # device and options): with strict encoding, the emotion engine's longer question head encodes memory's questions alike.
+    shared = emotion_engine is not None and config.emotion.strict_encoding and config.emotion.max_length == config.memory.system1_max_length
     memory = own(MemoryStore(config.memory, reflection_provider=provider.lanes['reflection'], parallelism=provider.capabilities.background_parallelism,
-        token_counter=provider.count_text_tokens, start_worker=not config.runtime.warmup))
+        token_counter=provider.count_text_tokens, start_worker=not config.runtime.warmup, julia_options=emotion_engine.load_options if shared else None))
     if config.runtime.warmup:
         from .runtime.warmup import warm_core
         warm_core(memory, emotion_engine, config.runtime.startup_timeout_seconds)

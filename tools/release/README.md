@@ -69,9 +69,8 @@ Linux packages currently require PortAudio, libsndfile and an audio/desktop stac
 the Vulkan module also needs the system Vulkan loader. CUDA runtime/cuBLAS are
 copied from the toolkit; do not redistribute NVIDIA drivers. Review NVIDIA's
 redistributable list/EULA, Python package licenses, Vulkan SDK/loader notices and
-avatar/model/voice licenses before public distribution. Signing certificates and
-publishing credentials are not configured for Windows; unsigned Windows installers
-will trigger trust warnings.
+avatar/model/voice licenses before public distribution. Windows installers are not
+signed yet and trigger SmartScreen warnings (see Code signing below).
 
 GPT-SoVITS is an optional externally installed API executable. Its executable,
 argument list, URL and reference audio are editable in Settings. Auto-start is
@@ -80,8 +79,45 @@ not unrelated services or process trees. Service readiness is not guaranteed at
 launch. External MCP tools, FFmpeg media decoding and Discord must also be tested
 and provisioned separately; packaging Python does not install arbitrary tools.
 
-Release dependency versions (except pinned llama.cpp/build tools) are not yet fully
-locked. CI builds need clean-machine acceptance tests and a license/SBOM audit
-before being described as production-ready. CUDA/Vulkan hardware execution is not
+Supply chain: Python dependencies come from the hash-locked
+`requirements-lock*.txt` (`lock.py`), Electron's from `electron/package-lock.json`
+(`npm ci`, electron-builder an exact devDependency run with `npx --no-install`),
+llama.cpp from its pinned commit, the ROCm image by digest, the smoke GGUF by
+revision and SHA-256, every GitHub action by commit (its tag in a comment, one
+commit per action repository: `tests/test_ci_workflows.py`), and both Vulkan SDK
+downloads are checked against LunarG's published SHA-256 (the `VULKAN_SDK_*`
+variables in release.yml, from `https://sdk.lunarg.com/sdk/sha/<version>/<os>/<file>.txt`)
+before they are extracted or run. Still unverified: the Windows CUDA network
+installer Jimver/cuda-toolkit downloads (NVIDIA publishes only MD5; the fix is an
+explicit download checked against a recorded SHA-256 and NVIDIA's Authenticode
+signature) and Julia-1's weights' origin beyond Hugging Face (Riko pins the commit
+and checks its Python files: `app_core/kernel/model_pins.py`). A new download in a
+workflow needs a recorded SHA-256, and a new `uses:` a commit. CI builds need
+clean-machine acceptance tests and a license/SBOM audit before being described as
+production-ready. CUDA/Vulkan hardware execution is not
 verified by the source tests. No installer or GPU build was run on the developer
 machine while adding this pipeline.
+
+## Code signing (plan)
+
+Not yet configured for Windows or Linux; whether an unsigned tag release may ship
+is the maintainer's decision.
+
+- macOS: wired already (MAC_* secrets above); it needs a paid Apple Developer ID.
+- Windows Authenticode, one of:
+  - Azure Trusted Signing through electron-builder 26's `win.azureSignOptions`
+    (`publisherName`, `endpoint`, `certificateProfileName`, `codeSigningAccountName`),
+    with AZURE_TENANT_ID, AZURE_CLIENT_ID and AZURE_CLIENT_SECRET given only to the
+    Windows leg, as the MAC_* secrets are given only to macOS.
+  - An OV certificate whose key lives in a cloud HSM (DigiCert KeyLocker, SSL.com
+    eSigner, Azure Key Vault) through a custom `win.signtoolOptions.sign` hook: since
+    the 2023 CA/Browser Forum rule a new code-signing key cannot be exported as a
+    `.pfx` secret.
+  - Either way: RFC 3161 timestamps; sign the installer, `Riko.exe`, and the
+    extraResources `riko-backend.exe` and `*.dll` (`win.signExts`); and a
+    post-package check that fails the build when an identity is configured but any
+    shipped `.exe`/`.dll` is unsigned.
+- All three OSes: publish a `SHA256SUMS` file and GitHub build-provenance
+  attestations (`actions/attest-build-provenance`, pinned by commit, with
+  `id-token: write` and `attestations: write` on the package job only), which users
+  check with `gh attestation verify <file> --repo <owner>/<repo>`.

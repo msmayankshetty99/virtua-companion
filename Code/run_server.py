@@ -12,7 +12,7 @@ RELEASE_MODULES = ('numpy', 'torch', 'transformers', 'sentence_transformers', 'f
 # kernel/, which code imports partly inside functions (chat's metrics, the background budgets): the release check imports
 # each by name, as it loads every name of the lazy process.app_core facade. tests/test_release_build.py keeps it equal to kernel/.
 KERNEL_MODULES = tuple(f'process.app_core.kernel.{name}' for name in ('audio_config', 'background_budget', 'cancellation', 'code_paths', 'lifecycle',
-    'messages', 'metrics', 'output_filter', 'safe_paths', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
+    'messages', 'metrics', 'model_pins', 'output_filter', 'safe_paths', 'schema', 'streaming', 'torch_device', 'turns', 'validation', 'workers'))
 # Installed only with an NVIDIA display driver: a bundle that loads it at load time fails everywhere else.
 DRIVER_LIBRARIES = {'nvcuda.dll', 'libcuda.so', 'libcuda.so.1', 'libcuda.dylib'}
 

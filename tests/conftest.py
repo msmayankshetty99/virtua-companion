@@ -48,6 +48,15 @@ def build_backend(config, **factories):
     return backend
 
 
+@pytest.fixture(autouse=True)
+def no_julia_download(monkeypatch):
+    """No test downloads Julia-1 (about 600 MB, with Python code that would run here): every load falls back as offline.
+    tests/test_julia_teacher.py tests the real emotion/teacher.snapshot, which it keeps from before this patch."""
+    from process.app_core.emotion import teacher
+    def refuse(*args, **kwargs): raise RuntimeError('tests never download Julia-1')
+    monkeypatch.setattr(teacher, 'snapshot', refuse)
+
+
 @pytest.fixture
 def backend(tmp_path):
     """A backend over tmp_path that has not started: the routes see a stub session until a test replaces it (backend.session)
