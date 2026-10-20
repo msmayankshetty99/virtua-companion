@@ -31,3 +31,12 @@ test('displays are sent once per change, retried after a failure, and again when
  displays.reset();const again=displays.publish();ok=false;resolve();await again;assert.equal(posted.length,2);
  const retry=displays.publish();ok=true;resolve();await retry;assert.equal(posted.length,3,'a refused post is sent again');
 });
+test('a display change that arrives while a post is in flight is sent once that post ends',async()=>{
+ const posted=[],pending=[];let all=[PRIMARY];
+ const screen={getAllDisplays:()=>all,getPrimaryDisplay:()=>PRIMARY};
+ const displays=displayTelemetry({screen,request:(route,init)=>{posted.push(JSON.parse(init.body).length);return new Promise(r=>pending.push(()=>r({ok:true})));}});
+ const first=displays.publish();all=[PRIMARY,{id:7,label:'Side',bounds:{x:1920,y:0,width:800,height:600},scaleFactor:1}];displays.publish();
+ assert.deepEqual(posted,[1],'one request in flight');
+ pending.shift()();await settle();assert.deepEqual(posted,[1,2],'the newer list follows');pending.shift()();await first;
+ displays.publish();await settle();assert.deepEqual(posted,[1,2],'then nothing until the next change');
+});

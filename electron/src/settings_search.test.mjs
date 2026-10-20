@@ -92,3 +92,12 @@ test('inline edits of a renamed pickup key round-trip without touching other pro
  assert.ok(localSettingPatch(item('profile.pickup.release'),'yeet',p,catalog).error);assert.equal(localSettingPatch(item('profile.pickup.release'),'place',p,catalog).changes.avatarStudioProfiles[catalog.key].pickup.release,'place');
  const off=localSettingPatch(item('profile.gaze.saccades'),false,p,catalog);assert.equal(off.changes.avatarStudioProfiles[catalog.key].gaze.saccades,false);assert.equal(off.changes.avatarStudioProfiles['other.vrm#two'].pickup.carryGain,2);
 });
+test('the avatar frame rate is a graphics setting: searchable, adaptive by default, and only adaptive or full',()=>{
+ const p=normalizePreferences({}),rate=item('avatarGraphics.frameRate');
+ assert.ok(searchSettings(items,'frame rate',groups).some(i=>i.path==='avatarGraphics.frameRate'));
+ assert.ok(searchSettings(items,'avatar fps battery',groups).some(i=>i.path==='avatarGraphics.frameRate'));
+ assert.equal(rate.target.sectionId,'settings-graphics');assert.equal(localSettingValue(rate,p,catalog),'adaptive');
+ assert.ok(localSettingPatch(rate,'60fps',p,catalog).error);
+ const next=localSettingPatch(rate,'full',p,catalog).changes;assert.equal(next.avatarGraphics.frameRate,'full');assert.equal(next.avatarGraphics.samples,p.avatarGraphics.samples);
+ assert.equal(normalizePreferences({avatarGraphics:{frameRate:'turbo'}}).avatarGraphics.frameRate,'adaptive');
+});

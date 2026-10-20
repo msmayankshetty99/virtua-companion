@@ -1,5 +1,6 @@
 import {normalizeProfile,normalizeBone,PICKUP_FIELDS,PICKUP_TOGGLES,GRAB_STYLES,RELEASE_STYLES,REACTION_FIELDS,REACTION_TOGGLES,FACE_FIELDS,GAZE_FIELDS,GAZE_TOGGLES} from './avatar_studio_settings.mjs';
 import {normalizeGraphics} from './avatar_graphics.mjs';
+import {FRAME_RATES} from './avatar_frame_rate.mjs';
 import {simpleLabel,simpleHelp} from './plain_language.mjs';
 import {parseSetting} from './settings_model.mjs';
 
@@ -28,6 +29,7 @@ export function settingsIndex(fields,groups,catalog){
   items.push({id:'section:settings-neural',label:'Custom neural network settings',group:'neural',kind:'section',source:'section',help:'expression probe Julia agreement validation training idle dataset label editor replay examples',target:{group:'neural',sectionId:'settings-neural'}});
  local('avatarHitOutlines','Show hit-volume outlines','boolean','appearance',{section:'Interaction connections',target:{group:'appearance',label:'Show hit-volume outlines',sectionId:'appearance-avatar-hits'}});
  local('avatarGraphics.antialias','Canvas anti-aliasing','boolean','graphics');
+ local('avatarGraphics.frameRate','Avatar frame rate','string','graphics',{options:FRAME_RATES.map(([value])=>value),help:'fps refresh rate CPU battery power idle throttle '+FRAME_RATES.map(([value,text])=>value+': '+text).join('. ')});
  for(const [key,label,options] of [['samples','Effect-pass MSAA samples',[0,2,4,8]],['anisotropy','Anisotropic texture filtering',[1,2,4,8,16]],['pixelRatio','Maximum render pixel ratio',[1,1.5,2,3]]])local('avatarGraphics.'+key,label,'number','graphics',{options});
  if(catalog){
   const profile=(path,label,kind,options={})=>local('profile.'+path,label,kind,'appearance',{profilePath:path,...options});

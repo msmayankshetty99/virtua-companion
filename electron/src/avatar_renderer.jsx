@@ -8,7 +8,7 @@ import {DesktopWalker, nearbyPointer} from './motion_geometry.mjs';
 import {cameraDistance, slidePixels, dragPosition, resizeDrag} from './avatar_geometry.mjs';
 import {API, request} from './api.mjs';
 import {avatarModelURL,validateAvatarFormat,keepAvatarDrawn} from './avatar_model.mjs';
-import {pointerSampler} from './avatar_pointer.mjs';
+import {pointerSampler,pointerReporter} from './avatar_pointer.mjs';
 import {AvatarBoneBVH} from './avatar_bvh.mjs';
 import {AvatarHitOutlines} from './avatar_hit_outlines.mjs';
 import {boneCatalog,publishCatalog,AvatarSecondaryMotion,AvatarSkeletonDebug} from './avatar_secondary.mjs';
@@ -16,7 +16,7 @@ import {normalizeProfile} from './avatar_studio_settings.mjs';
 import {AvatarEffects} from './avatar_effects.mjs';
 import {AvatarPickup,shoeTips} from './avatar_pickup.mjs';
 import {useAvatarEditorOpen} from './avatar_editor_channel.mjs';
-import {AvatarGesture,AvatarHover} from './avatar_input.mjs';
+import {AvatarGesture,AvatarHover,hoverReported} from './avatar_input.mjs';
 import {AvatarMouseSphere} from './avatar_mouse_sphere.mjs';
 import {normalizeGraphics,applyTextureFiltering} from './avatar_graphics.mjs';
 import {AvatarEyeGaze,gazeActive} from './avatar_gaze.mjs';
@@ -24,6 +24,8 @@ import {AvatarInertia,withSpringForce} from './avatar_inertia.mjs';
 import {AvatarFace,registerFaceParts,reportedExpressions} from './avatar_face.mjs';
 import {HoldBehaviour,HoldFace,HELD_STATES,DROP_STATES,passiveHold} from './avatar_hold.mjs';
 import {Release,workArea} from './avatar_drop.mjs';
+import {frameLoop,frameInterval,avatarActive,motionBusy} from './avatar_frame_rate.mjs';
+import {connectEvents} from './event_connection.mjs';
 
 /** Where the hold reactions look, from her (world metres): the holder's hand above and in front of the scruff, the floor ahead of her feet. */
 const HOLDER=new THREE.Vector3(0,.3,.35),FLOOR=new THREE.Vector3(0,-1,.6);
@@ -34,7 +36,7 @@ const BOX_BONES=['head','neck','hips','leftUpperArm','rightUpperArm','leftLowerA
 function shoeDepth(vrm,fallback){const tips=shoeTips(vrm.humanoid);return tips.length?tips.reduce((sum,tip)=>sum+tip.z,0)/tips.length:fallback;}
 
 /** Native VRM presentation layer. The runtime supplies intent; this loop owns animation frames. */
-export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', fov=30, actions = [], animation={}, preferences={}, geometry = {x:0,y:0,width:480,height:720}, onPosition,onError,onDragging}) {
+export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', fov=30, actions = [], animation={}, preferences={}, geometry = {x:0,y:0,width:480,height:720}, asleep=false, onPosition,onError,onDragging}) {
   const canvasRef = useRef(null);
   const [pointerState,setPointerState]=useState('idle');
   const [shaderError,setShaderError]=useState('');
@@ -50,6 +52,10 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
   geometryRef.current = geometry; positionRef.current = onPosition;
   const animationRef=useRef(animation);animationRef.current=animation;
   const errorRef=useRef(onError);errorRef.current=onError;
+  const asleepRef=useRef(asleep);asleepRef.current=asleep;
+  // The render loop's wake (avatar_frame_rate.mjs): a change from the backend or the studio draws now, even while she idles or sleeps,
+  // and asleep she then draws at the idle rate until she has settled again (a face fade or a pose change finishes before she pauses).
+  const wakeRef=useRef(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -74,7 +80,9 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     const inertia=new AvatarInertia(),cursorMotion=new AvatarInertia(),springForce=new THREE.Vector3(),hold=new HoldBehaviour();
     let motion=null,face=null,holdFace=new HoldFace(null);
     const interaction={held:false,pointer:null,reaction:'',until:0,target:null,rule:null,hold:null};
-    let lastPointerPost=0,lastHoldPost=0,lastWorldPerPixel=0;
+    let lastHoldPost=0,lastWorldPerPixel=0,capabilities=null,pointerAt=-Infinity,movedAt=-Infinity,quietSince=performance.now();
+    // The backend hears where the pointer is only when it comes near her or goes, and once a second while it moves near her.
+    const pointerReports=pointerReporter();
     const lookPoint=new THREE.Vector3(),scratch=new THREE.Vector3(),ground=new THREE.Vector3(),restCamera=new THREE.PerspectiveCamera();
     // Letting go (avatar_drop.mjs): the work area of the overlay's display, where her soles are in the canvas with the current camera
     // (the safety net may still be easing back) or the one at rest, and her body's extent in the canvas for the walls.
@@ -96,19 +104,22 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     // The release lifecycle (throw, fall, set-down, catch and the one final PATCH); the carry rig joins it once the model has loaded.
     const release=new Release({place:(g,final)=>{geometryRef.current=g;positionRef.current?.(g.x,g.y,final,g);},dragging:value=>draggingRef.current?.(value),interact:kind=>interact(kind),hold,
      measure:{area,foot:footLine,box:bodyBox,worldPerPixel:()=>lastWorldPerPixel,height:()=>canvas.clientHeight}});
-    function interact(kind,pointer=null,target=interaction.target){
+    function interact(kind,pointer=null,target=interaction.target,post=true){
       if(['hold','click','release','hover','leave','hoverDelayed'].includes(kind)){
        interaction.rule=preferencesRef.current.avatarHitRules?.[target?.bone]?.[kind]||null;
        if(['hover','leave','hoverDelayed'].includes(kind)){interaction.reaction=interaction.rule?'idle':'';interaction.until=performance.now()+(kind==='leave'?800:60000);}
        if(interaction.rule?.assetId)request('/api/animation/assets/'+encodeURIComponent(interaction.rule.assetId)+'/preview',{method:'POST'}).catch(()=>{});
       }
+      if(!post)return;
+      if(kind==='leave')pointerReports.reset();
       const serverKind=interaction.localDrag&&['hold','release'].includes(kind)?'pointer':kind;
       request('/api/animation/interaction',{method:'POST',body:{kind:serverKind,pointer,target}}).catch(()=>{});
     }
+    // Hover events run their local hit rules; the backend hears them as hoverReported says (one 'hover' for a move between bones).
+    function hovered(events,pointer){const reported=hoverReported(events);events.forEach((event,i)=>interact(event.kind,pointer,event.target,reported[i]));}
     let vrm = null;
     let pickBVH=null,hitOutlines=null;
-    let disposed = false;
-    let frame = 0;
+    let disposed = false,headNode = null;
     const clock = new THREE.Clock();
     let modelSize, modelCenter, modelFront=0;
     function fitModel() {
@@ -121,7 +132,8 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       camera.updateProjectionMatrix();
     }
 
-    const source=modelPath?avatarModelURL(API,modelPath,modelFormat):new URL('models/Mita.vrm',document.baseURI).href;
+    // The backend serves the configured VRM (its default when none is set); there is no bundled fallback model.
+    const source=avatarModelURL(API,modelPath||'',modelFormat);
     loader.load(source, gltf => {
       if (disposed) { VRMUtils.deepDispose(gltf.scene); return; }
       vrm = gltf.userData.vrm;
@@ -131,10 +143,10 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       VRMUtils.rotateVRM0(vrm);
       keepAvatarDrawn(vrm.scene);
       scene.add(vrm.scene);
-      catalog=boneCatalog(vrm,modelPath||'models/Mita.vrm');publishCatalog(catalog);
+      catalog=boneCatalog(vrm,modelPath||'models/Mita.vrm');publishCatalog(catalog);  // the old fallback's name keeps that model's studio profile
       secondary=new AvatarSecondaryMotion(vrm,catalog);skeletonDebug=new AvatarSkeletonDebug(vrm,catalog,scene);
       mouseSphere=new AvatarMouseSphere(catalog,scene);
-      eyeGaze=new AvatarEyeGaze(vrm);
+      eyeGaze=new AvatarEyeGaze(vrm);headNode=vrm.humanoid.getRawBoneNode('head');
       pickup=release.pickup=new AvatarPickup(vrm,catalog,kind=>{interaction.rule=preferencesRef.current.avatarHitRules?.[interaction.grabTarget?.bone]?.[kind]||null;if(interaction.rule?.assetId)request('/api/animation/assets/'+encodeURIComponent(interaction.rule.assetId)+'/preview',{method:'POST'}).catch(()=>{});if(kind==='recover'&&interaction.held)lastHoldPost=0;else if(kind==='recover'&&!profile.reactions.enabled){interaction.reaction='settling';interaction.until=performance.now()+800;}request('/api/animation/interaction',{method:'POST',body:{kind,pointer:interaction.pointer,target:interaction.grabTarget}}).catch(()=>{});});
       const bounds = new THREE.Box3().setFromObject(vrm.scene);
       const size = bounds.getSize(new THREE.Vector3());
@@ -149,14 +161,15 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       // Face parts register after the bone catalog (its ids never move) and before the capabilities report (64 names of 1-64 characters at most).
       registerFaceParts(vrm);face=vrm.expressionManager?new AvatarFace(vrm.expressionManager):null;holdFace=new HoldFace(face);
       const bones=Object.keys(vrm.humanoid.normalizedHumanBones||{}).filter(name=>vrm.humanoid.getNormalizedBoneNode(name));
-      request('/api/animation/capabilities',{method:'POST',body:{bones:bones.length?bones:BODY_BONES.filter(name=>vrm.humanoid.getNormalizedBoneNode(name)),expressions:reportedExpressions(vrm.expressionManager)}}).catch(()=>{});
+      capabilities={bones:bones.length?bones:BODY_BONES.filter(name=>vrm.humanoid.getNormalizedBoneNode(name)),expressions:reportedExpressions(vrm.expressionManager)};
+      reportCapabilities();rouse();
     }, undefined, error => {if(!disposed){console.warn(`VRM model unavailable (${modelPath || source}):`, error);errorRef.current?.('Avatar model could not be loaded. Check the selected VRM file.');}});
 
     const resize = () => {
       camera.aspect = canvas.clientWidth / canvas.clientHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
-      fitModel();
+      fitModel();rouse();  // a resize clears the canvas: draw again even when paused
     };
     addEventListener('resize', resize);
     const observer = new ResizeObserver(resize); observer.observe(canvas);
@@ -181,7 +194,13 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       interaction.target=pickBVH?.hit(raycaster.ray)||null;
       return !!interaction.target;
     }
-    const mousemove = event => {samples.queue(event);};
+    const mousemove = event => {
+      samples.queue(event);
+      // Over or near her (where her eyes and head follow it: nearbyPointer) the loop runs at the display's rate for a moment; elsewhere
+      // it stays idle, except that a move off her while the overlay takes the pointer is handled at once (it must turn click-through again).
+      const g=geometryRef.current,x=event.clientX,y=event.clientY;
+      if(x>=g.x&&x<=g.x+g.width&&y>=g.y&&y<=g.y+g.height||nearbyPointer(g,{x,y},interaction.pointer?.near).near){pointerAt=performance.now();loop.wake();}else if(interactive)loop.wake();
+    };
     /** The drag threshold was crossed (or she was caught mid-fall): she is held. */
     function startGrab(point){
      drag.started=true;interaction.held=drag.kind==='body';interaction.reaction='';walker.stop();interact('hold',interaction.pointer);hold.grab(performance.now()/1000,{region:interaction.grabTarget?.region,kind:drag.kind,emotion:emotionRef.current,caught:!!drag.caught});
@@ -197,7 +216,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     function processPointer(point){
       lastMousePoint=point;mouseSphere?.aim(point,canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);
       interaction.pointer=nearbyPointer(geometryRef.current,point,interaction.pointer?.near);
-      if(performance.now()-lastPointerPost>150){lastPointerPost=performance.now();interact('pointer',interaction.pointer);}
+      if(pointerReports.due(interaction.pointer,performance.now()))interact('pointer',interaction.pointer);
       if (drag) {
         if(gesture.move(point,profile.input.dragThreshold))startGrab(point);
         if(!drag.started)return;
@@ -207,11 +226,12 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         return;
       }
       hit=pick(point.x,point.y);
-      for(const event of hover.update(interaction.target,performance.now(),profile.input.hoverDelay))interact(event.kind,interaction.pointer,event.target);
+      hovered(hover.update(interaction.target,performance.now(),profile.input.hoverDelay),interaction.pointer);
       setInteractive(hit);feedback();
     }
     const pointerdown = event => {
       if (event.button !== 0||drag) return;
+      pointerAt=performance.now();loop.wake();
       // Do not rely on the last throttled hover result for pickup.
       hit=pick(event.clientX,event.clientY,true);
       if(!hit)return;
@@ -286,8 +306,9 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
     };
     canvas.addEventListener('wheel', wheel, {passive:false});
 
+    // One frame; returns how long until the next (avatar_frame_rate.mjs): every display frame while she moves, about 30 fps standing
+    // still, nothing while hidden or settled asleep, and nothing before the model has loaded.
     const animate = () => {
-      frame = requestAnimationFrame(animate);
       const delta = Math.min(clock.getDelta(), 0.1);
       const elapsed = clock.elapsedTime,now=performance.now();
       const point=samples.take(performance.now(),!!drag);if(point)processPointer(point);
@@ -297,7 +318,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       if(nextProfile!==profileSource){profileSource=nextProfile;profile=normalizeProfile(nextProfile);holdSettings={...profile.reactions,recoverySeconds:profile.pickup.recoverySeconds,landingSquash:profile.pickup.landingSquash};}
       if (vrm) {
         eyeGaze?.restore();mouseSphere?.restore();pickup?.restore();secondary.restore();
-        if(!drag&&(!interaction.reaction||interaction.reaction==='idle'))for(const event of hover.update(interaction.target,performance.now(),profile.input.hoverDelay))interact(event.kind,interaction.pointer,event.target);
+        if(!drag&&(!interaction.reaction||interaction.reaction==='idle'))hovered(hover.update(interaction.target,performance.now(),profile.input.hoverDelay),interaction.pointer);
         const filter=preferencesRef.current.avatarGraphics?.anisotropy??8;if(filter!==lastFilter){lastFilter=filter;applyTextureFiltering(vrm.scene,renderer,{anisotropy:filter});}
         // A hit rule lasts its own window (0.8 s after a click or release, or while held), never the whole hold reaction that follows.
         if(!interaction.held&&performance.now()>=interaction.until)interaction.rule=null;
@@ -345,26 +366,45 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
         if(!profile.tPose&&vrm.springBoneManager)withSpringForce(vrm.springBoneManager.joints,inertia.force(worldPerPixel,profile.pickup.bounce,delta,springForce),()=>vrm.springBoneManager.update(delta));
         for(const material of vrm.materials||[])material.update?.(delta);
         secondary.update(profile,delta);
-        if(!profile.tPose){vrm.scene.updateMatrixWorld(true);if(lastMousePoint)mouseSphere.aim(lastMousePoint,canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);mouseSphere?.update(profile,delta);}
+        // World matrices: the sphere reads every spring endpoint, so it gets a full pass while the pointer is over her or a spring is
+        // dragged (aim needs only the camera); the eyes need only the head's chain; render() makes the frame's one full pass.
+        if(!profile.tPose){if(lastMousePoint)mouseSphere.aim(lastMousePoint,canvas.getBoundingClientRect(),camera,(modelCenter?.z||0)+profile.mouseSphere.depth);if(mouseSphere.active||mouseSphere.drag)vrm.scene.updateMatrixWorld(true);mouseSphere?.update(profile,delta);}
         // The face writes last: base emotion (or a resting smile) crossfaded against the reaction or a hit rule's expression, then blinks; the mouth breathes with the body.
         if(face)for(const [name,value] of face.step(delta,{emotion:emotionRef.current,rule:custom?.expression&&custom.expression!=='default'?custom:null,assets:profile.tPose?null:motion?.expressionTargets,breathPhase:held?.breath.phase,settings:profile.face}))vrm.expressionManager.setValue(name,value);
         vrm.expressionManager?.update();
-        vrm.scene.updateMatrixWorld(true);
+        headNode?.updateWorldMatrix(true,false);
         eyeGaze?.update({...profile.gaze,enabled:profile.gaze.enabled&&!profile.tPose&&animationRef.current.settings?.mouse_tracking!==false},delta,lastMousePoint,canvas.getBoundingClientRect(),camera,mouseSphere,gazeActive(look,interaction.pointer?.near),lookAt);
         if(eyeGaze?.bigShift)face?.gazeShift();  // a big gaze shift comes with a blink (never two within 2 s, never while her eyes are held wide)
-         vrm.expressionManager?.update();vrm.scene.updateMatrixWorld(true);
-        if(preferencesRef.current.avatarHitOutlines)pickBVH?.refit(profile.springPickRadius);
+        vrm.expressionManager?.update();
+        if(preferencesRef.current.avatarHitOutlines){vrm.scene.updateMatrixWorld(true);pickBVH?.refit(profile.springPickRadius);}  // a debug view
         skeletonDebug.update(profile);hitOutlines?.update(preferencesRef.current,interaction.target);
       }
       const activeRule=(interaction.held||performance.now()<interaction.until)?interaction.rule:null;
       const visualProfile=activeRule?.effect?{...profile,effect:{...profile.effect,preset:activeRule.effect}}:profile;
       effects.update(visualProfile,elapsed);effects.render(scene,camera,visualProfile);
+      if(!vrm)return Infinity;
+      const moving=avatarActive({dragging:!!drag||!!mouseSphere?.drag,released:release.active||!!pickup?.cameraActive,walking:!!walker.active,
+        animating:motionBusy(actionsRef.current,motion?.mode,motion?.blending)||!!profile.effect.glslEnabled,reacting:interaction.held||!!interaction.hold||!!interaction.reaction&&interaction.reaction!=='idle',now});
+      if(moving)movedAt=now;
+      const active=moving||avatarActive({pointerAt,movedAt,now});  // and for a moment after: the pointer's 1.5 s, her springs' 1 s
+      if(active)quietSince=now;
+      return frameInterval({mode:preferencesRef.current.avatarGraphics?.frameRate==='full'?'full':'adaptive',active,hidden:document.hidden,asleep:asleepRef.current,quietFor:now-quietSince,settled:!asleepRef.current||!face||face.settled});
     };
-    animate();
+    const loop=frameLoop(animate);
+    // A wake from outside the loop (a change in props, a resize, the window shown, the model loaded) draws now and starts a fresh
+    // settle window, so asleep she draws at the idle rate until the change has played out, not one frame of it.
+    function rouse(){quietSince=performance.now();loop.wake();}
+    wakeRef.current=rouse;
+    const visibility=()=>rouse();document.addEventListener('visibilitychange',visibility);
+    // A new backend (a restart while Electron runs) starts without the model's bones and expressions: report them again on reconnect,
+    // or library animations and previews stop until the model reloads.
+    function reportCapabilities(){if(capabilities&&!disposed)request('/api/animation/capabilities',{method:'POST',body:capabilities}).catch(()=>{});}
+    const disconnectEvents=connectEvents(()=>{},connected=>{if(connected)reportCapabilities();});
+    loop.start();
     return () => {
        release.dispose();disposed = true;
        nativeOff?.();window.overlayInputBridge?.drag('avatar',false);
-      cancelAnimationFrame(frame);
+      loop.stop();wakeRef.current=null;document.removeEventListener('visibilitychange',visibility);disconnectEvents();
       removeEventListener('resize', resize);
       observer.disconnect(); removeEventListener('mousemove', mousemove);
       removeEventListener('mouseleave',leave);removeEventListener('pointerup',pointerup);removeEventListener('mouseup',pointerup);removeEventListener('pointermove',mousemove);canvas.removeEventListener('mousedown',mouseFallback);draggingRef.current?.(false);
@@ -380,6 +420,7 @@ export default function AvatarRenderer({emotion, modelPath, modelFormat='auto', 
       VRMUtils.deepDispose(scene);
     };
   }, [modelPath,modelFormat,fov,graphics.antialias,graphics.samples,graphics.pixelRatio]);
+  useEffect(()=>{wakeRef.current?.();},[emotion,actions,animation,preferences,asleep]);
 
   return <><canvas key={String(graphics.antialias)} ref={canvasRef} className="avatar-canvas" style={{inset:'auto',left:geometry.x,top:geometry.y,width:geometry.width,height:geometry.height,pointerEvents:'auto'}} aria-label="Character avatar" />
     {shaderError&&<div className="avatar-grab-feedback" role="alert" style={{left:geometry.x+geometry.width/2,top:Math.max(8,geometry.y+40)}}>{shaderError}</div>}

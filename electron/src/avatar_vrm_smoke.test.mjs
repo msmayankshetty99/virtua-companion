@@ -37,7 +37,7 @@ async function load(){
  return gltf.userData.vrm;
 }
 /** The renderer's frame order on the loaded model, with a canvas at `geometry` (overlay px) and the press, drag and release it handles. */
-async function stage({geometry={x:700,y:100},profile:raw={}}={}){
+async function stage({geometry={x:700,y:100},profile:raw={},dt=DT}={}){
  const vrm=await load();VRMUtils.rotateVRM0(vrm);keepAvatarDrawn(vrm.scene);
  const scene=new THREE.Scene();scene.add(vrm.scene);const vrm0=vrm.meta?.metaVersion==='0',spin=vrm0?Math.PI:0;
  const catalog=boneCatalog(vrm,FILE);
@@ -50,7 +50,7 @@ async function stage({geometry={x:700,y:100},profile:raw={}}={}){
  const inertia=new AvatarInertia(),cursor=new AvatarInertia(),force=new THREE.Vector3(),interaction={held:false,reaction:'',until:0,rule:null,hold:null};
  const raw_=name=>vrm.humanoid.getRawBoneNode(name),world=name=>raw_(name).getWorldPosition(new THREE.Vector3());
  const shoes=shoeTips(vrm.humanoid),front=shoes.reduce((sum,tip)=>sum+tip.z,0)/shoes.length;
- const s={vrm,camera,catalog,profile,added,face,hold,motion,pickup,gaze,interaction,world,time:10,geometry:{...geometry,width:W,height:H},drag:null,out:null,patches:[],wpp:0,frames:0,faceAway:0,limitBreaks:[],interacts:[]};
+ const s={dt,vrm,camera,catalog,profile,added,face,hold,motion,pickup,gaze,interaction,world,time:10,geometry:{...geometry,width:W,height:H},drag:null,out:null,patches:[],wpp:0,frames:0,faceAway:0,limitBreaks:[],interacts:[]};
  const screen=v=>{const p=v.clone().project(camera);return {x:s.geometry.x+(p.x+1)/2*W,y:s.geometry.y+(1-p.y)/2*H};};
  const rest=new THREE.PerspectiveCamera(),footLine=(atRest=false)=>{let view=camera;if(atRest&&pickup.cameraActive){view=rest.copy(camera);view.position.copy(pickup.cameraRest.position);view.quaternion.copy(pickup.cameraRest.quaternion);view.updateMatrixWorld(true);}const p=new THREE.Vector3(center.x,0,front).project(view);return (1-p.y)/2*H;};
  const BOX=['head','neck','hips','leftUpperArm','rightUpperArm','leftLowerArm','rightLowerArm','leftHand','rightHand','leftFoot','rightFoot','leftToes','rightToes'];
@@ -69,28 +69,28 @@ async function stage({geometry={x:700,y:100},profile:raw={}}={}){
   return release.letGo(s.time,final,velocity,{slid:d.slid,settings:profile.pickup});};
  const lookPoint=new THREE.Vector3();
  s.frame=()=>{
-  s.time+=DT;const now=s.time;s.landed=null;s.frames++;
+  s.time+=s.dt;const now=s.time;s.landed=null;s.frames++;
   gaze.restore();pickup.restore();vrm.scene.rotation.y=spin+Math.sin(now*.7)*.025;vrm.scene.position.x=Math.sin(now*.45)*.006;
-  if(release.active){const step=release.step(now,DT);if(step.landed)s.landed=step;}
+  if(release.active){const step=release.step(now,s.dt);if(step.landed)s.landed=step;}
   if(s.drag&&pickup.held)place();
-  inertia.track(s.geometry.x,s.geometry.y,DT);const slid=s.drag?.slid||{x:0,y:0};cursor.track(s.geometry.x-slid.x,s.geometry.y-slid.y,DT);
+  inertia.track(s.geometry.x,s.geometry.y,s.dt);const slid=s.drag?.slid||{x:0,y:0};cursor.track(s.geometry.x-slid.x,s.geometry.y-slid.y,s.dt);
   s.wpp=2*Math.tan(camera.fov*D/2)*camera.position.distanceTo(center)/H;
-  const held=hold.step(now,DT,{vx:cursor.velocity.x,vy:cursor.velocity.y,ax:cursor.acceleration.x,ay:cursor.acceleration.y},{...profile.reactions,recoverySeconds:profile.pickup.recoverySeconds,landingSquash:profile.pickup.landingSquash});s.out=held;
+  const held=hold.step(now,s.dt,{vx:cursor.velocity.x,vy:cursor.velocity.y,ax:cursor.acceleration.x,ay:cursor.acceleration.y},{...profile.reactions,recoverySeconds:profile.pickup.recoverySeconds,landingSquash:profile.pickup.landingSquash});s.out=held;
   interaction.hold=held?.pose?held:null;if(held?.pose)interaction.reaction=held.state;else if(HELD_STATES.has(interaction.reaction)||DROP_STATES.has(interaction.reaction))interaction.reaction='';
   holdFace.apply(held);
   const look=held?.state?held.look:null,head=world('head');
   const lookAt=look==='viewer'?lookPoint.copy(camera.position):look==='holder'?lookPoint.copy(pickup.active?pickup.anchorPoint:head).add(new THREE.Vector3(0,.3,.35)):look==='floor'?lookPoint.copy(head).add(new THREE.Vector3(0,-1,.6)):null;
-  motion.update({interaction,settings:{enabled:true},held:{pitch:profile.pickup.scruffPitch,kickAmplitude:profile.reactions.kickAmplitude}},DT);
+  motion.update({interaction,settings:{enabled:true},held:{pitch:profile.pickup.scruffPitch,kickAmplitude:profile.reactions.kickAmplitude}},s.dt);
   s.before=new Map(catalog.entries.filter(e=>!e.human).map(e=>[e.node,e.node.quaternion.clone()]));
-  pickup.pose(profile.pickup,DT,{ax:inertia.acceleration.x,ay:inertia.acceleration.y,vx:inertia.velocity.x,vy:inertia.velocity.y,worldPerPixel:s.wpp,hold:interaction.hold,look:lookAt||(look==='cursor'&&gaze.tracking?gaze.target:null),eyeReach:gaze.reach});
+  pickup.pose(profile.pickup,s.dt,{ax:inertia.acceleration.x,ay:inertia.acceleration.y,vx:inertia.velocity.x,vy:inertia.velocity.y,worldPerPixel:s.wpp,hold:interaction.hold,look:lookAt||(look==='cursor'&&gaze.tracking?gaze.target:null),eyeReach:gaze.reach});
   s.limits();
   vrm.humanoid.update();vrm.nodeConstraintManager?.update();pickup.anchor(profile.pickup);
   s.untouched=[...s.before].every(([node,q])=>node.quaternion.equals(q));
-  withSpringForce(vrm.springBoneManager.joints,inertia.force(s.wpp,profile.pickup.bounce,DT,force),()=>vrm.springBoneManager.update(DT));
-  s.expressions=face.step(DT,{breathPhase:held?.breath.phase,settings:profile.face});for(const [name,value] of s.expressions)vrm.expressionManager.setValue(name,value);vrm.expressionManager.update();
-  vrm.scene.updateMatrixWorld(true);
-  gaze.update({...profile.gaze},DT,null,{left:0,top:0,width:W,height:H},camera,null,gazeActive(look,false),lookAt);if(gaze.bigShift)face.gazeShift();
-  vrm.expressionManager.update();vrm.scene.updateMatrixWorld(true);
+  withSpringForce(vrm.springBoneManager.joints,inertia.force(s.wpp,profile.pickup.bounce,s.dt,force),()=>vrm.springBoneManager.update(s.dt));
+  s.expressions=face.step(s.dt,{breathPhase:held?.breath.phase,settings:profile.face});for(const [name,value] of s.expressions)vrm.expressionManager.setValue(name,value);vrm.expressionManager.update();
+  vrm.humanoid.getRawBoneNode('head').updateWorldMatrix(true,false);  // as the renderer: the eyes need only the head's chain
+  gaze.update({...profile.gaze},s.dt,null,{left:0,top:0,width:W,height:H},camera,null,gazeActive(look,false),lookAt);if(gaze.bigShift)face.gazeShift();
+  vrm.expressionManager.update();vrm.scene.updateMatrixWorld(true);  // the frame's one full pass (render() makes it in the renderer)
   const facing=new THREE.Vector3(0,0,vrm0?-1:1).applyQuaternion(vrm.humanoid.getNormalizedBoneNode('head').getWorldQuaternion(new THREE.Quaternion())).z;if(!(facing>0))s.faceAway++;
  };
  // The composed rotation each limb joint gets after the carry rig, in canonical axes: knee and elbow flexion (and its direction), hip.
@@ -99,7 +99,7 @@ async function stage({geometry={x:700,y:100},profile:raw={}}={}){
    if(angle(knee)>JOINT_LIMITS.knee[1]+.5||angle(knee)>1&&axis(knee,0)<0)s.limitBreaks.push(`${side} knee ${angle(knee).toFixed(1)} at ${s.time.toFixed(2)}`);
    if(angle(elbow)>JOINT_LIMITS.elbow[1]+.5||angle(elbow)>1&&axis(elbow,1)!==(side==='left'?-1:1))s.limitBreaks.push(`${side} elbow ${angle(elbow).toFixed(1)} at ${s.time.toFixed(2)}`);
    if(-hip>JOINT_LIMITS.hipFlex[1]+.5||hip>JOINT_LIMITS.hipExtend[1]+.5)s.limitBreaks.push(`${side} hip ${hip.toFixed(1)} at ${s.time.toFixed(2)}`);}};
- s.run=(seconds,each)=>{for(let i=0,n=Math.round(seconds/DT);i<n;i++){s.frame();each?.(i);}};
+ s.run=(seconds,each)=>{for(let i=0,n=Math.round(seconds/s.dt);i<n;i++){s.frame();each?.(i);}};
  // the two lowest hair spring tips (the twintails on Miku) and their chain roots
  const joints=[...vrm.springBoneManager.joints],tips=joints.filter(j=>!joints.some(k=>k.bone.parent===j.bone)).map(j=>({j,y:j.bone.getWorldPosition(new THREE.Vector3()).y})).sort((a,b)=>a.y-b.y);
  const rootOf=j=>{let b=j.bone;while(b.parent&&joints.some(k=>k.bone===b.parent))b=b.parent;return b;};
@@ -184,4 +184,14 @@ test('real model: off the taskbar a head grab let go lands back on it, a sideway
  assert.equal(decision,'fall');assert.ok(s.floor()-top>30,'a hop off the taskbar');assert.ok(landed&&landed.x-from>300);assert.ok(out<=1,'the walls follow her body');
  assert.ok(slide<8,'her feet stay where they touched down');assert.equal(blinks,0,'her eyes stay wide on the way down');assert.ok(Math.abs(s.patches.at(-1).y-s.floor())<1e-6);
  s.audit('flick off the taskbar');
+});
+
+test('real model: standing still at the adaptive 30 fps her hair settles where it does at 60 fps and her face stays forward',{skip},async()=>{
+ const tips=s=>s.hair.map(h=>h.tip.getWorldPosition(new THREE.Vector3()));
+ const fast=await stage(),slow=await stage({dt:1/30});fast.run(3);slow.run(3);
+ const gap=Math.max(...tips(fast).map((p,i)=>p.distanceTo(tips(slow)[i])));
+ const wander=[];slow.run(1,()=>wander.push(tips(slow)[0].clone()));const drift=Math.max(...wander.map(p=>p.distanceTo(wander[0])));
+ say(`idle 30 fps against 60 fps: hair tips ${(gap*1000).toFixed(1)} mm apart after 3 s; the 30 fps tip moves ${(drift*1000).toFixed(1)} mm over the next second`);
+ assert.ok(gap<.02,'the hair rests in the same place');assert.ok(drift<.02,'and stays settled');
+ slow.audit('idle at 30 fps');
 });

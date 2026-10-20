@@ -215,3 +215,14 @@ test('a relaxed expression authored to block blinks still lets the resting smile
  let peak=0;for(let i=0;i<20;i++){for(const [name,value] of face.step(1/60,options))m.setValue(name,value);m.update();peak=Math.max(peak,mesh.morphTargetInfluences[0]);}
  assert.ok(peak>.8,`the eyelid morph reached ${peak.toFixed(2)}`);
 });
+
+test('the face is settled only once every channel reached its goal, no blink runs and no timed reaction waits (the asleep pause)',()=>{
+ const face=new AvatarFace(manager(...VROID,...Object.keys(FACE_PARTS)),{random:never});
+ const step=(seconds,options={})=>{for(let t=0;t<seconds-1e-9;t+=1/60)face.step(1/60,{settings:{restingSmile:.15,intensity:1},...options});};
+ step(2);assert.equal(face.settled,true,'the resting smile reached');
+ const sad={emotion:{primary:'sadness',intensity:.8}};step(.1,sad);assert.equal(face.settled,false,'a fade to sadness is running');
+ step(3,sad);assert.equal(face.settled,true,'and has finished');
+ face.blink('press');assert.equal(face.settled,false,'a queued blink');step(.1,sad);assert.equal(face.settled,false,'a running blink');step(.5,sad);assert.equal(face.settled,true);
+ face.react('pout',{duration:.5});assert.equal(face.settled,false,'a timed reaction waits');step(4,sad);assert.equal(face.settled,true,'it ended and faded out');
+ face.react('worried');step(4,sad);assert.equal(face.settled,false,'the worried mouth keeps breathing');
+});

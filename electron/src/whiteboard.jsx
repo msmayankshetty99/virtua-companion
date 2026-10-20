@@ -46,7 +46,7 @@ function BoardObject({command, zoom, position, move, measured, acknowledge}) {
   </div>;
 }
 
-export default function Whiteboard({commands = [], pages = ['page-1'], modelPage = 'page-1', clearCommand, acknowledge = false, loaded = true, persistenceError = '', revision,collapsed=false}) {
+export default function Whiteboard({commands = [], pages = ['page-1'], modelPage = 'page-1', clearCommand, acknowledge = false, loaded = true, persistenceError = '', revision,collapsed=false,connection=0}) {
   const storageKey = 'riko:whiteboard:' + (acknowledge ? 'surface' : 'workspace');
   const saved = useRef(readBoardView(storageKey));
   const root = useRef(null), pan = useRef(null), dirty = useRef(!!saved.current?.dirty), seen = useRef(saved.current?.seen || null), viewRef = useRef(null), pendingBack = useRef(null);
@@ -59,7 +59,7 @@ export default function Whiteboard({commands = [], pages = ['page-1'], modelPage
       rect:()=>{const rect=root.current.getBoundingClientRect();return{x:rect.x,y:rect.y,width:rect.width,height:rect.height};},
       capture:rect=>window.whiteboardBridge.capture(rect),
       send:(revision,png)=>request('/api/whiteboard/image?revision='+encodeURIComponent(revision),{method:'POST',type:'image/png',body:new Uint8Array(png)})});
-  },[acknowledge,loaded,revision,page,JSON.stringify(view),JSON.stringify(positions),collapsed]);
+  },[acknowledge,loaded,revision,page,JSON.stringify(view),JSON.stringify(positions),collapsed,connection]);
   const localState = useRef(null);
   localState.current = {page, view, back, positions, seen: seen.current, modelPage, dirty:dirty.current};
   useEffect(() => {
