@@ -16,7 +16,14 @@ function MarkdownImage({src, alt}) {
   return alt ? <span className="image-alt">{alt}</span> : null;
 }
 
-export default function FormattedText({text = ''}) {
+function MarkdownLink({children, href}) {return <a href={href} target="_blank" rel="noreferrer">{children}</a>;}
+// One set of plugins and components for every render: new arrays or an inline component would make react-markdown re-create them
+// and React remount every link on each render.
+const REMARK = [remarkGfm, remarkMath], REHYPE = [[rehypeKatex, {strict: false, throwOnError: false}]], COMPONENTS = {a: MarkdownLink, img: MarkdownImage};
+
+// Memoized: a message re-parses its Markdown only when its own text changes, never because a sibling streamed a token.
+function FormattedText({text = ''}) {
   const normalized = normalizeLatex(text);
-  return <div className="formatted-text"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[[rehypeKatex, {strict: false, throwOnError: false}]]} components={{a: ({children, href}) => <a href={href} target="_blank" rel="noreferrer">{children}</a>, img: MarkdownImage}}>{normalized}</ReactMarkdown></div>;
+  return <div className="formatted-text"><ReactMarkdown remarkPlugins={REMARK} rehypePlugins={REHYPE} components={COMPONENTS}>{normalized}</ReactMarkdown></div>;
 }
+export default React.memo(FormattedText);

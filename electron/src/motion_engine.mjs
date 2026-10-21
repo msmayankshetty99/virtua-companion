@@ -39,8 +39,11 @@ export function gesturePose(name,time,base,amount) {
 
 /** Blends from the displayed pose even when a transition is interrupted. */
 export class PoseInterpolator {
-  constructor(initial=new Map()) {this.displayed=new Map([...initial].map(([k,v])=>[k,v.clone()]));this.from=new Map();this.key=null;this.age=0;}
+  constructor(initial=new Map()) {this.displayed=new Map([...initial].map(([k,v])=>[k,v.clone()]));this.from=new Map();this.key=null;this.age=0;this.duration=.3;}
+  /** Mid-crossfade (the avatar's frame pacing draws every display frame meanwhile). */
+  get blending() {return this.age<Math.max(.05,this.duration);}
   step(target,key,dt,duration=.3) {
+    this.duration=duration;
     if(key!==this.key){this.key=key;this.from=new Map([...this.displayed].map(([k,v])=>[k,v.clone()]));this.age=0;}
     this.age+=Math.max(0,Math.min(.1,dt));
     const t=clamp(this.age/Math.max(.05,duration),0,1),weight=t*t*(3-2*t);
@@ -61,8 +64,10 @@ export class MotionEngine {
     this.vrm=vrm;this.sampler=sampler;this.report=report;this.time=0;this.ages=new Map();this.vrm0=vrm.meta?.metaVersion==='0';
     const initial=new Map(BODY_BONES.map(name=>[name,vrm.humanoid.getNormalizedBoneNode(name)?.quaternion]).filter(([,value])=>value).map(([name,value])=>[name,this.canonical(value)]));
     this.blender=new PoseInterpolator(initial);this.gaze=new THREE.Quaternion();
-    this.rest=new Map(initial);this.expressionTargets=new Map();
+    this.rest=new Map(initial);this.expressionTargets=new Map();this.mode='idle';
   }
+  /** Crossfading between poses (avatar_frame_rate.mjs motionBusy). */
+  get blending(){return this.blender.blending;}
   canonical(q){return this.vrm0?flipVRM0(q):q.clone();}
   age(action,dt){if(!action)return 0;const next=(this.ages.get(action.id)||0)+dt;this.ages.set(action.id,next);return next;}
   /** held: {pitch, kickAmplitude} for the held pose (the studio's scruff tilt and kick size). */
@@ -76,7 +81,7 @@ export class MotionEngine {
     const ids=new Set(active.map(a=>a.id));for(const id of this.ages.keys())if(!ids.has(id))this.ages.delete(id);
     const enabled=settings.enabled!==false,hold=enabled&&interaction.hold?.pose?interaction.hold:null,holding=!!(hold||interaction.held);
     const custom=(holding||interaction.reaction)&&interaction.rule?.animation!=='default'?interaction.rule?.animation:null;
-    const mode=enabled?(custom|| (hold?'hold':interaction.held?'held':interaction.reaction|| (walking?'walking':base?.payload.procedural||'idle'))):'idle';
+    const mode=this.mode=enabled?(custom|| (hold?'hold':interaction.held?'held':interaction.reaction|| (walking?'walking':base?.payload.procedural||'idle'))):'idle';
     let target,modeKey=mode;
     // Landing and recovering are one settle (idle with the squash): one key, so the crossfade into it never restarts between them.
     if(mode==='hold'){const settle=hold.state==='landing'||hold.state==='recovering';target=settle?settlePose(proceduralPose('idle',this.time),hold.pose.squash):heldPose(hold,this.time,held);modeKey=settle?'hold:settle':'hold:'+hold.state+':'+hold.pose.variant;}

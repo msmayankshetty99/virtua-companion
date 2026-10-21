@@ -18,17 +18,20 @@ function processTelemetry({app,request}){
  return {publish,watch};
 }
 function displayTelemetry({screen,request}){
- let signature='',publishing=false;
+ let signature='',publishing=false,again=false;
  const list=()=>screen.getAllDisplays().map((display,index)=>({index,id:display.id,
   label:display.label||`Screen ${index+1}`,primary:display.id===screen.getPrimaryDisplay().id,
   bounds:display.bounds,scaleFactor:display.scaleFactor}));
  async function publish(){
+  // A change while a post is in flight (macOS sends display-added, then display-metrics-changed) is checked again once it ends.
+  if(publishing){again=true;return;}
   const body=JSON.stringify(list());
-  if(publishing||body===signature)return;
+  if(body===signature)return;
   publishing=true;
   try{const response=await request('/api/displays',{method:'POST',headers:{'Content-Type':'application/json'},body});if(response.ok)signature=body;}
   catch{/* Retry on the next backend snapshot/reconnection. */}
   finally{publishing=false;}
+  if(again){again=false;await publish();}
  }
  // The backend lost them (a new backend, or the overlay saw none) or the screens changed: send them again.
  return {list,publish,reset(){signature='';}};

@@ -2,7 +2,9 @@ import {mergeHistory} from './chat_history.mjs';
 import {transcriptMatches} from './transcript_composer.mjs';
 // StreamChat's state: bus events (event_connection.mjs) plus its own `local.*` actions (history pages, send and stop, the
 // socket closing). Pure, as reduceOverlayReply is: stream_chat.jsx keeps only refs, scrolling and requests.
-export const initialStreamChat={messages:[],busy:false,error:'',speechError:'',characterName:'',startupError:'',sessionID:null};
+export const initialStreamChat={messages:[],busy:false,error:'',notice:null,speechError:'',characterName:'',startupError:'',sessionID:null};
+// The errors that belong to the conversation: the chat's error banner shows them until the next completed turn.
+const CHAT_ERRORS=['model.error','chat.error'];
 const ENDED=['chat.completed','chat.cancelled','model.error'];
 // A finished, cancelled or failed turn: the archive now has it, so the chat reloads its latest page.
 export const endsTurn=event=>ENDED.includes(event.type);
@@ -37,7 +39,8 @@ export function reduceStreamChat(state,event){
  switch(event.type){
   case 'local.busy':return {...state,busy:event.busy};
   case 'local.error':return {...state,error:event.error};
-  case 'local.disconnected':return {...state,busy:false};
+  case 'local.disconnected':return state.busy?{...state,busy:false}:state;
+  case 'local.notice_expired':return state.notice?.id===event.id?{...state,notice:null}:state;
   // A page of /api/chat/history. On reconnect, live messages the archive does not hold are dropped, except this session's
   // optimistic ones not yet archived (no sequence).
   case 'local.history':{
@@ -50,15 +53,21 @@ export function reduceStreamChat(state,event){
  }
  let next=state;
  if(event.type==='state.snapshot'){
-  next={...next,characterName:p.character_name||'',busy:!!p.runtime?.generating,speechError:p.runtime?.speech_error||'',sessionID:p.session_id,startupError:p.startup_error||''};
-  if(p.startup_error)next.error='';
+  const fields={characterName:p.character_name||'',busy:!!p.runtime?.generating,speechError:p.runtime?.speech_error||'',sessionID:p.session_id,startupError:p.startup_error||''};
+  if(p.startup_error)fields.error='';
+  // A snapshot comes with every desktop change: the chat keeps its state (and renders nothing) unless one of its own fields changed.
+  if(Object.keys(fields).some(key=>!Object.is(fields[key],state[key])))next={...next,...fields};
  }
  const messages=reduceMessages(next.messages,event,next.sessionID);
  if(messages!==next.messages)next={...next,messages};
  if(event.type==='model.started')next={...next,busy:true};
  if(endsTurn(event))next={...next,busy:false};
  if(['speech.error','speech.unavailable'].includes(event.type))next={...next,speechError:p.error};
- else if(event.type?.endsWith('.error'))next={...next,error:p.error};
+ else if(CHAT_ERRORS.includes(event.type))next={...next,error:p.error};
+ // Another part's error (microphone, animation, initiative, wake feedback, a tool) is a notice that passes (StreamChat expires it), never
+ // the chat's error: a recoverable microphone hiccup no longer leaves a banner that only a typed message clears.
+ else if(event.type?.endsWith('.error'))next={...next,notice:{id:(state.notice?.id||0)+1,text:p.error||'Something went wrong'}};
+ if(event.type==='chat.completed'&&next.error)next={...next,error:''};
  if(event.type==='speech.started')next={...next,speechError:''};
  return next;
 }

@@ -31,7 +31,8 @@ test('errors land where they belong: speech apart from chat, and a startup error
  let state=run([{type:'model.error',turn_id:'t',payload:{error:'context overflow'}}]);
  assert.equal(state.error,'context overflow');assert.equal(state.busy,false);
  state=run([{type:'speech.unavailable',payload:{error:'GPT-SoVITS offline'}},{type:'tool.error',payload:{error:'calculator failed'}}],state);
- assert.equal(state.speechError,'GPT-SoVITS offline');assert.equal(state.error,'calculator failed');
+ assert.equal(state.speechError,'GPT-SoVITS offline');assert.equal(state.error,'context overflow','another part\'s error is not the chat\'s');
+ assert.deepEqual(state.notice,{id:1,text:'calculator failed'});
  state=reduceStreamChat(state,{type:'speech.started'});assert.equal(state.speechError,'');
  state=reduceStreamChat(state,snapshot({startup_error:'Model missing',runtime:{generating:true,speech_error:'no voice'}}));
  assert.deepEqual([state.error,state.startupError,state.busy,state.speechError],['','Model missing',true,'no voice']);
@@ -65,4 +66,21 @@ test('a chat the backend refuses as busy (409) gives the typed message back; oth
  assert.deepEqual(await sendChat(refused(500),'hello'),{error:'Riko is already handling another turn',restore:''});
  const sent=[];assert.deepEqual(await sendChat(async(...args)=>{sent.push(args);return null;},'hello'),{error:'',restore:''});
  assert.deepEqual(sent,[['/api/chat',{method:'POST',body:{text:'hello'}}]]);
+});
+test('only model and chat errors set the chat error; the rest are notices that expire, and a completed turn clears the error',()=>{
+ let state=run([{type:'voice.error',payload:{error:'Microphone processing fell behind; recording resumed'}}]);
+ assert.equal(state.error,'');assert.deepEqual(state.notice,{id:1,text:'Microphone processing fell behind; recording resumed'});
+ state=run([{type:'animation.error',payload:{error:'clip failed'}},{type:'initiative.error',payload:{}}],state);
+ assert.deepEqual(state.notice,{id:3,text:'Something went wrong'},'the newest notice replaces the last');
+ assert.equal(reduceStreamChat(state,{type:'local.notice_expired',id:2}),state,'an older timer leaves the newer notice');
+ state=reduceStreamChat(state,{type:'local.notice_expired',id:3});assert.equal(state.notice,null);
+ state=run([{type:'chat.error',payload:{error:'stream broke'}}],state);assert.equal(state.error,'stream broke');
+ state=run([{type:'model.started',turn_id:'t',timestamp:1,payload:{}}],state);assert.equal(state.error,'stream broke','still shown while the next turn streams');
+ state=run([{type:'chat.completed',turn_id:'t',payload:{text:'ok'}}],state);assert.equal(state.error,'');
+});
+test('a snapshot that changes none of the chat\'s fields keeps its state object, so nothing renders',()=>{
+ const state=run([snapshot()]);
+ assert.equal(reduceStreamChat(state,snapshot({emotion:{primary:'joy'},tools:[{id:1}]})),state);
+ assert.notEqual(reduceStreamChat(state,snapshot({runtime:{generating:true}})),state);
+ assert.equal(reduceStreamChat(state,{type:'local.disconnected'}),state,'not busy: nothing to clear');
 });

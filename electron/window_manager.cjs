@@ -107,10 +107,12 @@ function windowManager({BrowserWindow,screen,dialog,app,page,preferences,icon,op
   const whiteboard=windows.whiteboard=new BrowserWindow(windowOptions('whiteboard',{title:name,preferences}));
   whiteboard.loadURL(page('whiteboard'));
   whiteboard.on('close',event=>{if(!app.isQuitting){event.preventDefault();setBoardMode('collapsed');}});
-  // The backend keeps the whiteboard's geometry relative to its display (sync-surfaces brings it back).
+  // The backend keeps the whiteboard's geometry relative to its display (sync-surfaces brings it back). While a move or resize is
+  // still being saved (board.geometry pending), syncSurfaces leaves the bounds alone: an older saved geometry must not snap it back.
   const saveGeometry=()=>{
    timers.clear(board.geometry);
    board.geometry=timers.set(()=>{
+    board.geometry=null;
     if(whiteboard.isDestroyed())return;
     const bounds=board.mode==='collapsed'?(board.bounds||whiteboard.getBounds()):whiteboard.getBounds(),displays=screen.getAllDisplays();
     const display=screen.getDisplayMatching(bounds);board.screen=displays.findIndex(item=>item.id===display.id);
@@ -154,8 +156,9 @@ function windowManager({BrowserWindow,screen,dialog,app,page,preferences,icon,op
    const window=windows[name];if(name==='control'&&chat.mode==='full')chat.blur=enabled;
    const result=platform.material(window,name==='control'?chat.mode:'transparent',name==='control'&&chat.blur);syncWindowContent(window);return result;
   },
-  // The dock and mini chat are click-through except where the renderer's hit test says otherwise, and never during a gesture.
-  compactInteractive(enabled){if(chat.mode!=='full'&&!gesture.active)windows.control.setIgnoreMouseEvents(chat.ignoring=!enabled,{forward:true});},
+  // The dock and mini chat are click-through except where the renderer's hit test says otherwise, and never during a gesture. A report
+  // that changes nothing makes no native call.
+  compactInteractive(enabled){if(chat.mode!=='full'&&!gesture.active&&chat.ignoring!==!enabled)windows.control.setIgnoreMouseEvents(chat.ignoring=!enabled,{forward:true});},
   windowGesture(name,value){
    if(!value||typeof value.id!=='string'||value.id.length>64)return;
    const window=windows[name];
@@ -189,7 +192,7 @@ function windowManager({BrowserWindow,screen,dialog,app,page,preferences,icon,op
     const display=displays[board.screen];
     const bounds={x:Math.round(display.bounds.x+geometry.x),y:Math.round(display.bounds.y+geometry.y),width:Math.max(200,Math.min(4096,Math.round(geometry.width))),height:Math.max(200,Math.min(4096,Math.round(geometry.height)))};
     const current=whiteboard.getBounds();
-    if(board.mode==='full'&&Object.keys(bounds).some(key=>bounds[key]!==current[key]))whiteboard.setBounds(bounds);
+    if(board.mode==='full'&&!board.geometry&&Object.keys(bounds).some(key=>bounds[key]!==current[key]))whiteboard.setBounds(bounds);
    }
    if(state.whiteboard_visible){if(!whiteboard.isVisible()){whiteboard.setAlwaysOnTop(true);whiteboard.show();whiteboard.focus();}}else whiteboard.hide();
    state.effect?effects.showInactive():effects.hide();

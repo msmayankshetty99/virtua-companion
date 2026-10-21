@@ -133,7 +133,7 @@ export class FaceMixer{
  constructor(manager,{random=Math.random}={}){
   this.manager=manager;this.blinker=new Blinker({random});
   this.base=new Map();this.reaction=new Map();this.owner=new Map();this.values=new Map();this.spare=new Map();this.out=new Map();this.baseGoal=new Map();this.reactionGoal=new Map();
-  this.w=0;this.wRelease=BASE.release;this.ohAmp=0;this.ohWritten=false;this.lidValue=0;this.lidRelease=BASE.release;this.breath=0;
+  this.w=0;this.wGoal=0;this.lidGoal=0;this.wRelease=BASE.release;this.ohAmp=0;this.ohWritten=false;this.lidValue=0;this.lidRelease=BASE.release;this.breath=0;
   this.refresh();
  }
  /** Re-reads the model's expressions; call it after registering more. Names are resolved once and kept. */
@@ -142,6 +142,13 @@ export class FaceMixer{
   // three-vrm's 'block' stops every blink while the weight is above 0, so an always-on resting smile would stop them all.
   // 'blend' is the same at full weight and lets a blink through in proportion below it.
   const relaxed=this.resolve('relaxed'),expression=relaxed&&this.manager.getExpression(relaxed);if(expression?.overrideBlink==='block')expression.overrideBlink='blend';
+ }
+ /** Every channel has reached its goal (follow snaps the last 0.002), the eyelid and crossfade too, the breathing mouth is still and no
+  * blink runs or waits: the next step writes the same weights. The avatar's frame loop pauses asleep only on a settled face. */
+ get settled(){
+  if(this.blinker.busy||this.w!==this.wGoal||Math.abs(this.lidValue-this.lidGoal)>=.002||this.ohAmp>.002||this.ohWritten)return false;
+  const reached=(values,goals)=>{for(const [name,value] of values)if(goals.get(name)!==value)return false;for(const [name,goal] of goals)if(goal>0&&values.get(name)!==goal)return false;return true;};
+  return reached(this.base,this.baseGoal)&&reached(this.reaction,this.reactionGoal);
  }
  resolve(name){let hit=this.names.get(name);if(hit===undefined){hit=resolveExpression(this.manager,name);this.names.set(name,hit);}return hit;}
  /** Resolved weights of a {parts, fallback} spec: every part, else the fallback presets, else whatever parts exist. */
@@ -178,7 +185,7 @@ export class FaceMixer{
    if(rising&&goals.has(name)){this.owner.set(name,reaction.release);return reaction.attack;}
    const tau=goals.has(name)?reaction.release:reaction?reaction.attack:this.owner.get(name)??BASE.release;if(value>.02)falling=Math.max(falling,tau);return tau;});
   for(const name of this.owner.keys())if(!this.reaction.has(name))this.owner.delete(name);
-  const weight=reaction?.weight||0;if(reaction)this.wRelease=reaction.release;
+  const weight=this.wGoal=reaction?.weight||0;if(reaction)this.wRelease=reaction.release;
   this.w=approach(this.w,weight,weight>this.w?reaction.attack:falling||(reaction?reaction.attack:this.wRelease),h);if(Math.abs(this.w-weight)<.002)this.w=weight;
   const previous=this.values,values=this.spare,out=this.out;values.clear();out.clear();
   for(const [name,value] of this.base)values.set(name,value*(1-this.w));
@@ -191,7 +198,7 @@ export class FaceMixer{
   this.breath+=h*2*Math.PI/(reaction?.breath||2.2);const oh=this.resolve('oh');
   if(oh&&(this.ohAmp>.002||this.ohWritten)){const phase=Number.isFinite(breathPhase)?breathPhase:this.breath,value=this.ohAmp>.002?this.ohAmp*(.5-.5*Math.cos(phase)):0;out.set(oh,Math.max(out.get(oh)||0,value));this.ohWritten=value>0;}
   // The eyelid is written only to 'blink': max(blink, the intent's lid), so Fcl_EYE_Close never applies twice.
-  const lidGoal=reaction?.lid||0;if(lidGoal>this.lidValue)this.lidRelease=reaction.release;
+  const lidGoal=this.lidGoal=reaction?.lid||0;if(lidGoal>this.lidValue)this.lidRelease=reaction.release;
   this.lidValue=approach(this.lidValue,lidGoal,lidGoal>this.lidValue?reaction.attack:this.lidRelease,h);if(this.lidValue<.002&&!lidGoal)this.lidValue=0;
   this.blinker.setMood(reaction?.mood||'calm');const blinkLid=this.blinker.step(h);
   for(const part of EYE_PARTS){const name=this.resolve(part);if(name&&out.has(name))out.set(name,out.get(name)*(1-blinkLid));}
@@ -209,6 +216,8 @@ export class AvatarFace{
  constructor(manager,{random=Math.random}={}){this.mixer=new FaceMixer(manager,{random});this.queue=[];this.age=0;this.gazeBlinkAt=-Infinity;}
  get blinker(){return this.mixer.blinker;}
  get intent(){return this.queue[0]?.intent||null;}
+ /** The face stands still (FaceMixer.settled) and no timed reaction step is waiting to give way to the next. */
+ get settled(){const step=this.queue[0];return this.mixer.settled&&!(step&&Number.isFinite(step.duration??Infinity));}
  /** Holds `intent` (an INTENTS name, a spec or null) for `duration` seconds, then `then` (or the base face). */
  react(intent,{duration=Infinity,intensity=1,then=null}={}){return this.sequence([{intent,duration,intensity},...(then?[{intent:then}]:[])]);}
  /** Steps: {intent, duration (s, default until replaced), intensity, blink (a Blinker kind), blinkDelay, suppress (s)}. */

@@ -121,6 +121,16 @@ test('surface sync moves the overlay to the avatar display and applies the backe
  assert.deepEqual(h.whiteboard.bounds,collapsed,'a collapsed whiteboard keeps its bar');assert.equal(h.whiteboard.visible,false);assert.equal(h.effects.visible,false);
 });
 
+test('a whiteboard being moved is not snapped back by an older saved geometry; once saved, the backend\'s geometry applies again',()=>{
+ const h=setup();h.windows.syncSurfaces({whiteboard_geometry:{x:100,y:100,width:900,height:700,screen:0},whiteboard_visible:true});
+ h.whiteboard.bounds={x:300,y:200,width:900,height:700};h.whiteboard.emit('move');  // the user drags it
+ h.windows.syncSurfaces({whiteboard_geometry:{x:100,y:100,width:900,height:700,screen:0},whiteboard_visible:true});
+ assert.deepEqual(h.whiteboard.bounds,{x:300,y:200,width:900,height:700},'mid-drag, the stale geometry is ignored');
+ h.timers.run(200);assert.deepEqual(h.boards.at(-1),{geometry:{x:300,y:200,width:900,height:700,screen:0}});
+ h.windows.syncSurfaces({whiteboard_geometry:{x:50,y:60,width:800,height:600,screen:0},whiteboard_visible:true});
+ assert.deepEqual(h.whiteboard.bounds,{x:50,y:60,width:800,height:600},'saved: the backend places it again');
+});
+
 test('full-view blur is a preference of the full chat; Windows alone draws acrylic',()=>{
  for(const platform of ['win32','darwin','linux']){
   const h=setup({platform});h.whiteboard.setBackgroundMaterial=h.control.setBackgroundMaterial;
@@ -149,6 +159,9 @@ test('a window gesture follows the cursor every 16 ms from where it began and ow
  assert.equal(h.control.bounds.width,148,'another gesture id cannot end it');
  h.windows.windowGesture('control',{id:'g1',phase:'end'});assert.equal(h.timers.pending,0);
  h.windows.compactInteractive(true);assert.equal(h.control.ignoring,false);h.windows.compactInteractive(false);assert.equal(h.control.ignoring,true);
+ const native=()=>h.calls(h.control,'setIgnoreMouseEvents').length,before=native();
+ h.windows.compactInteractive(false);h.windows.compactInteractive(false);assert.equal(native(),before,'an unchanged report makes no native call');
+ h.windows.compactInteractive(true);assert.equal(native(),before+1);assert.equal(h.control.ignoring,false);h.windows.compactInteractive(false);
  // The whiteboard moves but never resizes; the full chat neither; oversized ids are ignored.
  for(const [name,value] of [['whiteboard',{id:'g',phase:'begin',kind:'resize'}],['control',{id:'x'.repeat(65),phase:'begin',kind:'move'}],['control',{id:'g',phase:'begin',kind:'spin'}]]){h.windows.windowGesture(name,value);assert.equal(h.timers.pending,0,JSON.stringify(value));}
  h.state.cursor={x:0,y:0};h.windows.windowGesture('whiteboard',{id:'m',phase:'begin',kind:'move'});h.state.cursor={x:30,y:40};h.timers.run(16);
